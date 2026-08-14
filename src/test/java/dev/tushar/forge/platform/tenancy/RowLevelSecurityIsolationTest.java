@@ -3,7 +3,7 @@ package dev.tushar.forge.platform.tenancy;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import dev.tushar.forge.support.AbstractPostgresIT;
+import dev.tushar.forge.support.AbstractIntegrationTest;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,7 +20,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * the backstop, and these tests are what prove the backstop is actually armed — an RLS policy that
  * silently is not in force looks identical to one that is, until it doesn't.
  */
-class RowLevelSecurityIsolationTest extends AbstractPostgresIT {
+class RowLevelSecurityIsolationTest extends AbstractIntegrationTest {
 
     private static final UUID WORKSPACE_A = UUID.fromString("aaaaaaaa-0000-4000-8000-000000000001");
     private static final UUID WORKSPACE_B = UUID.fromString("bbbbbbbb-0000-4000-8000-000000000002");

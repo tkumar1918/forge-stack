@@ -2,7 +2,7 @@ package dev.tushar.forge.githubauth;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import dev.tushar.forge.support.AbstractPostgresIT;
+import dev.tushar.forge.support.AbstractIntegrationTest;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,7 +17,7 @@ import org.springframework.security.oauth2.client.registration.InMemoryClientReg
  * every repository they can see — and nothing would visibly break, which is exactly why it needs
  * a test rather than a code review.
  */
-class GithubOAuthScopeTest extends AbstractPostgresIT {
+class GithubOAuthScopeTest extends AbstractIntegrationTest {
 
     @Autowired
     private ClientRegistrationRepository registrations;

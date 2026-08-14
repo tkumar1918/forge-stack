@@ -2,7 +2,7 @@ package dev.tushar.forge.iam;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import dev.tushar.forge.support.AbstractPostgresIT;
+import dev.tushar.forge.support.AbstractIntegrationTest;
 import dev.tushar.forge.iam.UserProvisioningService.GithubProfile;
 import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 
-class UserProvisioningServiceTest extends AbstractPostgresIT {
+class UserProvisioningServiceTest extends AbstractIntegrationTest {
 
     @Autowired
     private UserProvisioningService provisioning;
