@@ -6,5 +6,5 @@
  */
 @org.springframework.modulith.ApplicationModule(
         displayName = "API",
-        allowedDependencies = {"iam", "githubauth"})
+        allowedDependencies = {"iam", "githublogin"})
 package dev.tushar.forge.api;

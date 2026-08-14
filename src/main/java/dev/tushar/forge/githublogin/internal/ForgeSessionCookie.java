@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubauth.internal;
+package dev.tushar.forge.githublogin.internal;
 
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;

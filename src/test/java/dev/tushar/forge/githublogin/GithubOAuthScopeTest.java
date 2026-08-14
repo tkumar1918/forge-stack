@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubauth;
+package dev.tushar.forge.githublogin;
 
 import static org.assertj.core.api.Assertions.assertThat;
 

@@ -1,6 +1,6 @@
-package dev.tushar.forge.githubauth.internal;
+package dev.tushar.forge.githublogin.internal;
 
-import dev.tushar.forge.githubauth.ForgePrincipal;
+import dev.tushar.forge.githublogin.ForgePrincipal;
 import dev.tushar.forge.iam.AuthenticatedSession;
 import dev.tushar.forge.iam.SessionService;
 import jakarta.servlet.FilterChain;

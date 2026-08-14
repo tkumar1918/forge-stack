@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubapp;
+package dev.tushar.forge.githubinstallation;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;

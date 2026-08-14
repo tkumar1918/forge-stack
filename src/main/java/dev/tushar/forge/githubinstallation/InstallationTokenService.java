@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubapp;
+package dev.tushar.forge.githubinstallation;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -8,8 +8,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
-import dev.tushar.forge.githubapp.internal.GithubAppJwtService;
-import dev.tushar.forge.githubapp.internal.GithubAppProperties;
+import dev.tushar.forge.githubinstallation.internal.GithubAppJwtService;
+import dev.tushar.forge.githubinstallation.internal.GithubAppProperties;
 import org.springframework.web.client.RestClient;
 
 /**

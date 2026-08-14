@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubapp.internal;
+package dev.tushar.forge.githubinstallation.internal;
 
 import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.JWSAlgorithm;

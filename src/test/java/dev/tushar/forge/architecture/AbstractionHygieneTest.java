@@ -89,7 +89,7 @@ class AbstractionHygieneTest {
                 .resideInAPackage(ROOT + ".sandbox..")
                 .should()
                 .dependOnClassesThat()
-                .resideInAnyPackage(ROOT + ".githubapp..")
+                .resideInAnyPackage(ROOT + ".githubinstallation..")
                 .because("repository content is attacker-controlled; a token inside the sandbox "
                         + "with any egress is a one-prompt exfiltration")
                 // The sandbox module does not exist yet. The rule arms itself the moment it does,

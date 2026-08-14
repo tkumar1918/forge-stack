@@ -1,6 +1,6 @@
 package dev.tushar.forge.api;
 
-import dev.tushar.forge.githubauth.ForgePrincipal;
+import dev.tushar.forge.githublogin.ForgePrincipal;
 import dev.tushar.forge.iam.IamQueries;
 import dev.tushar.forge.iam.UserProfile;
 import dev.tushar.forge.iam.WorkspaceSummary;
@@ -12,17 +12,24 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+/**
+ * The authenticated caller's session context.
+ *
+ * <p>The resource is the session rather than the user: the identity fields come from the user row,
+ * but {@code activeWorkspaceId} comes from the server-side session and {@code workspaces} is what
+ * that session may switch to. "Who am I and what may I see right now" is session state.
+ */
 @RestController
-@RequestMapping("/api/me")
-class MeController {
+@RequestMapping("/api/session")
+class SessionController {
 
     private final IamQueries iam;
 
-    MeController(IamQueries iam) {
+    SessionController(IamQueries iam) {
         this.iam = iam;
     }
 
-    record MeView(
+    record SessionView(
             UUID userId,
             String email,
             String displayName,
@@ -31,14 +38,14 @@ class MeController {
             List<WorkspaceSummary> workspaces) {}
 
     @GetMapping
-    ResponseEntity<MeView> me(@AuthenticationPrincipal ForgePrincipal principal) {
+    ResponseEntity<SessionView> current(@AuthenticationPrincipal ForgePrincipal principal) {
         return iam.findUser(principal.userId())
                 .map(user -> ResponseEntity.ok(toView(user, principal)))
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
-    private MeView toView(UserProfile user, ForgePrincipal principal) {
-        return new MeView(
+    private SessionView toView(UserProfile user, ForgePrincipal principal) {
+        return new SessionView(
                 user.id(),
                 user.email(),
                 user.displayName(),

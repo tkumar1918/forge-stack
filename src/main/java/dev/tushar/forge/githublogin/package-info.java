@@ -1,12 +1,11 @@
 /**
- * GitHub OAuth login — authenticating a human into Forge.
+ * Signing a human in with GitHub, and nothing else.
  *
- * <p>This module grants the agent nothing. It requests {@code read:user} and {@code user:email}
- * and never {@code repo}: logging into Forge must not imply that the agent may touch any
- * repository. Authority for the agent to act on GitHub comes from an explicitly installed GitHub
- * App, and lives in {@code githubapp}.
+ * <p>Requests {@code read:user} and {@code user:email}, never {@code repo}: signing in identifies
+ * a person and grants no access to any repository. Everything here is about the browser session —
+ * the OAuth handshake, the session cookie, and the authenticated principal.
  */
 @org.springframework.modulith.ApplicationModule(
-        displayName = "GitHub OAuth",
+        displayName = "GitHub Login",
         allowedDependencies = {"iam"})
-package dev.tushar.forge.githubauth;
+package dev.tushar.forge.githublogin;

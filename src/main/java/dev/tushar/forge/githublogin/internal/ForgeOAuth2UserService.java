@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubauth.internal;
+package dev.tushar.forge.githublogin.internal;
 
 import dev.tushar.forge.iam.GithubProfile;
 import dev.tushar.forge.iam.UserProfile;
