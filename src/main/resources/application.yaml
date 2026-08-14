@@ -37,6 +37,23 @@ spring:
       host: localhost
       port: 6379
 
+  security:
+    oauth2:
+      client:
+        registration:
+          github:
+            client-id: ${GITHUB_OAUTH_CLIENT_ID:not-configured}
+            client-secret: ${GITHUB_OAUTH_CLIENT_SECRET:not-configured}
+            # Login identifies a human. It grants the agent nothing.
+            #
+            # Deliberately NOT 'repo'. Access to a repository comes only from explicitly
+            # installing the GitHub App and choosing repositories, which is a separate,
+            # revocable decision. Adding 'repo' here would silently make every login a grant
+            # of read/write access to everything the user can see.
+            scope:
+              - read:user
+              - user:email
+
   threads:
     virtual:
       enabled: true

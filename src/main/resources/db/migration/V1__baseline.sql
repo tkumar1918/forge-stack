@@ -3,7 +3,11 @@
 -- Runs as forge_migrator (schema owner). The application connects as forge_app, which is
 -- neither superuser nor BYPASSRLS nor the table owner.
 
-CREATE EXTENSION IF NOT EXISTS citext;
+-- Case-insensitive identifiers (emails, slugs) are stored as plain text and normalised to
+-- lower case by the application before they are written. The obvious alternative, citext,
+-- reports as Types#OTHER over JDBC and fails Hibernate's schema validation, which would mean
+-- either weakening ddl-auto=validate or teaching Hibernate a custom type. Normalising at the
+-- boundary is less machinery and keeps the column a boring, portable text.
 
 -- ---------------------------------------------------------------------------
 -- Identity (global, NOT tenant-scoped)
@@ -16,7 +20,7 @@ CREATE EXTENSION IF NOT EXISTS citext;
 
 CREATE TABLE users (
     id            uuid PRIMARY KEY     DEFAULT gen_random_uuid(),
-    primary_email citext      NOT NULL UNIQUE,
+    primary_email text        NOT NULL UNIQUE,
     display_name  text,
     avatar_url    text,
     created_at    timestamptz NOT NULL DEFAULT now(),
@@ -50,7 +54,7 @@ CREATE INDEX user_identities_user_id_idx ON user_identities (user_id);
 
 CREATE TABLE workspaces (
     id         uuid PRIMARY KEY     DEFAULT gen_random_uuid(),
-    slug       citext      NOT NULL UNIQUE,
+    slug       text        NOT NULL UNIQUE,
     name       text        NOT NULL,
     plan       text        NOT NULL DEFAULT 'ALPHA',
     status     text        NOT NULL DEFAULT 'ACTIVE',
