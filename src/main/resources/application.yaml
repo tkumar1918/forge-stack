@@ -1,3 +1,60 @@
 spring:
   application:
     name: Forge
+
+  datasource:
+    # The application connects as forge_app: no superuser, no BYPASSRLS, not the table
+    # owner. Row-level security is the backstop for tenant isolation, so the app must
+    # not be able to escape it.
+    url: jdbc:postgresql://localhost:5432/forge
+    username: forge_app
+    password: forge_app
+    hikari:
+      maximum-pool-size: 10
+      pool-name: forge-pool
+
+  flyway:
+    enabled: true
+    # Migrations run as the schema owner, which the application deliberately is not.
+    url: jdbc:postgresql://localhost:5432/forge
+    user: forge_migrator
+    password: forge_migrator
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+  jpa:
+    hibernate:
+      # Flyway owns the schema. Hibernate validates against it and never mutates it.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  threads:
+    virtual:
+      enabled: true
+
+forge:
+  # Which responsibilities this process takes on. One artifact, three roles, so the API
+  # and the agent workers scale and fail independently. "all" is for local development.
+  role: all
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    dev.tushar.forge: DEBUG
