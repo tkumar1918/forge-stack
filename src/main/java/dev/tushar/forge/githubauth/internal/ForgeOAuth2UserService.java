@@ -1,8 +1,8 @@
-package dev.tushar.forge.githubauth;
+package dev.tushar.forge.githubauth.internal;
 
-import dev.tushar.forge.iam.User;
+import dev.tushar.forge.iam.GithubProfile;
+import dev.tushar.forge.iam.UserProfile;
 import dev.tushar.forge.iam.UserProvisioningService;
-import dev.tushar.forge.iam.UserProvisioningService.GithubProfile;
 import java.util.Map;
 import org.springframework.security.oauth2.client.userinfo.DefaultOAuth2UserService;
 import org.springframework.security.oauth2.client.userinfo.OAuth2UserRequest;
@@ -16,7 +16,9 @@ import org.springframework.stereotype.Service;
  * Maps a completed GitHub OAuth exchange onto a Forge user.
  *
  * <p>The access token in {@code OAuth2UserRequest} is used only to fetch the profile and is then
- * discarded — it is never persisted. See {@link dev.tushar.forge.iam.UserIdentity} for why.
+ * discarded — it is never persisted. A stored user OAuth token is a standing credential able to
+ * act as that person on GitHub, and the agent never needs it: it uses short-lived,
+ * repository-scoped GitHub App installation tokens instead.
  */
 @Service
 public class ForgeOAuth2UserService implements OAuth2UserService<OAuth2UserRequest, OAuth2User> {
@@ -49,10 +51,10 @@ public class ForgeOAuth2UserService implements OAuth2UserService<OAuth2UserReque
             email = "%s@users.noreply.github.com".formatted(login);
         }
 
-        User user = provisioning.provision(new GithubProfile(providerUserId, login, email, name, avatarUrl));
+        UserProfile user = provisioning.provision(new GithubProfile(providerUserId, login, email, name, avatarUrl));
 
         Map<String, Object> enriched = new java.util.HashMap<>(attributes);
-        enriched.put(FORGE_USER_ID, user.getId().toString());
+        enriched.put(FORGE_USER_ID, user.id().toString());
 
         return new DefaultOAuth2User(githubUser.getAuthorities(), enriched, "login");
     }

@@ -41,6 +41,41 @@ final class AbstractionRules {
                         + "write the concrete class and revisit when a second implementation exists");
     }
 
+    /**
+     * Packages are named after what the code is <em>about</em>, never after the pattern it uses.
+     *
+     * <p>Package-by-layer ({@code entity}, {@code dto}, {@code impl}) scatters things that change
+     * together: adding one field touches the entity package, the dto package, and the mapper
+     * package. Package-by-aggregate ({@code user}, {@code workspace}, {@code session}) keeps them
+     * in one place. This is the rule that actually prevents a module from feeling like a dumping
+     * ground once it passes a dozen files.
+     *
+     * <p>{@code util}, {@code common}, and {@code misc} are banned for a related reason: they are
+     * defined by having no definition, so everything eventually qualifies.
+     */
+    static ArchRule packagesAreNamedAfterConceptsNotLayers(String basePackage) {
+        return noClasses()
+                .that()
+                .resideInAPackage(basePackage + "..")
+                .should()
+                .resideInAnyPackage(
+                        "..entity..",
+                        "..entities..",
+                        "..dto..",
+                        "..dtos..",
+                        "..impl..",
+                        "..beans..",
+                        "..pojo..",
+                        "..util..",
+                        "..utils..",
+                        "..common..",
+                        "..helper..",
+                        "..helpers..",
+                        "..misc..")
+                .because("packages are named after the concept they own (user, workspace, session), "
+                        + "not the technical pattern their contents happen to use");
+    }
+
     private static DescribedPredicate<JavaClass> notAnnotationsOrPackageDescriptors() {
         return new DescribedPredicate<>("are not annotations or package descriptors") {
             @Override

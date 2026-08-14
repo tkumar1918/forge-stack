@@ -1,10 +1,10 @@
-package dev.tushar.forge.iam;
+package dev.tushar.forge.iam.internal.user;
 
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 
-interface UserIdentityRepository extends JpaRepository<UserIdentity, UUID> {
+public interface UserIdentityRepository extends JpaRepository<UserIdentity, UUID> {
 
     Optional<UserIdentity> findByProviderAndProviderUserId(String provider, String providerUserId);
 }

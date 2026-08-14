@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubapp;
+package dev.tushar.forge.githubapp.internal;
 
 import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.JWSAlgorithm;
@@ -40,7 +40,7 @@ public class GithubAppJwtService {
     private final GithubAppProperties properties;
     private final RSAPrivateKey privateKey;
 
-    GithubAppJwtService(GithubAppProperties properties) {
+    public GithubAppJwtService(GithubAppProperties properties) {
         this.properties = properties;
         this.privateKey = properties.isConfigured() ? parsePrivateKey(properties.privateKeyPem()) : null;
     }

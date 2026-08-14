@@ -3,7 +3,6 @@ package dev.tushar.forge.iam;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import dev.tushar.forge.support.AbstractIntegrationTest;
-import dev.tushar.forge.iam.UserProvisioningService.GithubProfile;
 import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -31,12 +30,12 @@ class UserProvisioningServiceTest extends AbstractIntegrationTest {
     void firstLoginProvisionsEverything() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
 
-        User user = provisioning.provision(profile(suffix));
+        UserProfile user = provisioning.provision(profile(suffix));
 
-        var workspaces = iam.workspacesFor(user.getId());
+        var workspaces = iam.workspacesFor(user.id());
         assertThat(workspaces).hasSize(1);
-        assertThat(iam.roleIn(workspaces.getFirst().getId(), user.getId()))
-                .contains(WorkspaceMember.Role.OWNER);
+        assertThat(iam.roleIn(workspaces.getFirst().id(), user.id()))
+                .contains(WorkspaceRole.OWNER);
     }
 
     @Test
@@ -44,13 +43,13 @@ class UserProvisioningServiceTest extends AbstractIntegrationTest {
     void repeatLoginIsIdempotent() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
 
-        User first = provisioning.provision(profile(suffix));
-        User second = provisioning.provision(profile(suffix));
+        UserProfile first = provisioning.provision(profile(suffix));
+        UserProfile second = provisioning.provision(profile(suffix));
 
-        assertThat(second.getId()).isEqualTo(first.getId());
+        assertThat(second.id()).isEqualTo(first.id());
         // The important part: no second workspace. Provisioning runs on every login, so a
         // non-idempotent path would quietly accumulate a workspace per sign-in.
-        assertThat(iam.workspacesFor(first.getId())).hasSize(1);
+        assertThat(iam.workspacesFor(first.id())).hasSize(1);
     }
 
     @Test
@@ -79,13 +78,13 @@ class UserProvisioningServiceTest extends AbstractIntegrationTest {
     void workspaceSlugsAreUnique() {
         String login = "octo-" + UUID.randomUUID().toString().substring(0, 8);
 
-        User first = provisioning.provision(
+        UserProfile first = provisioning.provision(
                 new GithubProfile("gh-1-" + login, login, login + "-1@example.com", "A", null));
-        User second = provisioning.provision(
+        UserProfile second = provisioning.provision(
                 new GithubProfile("gh-2-" + login, login, login + "-2@example.com", "B", null));
 
-        String slugA = iam.workspacesFor(first.getId()).getFirst().getSlug();
-        String slugB = iam.workspacesFor(second.getId()).getFirst().getSlug();
+        String slugA = iam.workspacesFor(first.id()).getFirst().slug();
+        String slugB = iam.workspacesFor(second.id()).getFirst().slug();
 
         assertThat(slugA).isNotEqualTo(slugB);
     }

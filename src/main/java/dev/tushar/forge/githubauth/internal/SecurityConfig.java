@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubauth;
+package dev.tushar.forge.githubauth.internal;
 
 import dev.tushar.forge.iam.SessionService;
 import java.time.Duration;

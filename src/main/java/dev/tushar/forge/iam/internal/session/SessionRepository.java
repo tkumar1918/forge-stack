@@ -1,11 +1,11 @@
-package dev.tushar.forge.iam;
+package dev.tushar.forge.iam.internal.session;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 
-interface SessionRepository extends JpaRepository<Session, UUID> {
+public interface SessionRepository extends JpaRepository<Session, UUID> {
 
     Optional<Session> findByTokenHash(byte[] tokenHash);
 

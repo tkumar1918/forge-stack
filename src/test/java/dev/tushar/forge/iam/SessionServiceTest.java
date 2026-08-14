@@ -26,9 +26,9 @@ class SessionServiceTest extends AbstractIntegrationTest {
     @BeforeEach
     void createUser() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        User user = provisioning.provision(new UserProvisioningService.GithubProfile(
+        UserProfile user = provisioning.provision(new GithubProfile(
                 "gh-" + suffix, "octo-" + suffix, suffix + "@example.com", "Octo Cat", "https://example.com/a.png"));
-        this.userId = user.getId();
+        this.userId = user.id();
     }
 
     @Test
@@ -39,7 +39,7 @@ class SessionServiceTest extends AbstractIntegrationTest {
         assertThat(sessions.validate(issued.token()))
                 .isPresent()
                 .get()
-                .satisfies(session -> assertThat(session.getUserId()).isEqualTo(userId));
+                .satisfies(session -> assertThat(session.userId()).isEqualTo(userId));
     }
 
     @Test

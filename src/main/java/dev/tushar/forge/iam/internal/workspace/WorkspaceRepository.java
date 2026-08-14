@@ -1,4 +1,4 @@
-package dev.tushar.forge.iam;
+package dev.tushar.forge.iam.internal.workspace;
 
 import java.util.List;
 import java.util.Optional;
@@ -6,7 +6,7 @@ import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 
-interface WorkspaceRepository extends JpaRepository<Workspace, UUID> {
+public interface WorkspaceRepository extends JpaRepository<Workspace, UUID> {
 
     Optional<Workspace> findBySlug(String slug);
 

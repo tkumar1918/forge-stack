@@ -2,7 +2,8 @@ package dev.tushar.forge.api;
 
 import dev.tushar.forge.githubauth.ForgePrincipal;
 import dev.tushar.forge.iam.IamQueries;
-import dev.tushar.forge.iam.User;
+import dev.tushar.forge.iam.UserProfile;
+import dev.tushar.forge.iam.WorkspaceSummary;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.http.ResponseEntity;
@@ -21,9 +22,13 @@ class MeController {
         this.iam = iam;
     }
 
-    record WorkspaceView(UUID id, String slug, String name) {}
-
-    record MeView(UUID userId, String email, String displayName, String avatarUrl, UUID activeWorkspaceId, List<WorkspaceView> workspaces) {}
+    record MeView(
+            UUID userId,
+            String email,
+            String displayName,
+            String avatarUrl,
+            UUID activeWorkspaceId,
+            List<WorkspaceSummary> workspaces) {}
 
     @GetMapping
     ResponseEntity<MeView> me(@AuthenticationPrincipal ForgePrincipal principal) {
@@ -32,17 +37,13 @@ class MeController {
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
-    private MeView toView(User user, ForgePrincipal principal) {
-        List<WorkspaceView> workspaces = iam.workspacesFor(user.getId()).stream()
-                .map(w -> new WorkspaceView(w.getId(), w.getSlug(), w.getName()))
-                .toList();
-
+    private MeView toView(UserProfile user, ForgePrincipal principal) {
         return new MeView(
-                user.getId(),
-                user.getPrimaryEmail(),
-                user.getDisplayName(),
-                user.getAvatarUrl(),
+                user.id(),
+                user.email(),
+                user.displayName(),
+                user.avatarUrl(),
                 principal.activeWorkspaceId(),
-                workspaces);
+                iam.workspacesFor(user.id()));
     }
 }

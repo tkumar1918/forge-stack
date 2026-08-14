@@ -1,4 +1,4 @@
-package dev.tushar.forge.iam;
+package dev.tushar.forge.iam.internal.session;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -55,7 +55,7 @@ public class Session {
 
     protected Session() {}
 
-    static Session issue(UUID userId, byte[] tokenHash, String userAgent, Instant expiresAt) {
+    public static Session issue(UUID userId, byte[] tokenHash, String userAgent, Instant expiresAt) {
         Session session = new Session();
         Instant now = Instant.now();
         session.id = UUID.randomUUID();
@@ -72,11 +72,11 @@ public class Session {
         return revokedAt == null && expiresAt.isAfter(at);
     }
 
-    void touch(Instant at) {
+    public void touch(Instant at) {
         this.lastSeenAt = at;
     }
 
-    void revoke(Instant at) {
+    public void revoke(Instant at) {
         if (this.revokedAt == null) {
             this.revokedAt = at;
         }

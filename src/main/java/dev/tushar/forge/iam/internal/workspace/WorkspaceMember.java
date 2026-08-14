@@ -1,4 +1,4 @@
-package dev.tushar.forge.iam;
+package dev.tushar.forge.iam.internal.workspace;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Embeddable;
@@ -7,6 +7,7 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.Table;
+import dev.tushar.forge.iam.WorkspaceRole;
 import java.io.Serializable;
 import java.time.Instant;
 import java.util.Objects;
@@ -16,14 +17,6 @@ import java.util.UUID;
 @Entity
 @Table(name = "workspace_members")
 public class WorkspaceMember {
-
-    /** Four roles, deliberately. Richer RBAC is deferred until someone asks for it. */
-    public enum Role {
-        OWNER,
-        ADMIN,
-        MAINTAINER,
-        VIEWER
-    }
 
     @Embeddable
     public record Key(
@@ -36,7 +29,7 @@ public class WorkspaceMember {
 
     @Enumerated(EnumType.STRING)
     @Column(name = "role", nullable = false)
-    private Role role;
+    private WorkspaceRole role;
 
     @Column(name = "invited_by")
     private UUID invitedBy;
@@ -46,7 +39,7 @@ public class WorkspaceMember {
 
     protected WorkspaceMember() {}
 
-    public static WorkspaceMember of(UUID workspaceId, UUID userId, Role role, UUID invitedBy) {
+    public static WorkspaceMember of(UUID workspaceId, UUID userId, WorkspaceRole role, UUID invitedBy) {
         WorkspaceMember member = new WorkspaceMember();
         member.id = new Key(workspaceId, userId);
         member.role = role;
@@ -63,7 +56,7 @@ public class WorkspaceMember {
         return id.userId();
     }
 
-    public Role getRole() {
+    public WorkspaceRole getRole() {
         return role;
     }
 

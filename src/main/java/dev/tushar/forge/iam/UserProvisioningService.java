@@ -1,5 +1,13 @@
 package dev.tushar.forge.iam;
 
+import dev.tushar.forge.iam.internal.user.User;
+import dev.tushar.forge.iam.internal.user.UserIdentity;
+import dev.tushar.forge.iam.internal.user.UserIdentityRepository;
+import dev.tushar.forge.iam.internal.user.UserRepository;
+import dev.tushar.forge.iam.internal.workspace.Workspace;
+import dev.tushar.forge.iam.internal.workspace.WorkspaceMember;
+import dev.tushar.forge.iam.internal.workspace.WorkspaceMemberRepository;
+import dev.tushar.forge.iam.internal.workspace.WorkspaceRepository;
 import java.util.Locale;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
@@ -29,15 +37,14 @@ public class UserProvisioningService {
         this.members = members;
     }
 
-    /** A verified GitHub identity. Deliberately carries no access token. */
-    public record GithubProfile(String providerUserId, String login, String email, String name, String avatarUrl) {}
-
     @Transactional
-    public User provision(GithubProfile profile) {
-        return identities
+    public UserProfile provision(GithubProfile profile) {
+        User user = identities
                 .findByProviderAndProviderUserId(UserIdentity.PROVIDER_GITHUB, profile.providerUserId())
                 .map(identity -> refreshExisting(identity, profile))
                 .orElseGet(() -> createNew(profile));
+
+        return new UserProfile(user.getId(), user.getPrimaryEmail(), user.getDisplayName(), user.getAvatarUrl());
     }
 
     private User refreshExisting(UserIdentity identity, GithubProfile profile) {
@@ -62,7 +69,7 @@ public class UserProvisioningService {
         // GitHub App. It grants no repository access on its own.
         Workspace workspace = workspaces.save(
                 Workspace.create(uniqueSlug(profile.login()), "%s's workspace".formatted(profile.login())));
-        members.save(WorkspaceMember.of(workspace.getId(), user.getId(), WorkspaceMember.Role.OWNER, null));
+        members.save(WorkspaceMember.of(workspace.getId(), user.getId(), WorkspaceRole.OWNER, null));
 
         return user;
     }

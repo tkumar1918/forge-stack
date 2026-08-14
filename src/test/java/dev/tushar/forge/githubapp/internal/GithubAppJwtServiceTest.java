@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubapp;
+package dev.tushar.forge.githubapp.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;

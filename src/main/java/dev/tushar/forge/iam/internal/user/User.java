@@ -1,4 +1,4 @@
-package dev.tushar.forge.iam;
+package dev.tushar.forge.iam.internal.user;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;

@@ -52,6 +52,18 @@ class AbstractionHygieneTest {
     }
 
     /**
+     * Modules are organised by concept, not by technical layer.
+     *
+     * <p>Inside a module, {@code internal} is grouped by aggregate — {@code internal/user},
+     * {@code internal/workspace}, {@code internal/session} — so an entity and its repository sit
+     * together and change together.
+     */
+    @Test
+    void packagesAreNamedAfterConceptsNotLayers() {
+        AbstractionRules.packagesAreNamedAfterConceptsNotLayers(ROOT).check(productionClasses);
+    }
+
+    /**
      * Keeps the execution substrate swappable.
      *
      * <p>A clean {@code SandboxProvider} interface does not decouple anything on its own — the

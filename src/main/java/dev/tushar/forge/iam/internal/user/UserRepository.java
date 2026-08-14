@@ -1,10 +1,10 @@
-package dev.tushar.forge.iam;
+package dev.tushar.forge.iam.internal.user;
 
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 
-interface UserRepository extends JpaRepository<User, UUID> {
+public interface UserRepository extends JpaRepository<User, UUID> {
 
     Optional<User> findByPrimaryEmail(String primaryEmail);
 }

@@ -1,5 +1,7 @@
 package dev.tushar.forge.iam;
 
+import dev.tushar.forge.iam.internal.session.Session;
+import dev.tushar.forge.iam.internal.session.SessionRepository;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -39,9 +41,6 @@ public class SessionService {
         this.sessions = sessions;
     }
 
-    /** A newly issued session and its raw token. The token is not recoverable afterwards. */
-    public record IssuedSession(UUID sessionId, String token, Instant expiresAt) {}
-
     @Transactional
     public IssuedSession issue(UUID userId, String userAgent) {
         byte[] raw = new byte[TOKEN_BYTES];
@@ -62,14 +61,14 @@ public class SessionService {
      * which, and does not need to.
      */
     @Transactional
-    public Optional<Session> validate(String token) {
+    public Optional<AuthenticatedSession> validate(String token) {
         if (token == null || token.isBlank()) {
             return Optional.empty();
         }
         Instant now = Instant.now();
         return sessions.findByTokenHash(hash(token)).filter(session -> session.isActive(now)).map(session -> {
             session.touch(now);
-            return session;
+            return new AuthenticatedSession(session.getId(), session.getUserId(), session.getWorkspaceId());
         });
     }
 

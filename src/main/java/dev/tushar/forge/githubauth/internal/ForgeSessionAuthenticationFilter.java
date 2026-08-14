@@ -1,6 +1,7 @@
-package dev.tushar.forge.githubauth;
+package dev.tushar.forge.githubauth.internal;
 
-import dev.tushar.forge.iam.Session;
+import dev.tushar.forge.githubauth.ForgePrincipal;
+import dev.tushar.forge.iam.AuthenticatedSession;
 import dev.tushar.forge.iam.SessionService;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -35,11 +36,11 @@ public class ForgeSessionAuthenticationFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
 
         if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            Optional<Session> session = ForgeSessionCookie.read(request).flatMap(sessions::validate);
+            Optional<AuthenticatedSession> session = ForgeSessionCookie.read(request).flatMap(sessions::validate);
 
             session.ifPresent(active -> {
                 ForgePrincipal principal =
-                        new ForgePrincipal(active.getUserId(), active.getId(), active.getWorkspaceId());
+                        new ForgePrincipal(active.userId(), active.sessionId(), active.workspaceId());
                 var authentication = new UsernamePasswordAuthenticationToken(principal, null, List.of());
                 SecurityContextHolder.getContext().setAuthentication(authentication);
             });
