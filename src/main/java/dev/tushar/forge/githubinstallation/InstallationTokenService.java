@@ -2,10 +2,13 @@ package dev.tushar.forge.githubinstallation;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import dev.tushar.forge.githubinstallation.internal.GithubAppJwtService;
@@ -15,8 +18,8 @@ import org.springframework.web.client.RestClient;
 /**
  * Mints and caches scoped GitHub installation tokens.
  *
- * <p>This is where {@link TokenScope} becomes a real credential. Tokens live one hour; the cache
- * holds them for fifty minutes so a token is never handed out close to expiry.
+ * <p>This is where {@link TokenScope} becomes a real credential. Tokens are cached until GitHub's
+ * own stated expiry, less ten minutes, so one is never handed out close to expiring.
  *
  * <p><strong>Tokens are cached in Redis in plain text today.</strong> They are short-lived and
  * narrowly scoped, but this is a known gap: envelope encryption arrives with {@code
@@ -27,8 +30,11 @@ public class InstallationTokenService {
 
     private static final Logger log = LoggerFactory.getLogger(InstallationTokenService.class);
 
-    /** GitHub tokens last 60 minutes. Ten minutes of headroom avoids handing out a stale one. */
-    private static final Duration CACHE_TTL = Duration.ofMinutes(50);
+    /** Never hand out a token within this long of its expiry. */
+    private static final Duration EXPIRY_HEADROOM = Duration.ofMinutes(10);
+
+    /** Below this, caching is not worth the round trip; mint fresh next time instead. */
+    private static final Duration MIN_CACHE_TTL = Duration.ofMinutes(1);
 
     private static final String CACHE_PREFIX = "forge:ghtok:";
 
@@ -60,19 +66,36 @@ public class InstallationTokenService {
      * a different key. A read-only caller can never be served a write-capable token.
      */
     public String tokenFor(TokenScope scope) {
-        String cacheKey = CACHE_PREFIX + scope.fingerprint();
+        String cacheKey = cacheKey(scope.installationId(), scope.fingerprint());
 
         String cached = redis.opsForValue().get(cacheKey);
         if (cached != null) {
             return cached;
         }
 
-        String token = mint(scope);
-        redis.opsForValue().set(cacheKey, token, CACHE_TTL);
-        return token;
+        TokenResponse minted = mint(scope);
+
+        // Cache until GitHub's own expiry rather than a fixed guess: a token that turns out to be
+        // short-lived must not outlive its usefulness in the cache.
+        Duration ttl = Duration.between(Instant.now(), minted.expires_at()).minus(EXPIRY_HEADROOM);
+        if (ttl.compareTo(MIN_CACHE_TTL) >= 0) {
+            redis.opsForValue().set(cacheKey, minted.token(), ttl);
+        }
+        return minted.token();
     }
 
-    private String mint(TokenScope scope) {
+    /**
+     * The installation id is a key segment, not only an ingredient of the fingerprint.
+     *
+     * <p>{@link TokenScope#fingerprint()} hashes the installation id in, which makes keys unique
+     * but unenumerable. Eviction has to match on the installation, so the id has to survive in the
+     * clear.
+     */
+    private static String cacheKey(long installationId, String fingerprint) {
+        return CACHE_PREFIX + installationId + ":" + fingerprint;
+    }
+
+    private TokenResponse mint(TokenScope scope) {
         log.debug(
                 "Minting installation token: installation={} repositories={} permissions={}",
                 scope.installationId(),
@@ -89,20 +112,36 @@ public class InstallationTokenService {
                 .retrieve()
                 .body(TokenResponse.class);
 
-        if (response == null || response.token() == null) {
+        if (response == null || response.token() == null || response.expires_at() == null) {
             throw new IllegalStateException(
-                    "GitHub returned no token for installation " + scope.installationId());
+                    "GitHub returned no usable token for installation " + scope.installationId());
         }
-        return response.token();
+        return response;
     }
 
-    /** Drops cached tokens for an installation — used when it is suspended or uninstalled. */
-    public void evictAll(long installationId) {
-        // Scope fingerprints are opaque, so the cheap path is a scan over the small token keyspace.
-        var keys = redis.keys(CACHE_PREFIX + "*");
-        if (keys != null && !keys.isEmpty()) {
-            redis.delete(List.copyOf(keys));
+    /**
+     * Drops cached tokens for one installation — used when it is suspended or uninstalled.
+     *
+     * <p>Scoped to the installation: this Redis also holds queues, leases and rate limiters for
+     * every workspace, and one customer's suspension must not flush another's cache.
+     *
+     * <p>{@code SCAN} rather than {@code KEYS}, which is O(whole keyspace) and blocks the event
+     * loop. SCAN may miss a key written mid-scan; that costs one narrowly-scoped token living out
+     * its remaining minutes, which is an acceptable trade for not stalling Redis.
+     */
+    public void evict(long installationId) {
+        ScanOptions options = ScanOptions.scanOptions()
+                .match(CACHE_PREFIX + installationId + ":*")
+                .count(256)
+                .build();
+
+        List<String> doomed = new ArrayList<>();
+        try (Cursor<String> cursor = redis.scan(options)) {
+            cursor.forEachRemaining(doomed::add);
         }
-        log.info("Evicted cached installation tokens after change to installation {}", installationId);
+        if (!doomed.isEmpty()) {
+            redis.delete(doomed);
+        }
+        log.info("Evicted {} cached tokens for installation {}", doomed.size(), installationId);
     }
 }
