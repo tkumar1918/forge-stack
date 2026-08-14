@@ -112,6 +112,26 @@ class AbstractionHygieneTest {
                 .check(productionClasses);
     }
 
+    /**
+     * The HTTP layer is a leaf. Nothing may depend on it.
+     *
+     * <p>Modulith enforces this only for as long as no module happens to list {@code api} in its
+     * {@code allowedDependencies} — an omission, not a guarantee. Stated directly here, because
+     * "moving to a different transport touches only this package" stops being true the moment a
+     * controller package acquires a dependent.
+     */
+    @Test
+    void nothingDependsOnTheApiModule() {
+        noClasses()
+                .that()
+                .resideOutsideOfPackage(ROOT + ".api..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAPackage(ROOT + ".api..")
+                .because("the HTTP layer is the outermost ring; a dependent would invert it")
+                .check(productionClasses);
+    }
+
     /** Prints the current inventory so growth is noticed in review, not a year later. */
     @Test
     void printPortInventory() {
