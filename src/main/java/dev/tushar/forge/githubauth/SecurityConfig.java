@@ -2,6 +2,8 @@ package dev.tushar.forge.githubauth;
 
 import dev.tushar.forge.iam.SessionService;
 import java.time.Duration;
+
+import org.jspecify.annotations.NonNull;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -75,9 +77,9 @@ class SecurityConfig {
         return new SimpleUrlAuthenticationSuccessHandler(loginSuccessRedirect) {
             @Override
             public void onAuthenticationSuccess(
-                    jakarta.servlet.http.HttpServletRequest request,
-                    jakarta.servlet.http.HttpServletResponse response,
-                    org.springframework.security.core.Authentication authentication)
+                    jakarta.servlet.http.@NonNull HttpServletRequest request,
+                    jakarta.servlet.http.@NonNull HttpServletResponse response,
+                    org.springframework.security.core.@NonNull Authentication authentication)
                     throws java.io.IOException, jakarta.servlet.ServletException {
 
                 if (authentication.getPrincipal() instanceof OAuth2User user) {
