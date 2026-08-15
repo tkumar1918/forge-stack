@@ -10,5 +10,5 @@
  */
 @org.springframework.modulith.ApplicationModule(
         displayName = "GitHub Installation",
-        allowedDependencies = {"iam", "platform", "platform::tenancy"})
+        allowedDependencies = {"iam", "audit", "platform", "platform::tenancy"})
 package dev.tushar.forge.githubinstallation;

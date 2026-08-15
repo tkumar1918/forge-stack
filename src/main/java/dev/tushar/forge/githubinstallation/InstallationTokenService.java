@@ -1,19 +1,16 @@
 package dev.tushar.forge.githubinstallation;
 
+import dev.tushar.forge.githubinstallation.internal.GithubAppClient;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
-import dev.tushar.forge.githubinstallation.internal.GithubAppJwtService;
-import dev.tushar.forge.githubinstallation.internal.GithubAppProperties;
-import org.springframework.web.client.RestClient;
 
 /**
  * Mints and caches scoped GitHub installation tokens.
@@ -38,26 +35,13 @@ public class InstallationTokenService {
 
     private static final String CACHE_PREFIX = "forge:ghtok:";
 
-    private final GithubAppJwtService appJwt;
+    private final GithubAppClient github;
     private final StringRedisTemplate redis;
-    private final RestClient restClient;
 
-    InstallationTokenService(
-            GithubAppJwtService appJwt,
-            StringRedisTemplate redis,
-            GithubAppProperties properties,
-            RestClient.Builder restClientBuilder) {
-        this.appJwt = appJwt;
+    InstallationTokenService(GithubAppClient github, StringRedisTemplate redis) {
+        this.github = github;
         this.redis = redis;
-        this.restClient = restClientBuilder
-                .baseUrl(properties.apiBaseUrl())
-                .defaultHeader("Accept", "application/vnd.github+json")
-                .defaultHeader("X-GitHub-Api-Version", "2022-11-28")
-                .build();
     }
-
-    /** GitHub's response to a token request. */
-    record TokenResponse(String token, Instant expires_at) {}
 
     /**
      * Returns a token carrying exactly {@code scope}, from cache when possible.
@@ -73,11 +57,16 @@ public class InstallationTokenService {
             return cached;
         }
 
-        TokenResponse minted = mint(scope);
+        log.debug(
+                "Minting installation token: installation={} repositories={} permissions={}",
+                scope.installationId(),
+                scope.repositories(),
+                scope.permissions().keySet());
+        GithubAppClient.InstallationToken minted = github.mintInstallationToken(scope);
 
         // Cache until GitHub's own expiry rather than a fixed guess: a token that turns out to be
         // short-lived must not outlive its usefulness in the cache.
-        Duration ttl = Duration.between(Instant.now(), minted.expires_at()).minus(EXPIRY_HEADROOM);
+        Duration ttl = Duration.between(Instant.now(), minted.expiresAt()).minus(EXPIRY_HEADROOM);
         if (ttl.compareTo(MIN_CACHE_TTL) >= 0) {
             redis.opsForValue().set(cacheKey, minted.token(), ttl);
         }
@@ -93,30 +82,6 @@ public class InstallationTokenService {
      */
     private static String cacheKey(long installationId, String fingerprint) {
         return CACHE_PREFIX + installationId + ":" + fingerprint;
-    }
-
-    private TokenResponse mint(TokenScope scope) {
-        log.debug(
-                "Minting installation token: installation={} repositories={} permissions={}",
-                scope.installationId(),
-                scope.repositories(),
-                scope.permissions().keySet());
-
-        TokenResponse response = restClient
-                .post()
-                .uri("/app/installations/{id}/access_tokens", scope.installationId())
-                .header("Authorization", "Bearer " + appJwt.mintAppJwt())
-                .body(Map.of(
-                        "repositories", scope.repositories(),
-                        "permissions", scope.permissions()))
-                .retrieve()
-                .body(TokenResponse.class);
-
-        if (response == null || response.token() == null || response.expires_at() == null) {
-            throw new IllegalStateException(
-                    "GitHub returned no usable token for installation " + scope.installationId());
-        }
-        return response;
     }
 
     /**

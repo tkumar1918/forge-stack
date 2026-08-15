@@ -1,4 +1,4 @@
-package dev.tushar.forge.api;
+package dev.tushar.forge.api.session;
 
 import dev.tushar.forge.githublogin.ForgePrincipal;
 import dev.tushar.forge.iam.IamQueries;

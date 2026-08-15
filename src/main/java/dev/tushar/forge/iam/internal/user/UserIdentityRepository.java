@@ -7,4 +7,6 @@ import org.springframework.data.jpa.repository.JpaRepository;
 public interface UserIdentityRepository extends JpaRepository<UserIdentity, UUID> {
 
     Optional<UserIdentity> findByProviderAndProviderUserId(String provider, String providerUserId);
+
+    Optional<UserIdentity> findByUserIdAndProvider(UUID userId, String provider);
 }

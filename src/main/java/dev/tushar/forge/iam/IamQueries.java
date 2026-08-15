@@ -1,8 +1,10 @@
 package dev.tushar.forge.iam;
 
+import dev.tushar.forge.iam.internal.user.UserIdentity;
+import dev.tushar.forge.iam.internal.user.UserIdentityRepository;
+import dev.tushar.forge.iam.internal.user.UserRepository;
 import dev.tushar.forge.iam.internal.workspace.WorkspaceMemberRepository;
 import dev.tushar.forge.iam.internal.workspace.WorkspaceRepository;
-import dev.tushar.forge.iam.internal.user.UserRepository;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -20,11 +22,17 @@ import org.springframework.transaction.annotation.Transactional;
 public class IamQueries {
 
     private final UserRepository users;
+    private final UserIdentityRepository identities;
     private final WorkspaceRepository workspaces;
     private final WorkspaceMemberRepository members;
 
-    IamQueries(UserRepository users, WorkspaceRepository workspaces, WorkspaceMemberRepository members) {
+    IamQueries(
+            UserRepository users,
+            UserIdentityRepository identities,
+            WorkspaceRepository workspaces,
+            WorkspaceMemberRepository members) {
         this.users = users;
+        this.identities = identities;
         this.workspaces = workspaces;
         this.members = members;
     }
@@ -54,5 +62,21 @@ public class IamQueries {
 
     public boolean isMember(UUID workspaceId, UUID userId) {
         return roleIn(workspaceId, userId).isPresent();
+    }
+
+    /**
+     * The user's numeric GitHub account id, as GitHub reported it at login.
+     *
+     * <p>Exposed because it is the only thing Forge holds that can prove a person owns a GitHub
+     * account. Binding a GitHub App installation compares it against the installation's
+     * {@code account.id}, which is what stops someone claiming a stranger's installation.
+     *
+     * <p>The numeric id and not the login: logins are renameable and reusable, so a check against
+     * one is a check against whoever holds that name today.
+     */
+    public Optional<String> githubUserId(UUID userId) {
+        return identities
+                .findByUserIdAndProvider(userId, UserIdentity.PROVIDER_GITHUB)
+                .map(UserIdentity::getProviderUserId);
     }
 }
