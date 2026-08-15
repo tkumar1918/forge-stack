@@ -44,3 +44,4 @@ out/
 *.pkcs8
 .env
 .env.*
+!.env.example
