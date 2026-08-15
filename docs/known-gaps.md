@@ -26,7 +26,7 @@ must not tell a caller whether an installation id exists — but it also swallow
 | 403 | rejection, indistinguishable from 404 | WARN — usually a suspended App or a spent rate limit |
 | 404 | rejection, indistinguishable from 403 | DEBUG — the ordinary answer for a guessed id |
 
-Surfacing the 401 leaks nothing: it depends only on Forge's own configuration and never on the id
+Surfacing the 401 leaks nothing: it depends only on ForgeStack's own configuration and never on the id
 asked for, so it is not an oracle. 403 and 404 stay deliberately identical to the caller.
 
 Covered by `InstallationBindingServiceTest.badAppCredentialsFailLoudly`, watched failing
@@ -37,7 +37,7 @@ PKCS#1 and throws with the exact `openssl` command.
 
 ### 1.2 The session cookie is `Secure`, and `curl` will not send it over HTTP
 
-`forge.security.cookie-secure` defaults to `true`, so `ForgeSessionCookie` marks the cookie
+`forgestack.security.cookie-secure` defaults to `true`, so `ForgeStackSessionCookie` marks the cookie
 `Secure`. Over plain `http://localhost:8080` **`curl` withholds it**, and every authenticated step
 of the §7 checklist fails with a bare 401 that reads as broken authentication.
 
@@ -45,11 +45,24 @@ Browsers permit `Secure` cookies on `localhost`, which makes this worse rather t
 works in Chrome and fails in `curl` within the same session.
 
 **Deliberately not fixed by changing the default** — a default that is insecure for local
-convenience is how it reaches production. Override at run time:
+convenience is how it reaches production. `scripts/dev.sh` passes the override at run time instead:
 
 ```
-SPRING_APPLICATION_JSON='{"forge":{"security":{"cookie-secure":false}}}' ./gradlew bootRun
+./gradlew bootRun --args='--forgestack.security.cookie-secure=false'
 ```
+
+### 1.2b The compose Postgres had never worked — **fixed**
+
+`docker-compose.yml` mounted the volume at `/var/lib/postgresql/data`, but `postgres:18` keeps data
+in a version-specific subdirectory and wants the mount one level up, at `/var/lib/postgresql`. It
+refused to start, exit 1, and had done since the first commit.
+
+Nobody noticed for a month because **every test runs on Testcontainers**, which mounts no volume.
+The compose stack is only needed to run the app for real, which had not happened until GitHub
+credentials arrived.
+
+Worth keeping as a category, not just a fix: anything the test suite does not touch is unverified,
+however long it has been sitting in the repository looking correct.
 
 ### 1.3 GitHub hands out a PKCS#1 private key; the JDK cannot read it
 
@@ -58,7 +71,7 @@ Already handled with an actionable error naming the exact `openssl` command
 
 ```
 openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
-  -in github-app.private-key.pem -out github-app.pkcs8.pem
+  -in forgestack-app.private-key.pem -out forgestack-app.pkcs8.pem
 ```
 
 ### 1.4 Organization installs are refused
@@ -79,7 +92,7 @@ browser client; revisit when there is one.
 | Gap | Risk | Trigger to fix |
 |---|---|---|
 | **Installation tokens cached in Redis as plaintext** | Redis is credential-bearing infrastructure today. Tokens are short-lived and narrowly scoped, which bounds it. | `platform.crypto` envelope encryption |
-| **Database passwords in `application.yaml`** (`forge_app`/`forge_app`) | Local-only values, but the shape invites a real one being pasted there | Before any deployed environment |
+| **Database passwords in `application.yaml`** (`forgestack_app`/`forgestack_app`) | Local-only values, but the shape invites a real one being pasted there | Before any deployed environment |
 | **CSRF disabled for `/api/**`** | Session cookie is `SameSite=Lax` and the API is same-origin, so exposure is limited | Browser client lands |
 | **No sandbox isolation yet** | Not applicable until the sandbox exists, but the plan's residual-risk note (container ≠ VM boundary) stands | Before public self-serve signup — gVisor is the cheap next step |
 
@@ -97,7 +110,7 @@ rather than loudly — which is why it is written down.
 
 ### 3.2 Uninstalls and suspensions are not noticed
 
-There is no webhook handling (Phase 6). If a customer uninstalls the App or suspends it, Forge keeps
+There is no webhook handling (Phase 6). If a customer uninstalls the App or suspends it, ForgeStack keeps
 believing it has access until something fails. `InstallationTokenService.evict` exists for this but
 has no caller.
 
@@ -146,7 +159,7 @@ Options when this is picked up, in rough order of preference:
 
 ### 4.2 No workspace switching
 
-`ForgePrincipal.activeWorkspaceId` is now load-bearing for every installation and repository
+`ForgeStackPrincipal.activeWorkspaceId` is now load-bearing for every installation and repository
 endpoint, and it is set once at login. There is no `PUT /api/session/workspace`.
 
 Harmless while every user has exactly one workspace. **Becomes necessary the moment invitations
@@ -226,6 +239,6 @@ Once real credentials exist, this is what has never been exercised end to end:
 - [ ] Hand-edit `installation_id` in the callback URL to any other number — rejected, and an
       `INSTALLATION_BIND_REJECTED` row appears in `audit_events`
 - [ ] Verify no GitHub token, and no App private key, appears in application logs
-- [ ] Restart with a deliberately wrong `FORGE_GITHUB_APP_APP_ID` and replay the callback — expect a
+- [ ] Restart with a deliberately wrong `FORGESTACK_GITHUB_APP_ID` and replay the callback — expect a
       **500** naming the credentials, not a `403`. This is the §1.1 fix, and the one item here that
       cannot be checked against `FakeGithub`

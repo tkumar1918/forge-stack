@@ -1,26 +1,26 @@
 services:
   postgres:
     image: postgres:18-alpine
-    container_name: forge-postgres
+    container_name: forgestack-postgres
     environment:
-      POSTGRES_DB: forge
+      POSTGRES_DB: forgestack
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
       - "5432:5432"
     volumes:
-      - forge-pgdata:/var/lib/postgresql/data
+      - forgestack-pgdata:/var/lib/postgresql
       # Runs once, on an empty data directory only.
       - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d forge"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d forgestack"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   redis:
     image: redis:8-alpine
-    container_name: forge-redis
+    container_name: forgestack-redis
     # Redis holds only derived state (queues, leases, caches). Losing it must cost
     # latency, not correctness, so no persistence is configured here on purpose.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -33,4 +33,4 @@ services:
       retries: 10
 
 volumes:
-  forge-pgdata:
+  forgestack-pgdata:

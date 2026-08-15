@@ -1,4 +1,4 @@
--- GitHub App: installations, the repositories they expose, and the ones Forge maintains.
+-- GitHub App: installations, the repositories they expose, and the ones ForgeStack maintains.
 --
 -- The split between github_repositories and managed_repositories is the schema-level
 -- expression of the product's central rule: installation access is NOT consent to be
@@ -17,7 +17,7 @@ CREATE TABLE github_installations (
     account_login      text        NOT NULL,
     account_type       text        NOT NULL,
     account_id         bigint      NOT NULL,
-    -- What GitHub actually granted. The ceiling on any token we can mint; Forge policy
+    -- What GitHub actually granted. The ceiling on any token we can mint; ForgeStack policy
     -- narrows below this but can never widen beyond it.
     permissions        jsonb       NOT NULL DEFAULT '{}'::jsonb,
     events             jsonb       NOT NULL DEFAULT '[]'::jsonb,
@@ -55,7 +55,7 @@ CREATE TABLE github_repositories (
 CREATE INDEX github_repositories_workspace_idx ON github_repositories (workspace_id);
 
 -- ---------------------------------------------------------------------------
--- Repositories Forge has been told to maintain (explicit opt-in)
+-- Repositories ForgeStack has been told to maintain (explicit opt-in)
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE managed_repositories (

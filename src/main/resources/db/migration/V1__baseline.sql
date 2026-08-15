@@ -1,6 +1,6 @@
--- Forge baseline: tenancy, identity, audit.
+-- ForgeStack baseline: tenancy, identity, audit.
 --
--- Runs as forge_migrator (schema owner). The application connects as forge_app, which is
+-- Runs as forgestack_migrator (schema owner). The application connects as forgestack_app, which is
 -- neither superuser nor BYPASSRLS nor the table owner.
 
 -- Case-insensitive identifiers (emails, slugs) are stored as plain text and normalised to
@@ -140,7 +140,7 @@ CREATE TABLE audit_events_2026_09 PARTITION OF audit_events
 -- Row-level security
 --
 -- FORCE is required as well as ENABLE: without it the table owner bypasses the policy,
--- and forge_migrator would silently see every tenant's rows.
+-- and forgestack_migrator would silently see every tenant's rows.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
@@ -164,9 +164,9 @@ CREATE POLICY audit_events_tenant_isolation ON audit_events
 -- ---------------------------------------------------------------------------
 
 -- Audit is append-only: the application can write and read history, never rewrite it.
-REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM forge_app;
-REVOKE UPDATE, DELETE, TRUNCATE ON audit_events_default FROM forge_app;
-REVOKE UPDATE, DELETE, TRUNCATE ON audit_events_2026_08 FROM forge_app;
-REVOKE UPDATE, DELETE, TRUNCATE ON audit_events_2026_09 FROM forge_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM forgestack_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_events_default FROM forgestack_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_events_2026_08 FROM forgestack_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_events_2026_09 FROM forgestack_app;
 
-GRANT SELECT, INSERT ON audit_events TO forge_app;
+GRANT SELECT, INSERT ON audit_events TO forgestack_app;

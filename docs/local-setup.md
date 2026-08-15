@@ -1,6 +1,6 @@
 # Local setup with real GitHub credentials
 
-How to point Forge at a real GitHub account for the first time. GitHub's two registration forms
+How to point ForgeStack at a real GitHub account for the first time. GitHub's two registration forms
 demand a handful of URLs; **most of them are required and inert, and exactly two decide whether the
 flows work.** Knowing which two is the point of this document.
 
@@ -37,27 +37,27 @@ ever see it. Point it at the frontend when one exists.
 
 | Field | Value | What it does |
 |---|---|---|
-| Application name | `Forge (local)` | Shown on the consent screen |
+| Application name | `ForgeStack (local)` | Shown on the consent screen |
 | Homepage URL | `http://localhost:8080` | Nothing — required by the form, displayed only |
 | **Redirect URI** | `http://localhost:8080/login/oauth2/code/github` | **Load-bearing** — Spring Security owns this path |
 | Allow wildcard matching | **unchecked** | A wildcard redirect lets any matching subdomain or path receive the authorization code |
 | Enable Device Flow | unchecked | Not used |
-| Expire user access tokens | either | Irrelevant — Forge discards the user token after the profile fetch and never stores it |
+| Expire user access tokens | either | Irrelevant — ForgeStack discards the user token after the profile fetch and never stores it |
 
 GitHub used to call the Redirect URI field **"Authorization callback URL"**, and older guides still
-do. It is now a repeatable list of up to ten; one entry is all Forge needs.
+do. It is now a repeatable list of up to ten; one entry is all ForgeStack needs.
 
 That value is not a choice. `application.yaml` sets no `redirect-uri`, so Spring Security builds it
 from the default template `{baseUrl}/login/oauth2/code/{registrationId}` and the registration is
 named `github`. Exactly that string, no trailing slash.
 
-Scopes are not configured here; Forge requests `read:user` and `user:email` at authorization time
+Scopes are not configured here; ForgeStack requests `read:user` and `user:email` at authorization time
 (`application.yaml`). If the consent screen ever asks for repository access, something is wrong —
 that is the property `GithubOAuthScopeTest` exists to protect.
 
 ```bash
-export GITHUB_OAUTH_CLIENT_ID=...
-export GITHUB_OAUTH_CLIENT_SECRET=...
+export FORGESTACK_GITHUB_OAUTH_CLIENT_ID=...
+export FORGESTACK_GITHUB_OAUTH_CLIENT_SECRET=...
 ```
 
 Those two names are literal — `application.yaml` references them as explicit placeholders.
@@ -68,9 +68,9 @@ Those two names are literal — `application.yaml` references them as explicit p
 
 | Field | Value | What it does |
 |---|---|---|
-| GitHub App name | `Forge (local)` | Also generates the slug — see `FORGE_GITHUB_APP_SLUG` below |
+| GitHub App name | `ForgeStack (local)` | Also generates the slug — see `FORGESTACK_GITHUB_APP_SLUG` below |
 | Homepage URL | `http://localhost:8080` | Nothing — required by the form, displayed only |
-| Redirect URI | **leave blank** | This is the *App's own* user-auth flow. Forge identifies humans through the separate OAuth App above, so nothing consumes it |
+| Redirect URI | **leave blank** | This is the *App's own* user-auth flow. ForgeStack identifies humans through the separate OAuth App above, so nothing consumes it |
 | Request user authorization (OAuth) during installation | **unchecked** | Would change the install flow. It is option 1 of the deferred org-support decision (`known-gaps.md` §4.1), not a setting to enable casually |
 | Setup URL | `http://localhost:8080/api/installations/callback` | **Load-bearing** — `InstallationController.callback` |
 | Redirect on update | ticked | Sends `setup_action=update` back through the same verification |
@@ -80,7 +80,7 @@ Those two names are literal — `application.yaml` references them as explicit p
 The two "leave it alone" rows are the easy mistakes: the App form has its own Redirect URI field
 that looks exactly like the one that *is* required on the OAuth form. It is a different flow.
 
-A GitHub App also issues a **Client ID and client secret**. Forge uses neither — App authentication
+A GitHub App also issues a **Client ID and client secret**. ForgeStack uses neither — App authentication
 is private key → JWT. They exist for the user-auth flow left disabled above.
 
 **Install it on your personal account.** Organization installs are rejected with
@@ -110,7 +110,7 @@ What lands is **PKCS#1**, which the JDK cannot read. Convert once:
 
 ```bash
 openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
-  -in github-app.private-key.pem -out github-app.pkcs8.pem
+  -in forgestack-app.private-key.pem -out forgestack-app.pkcs8.pem
 ```
 
 `GithubAppJwtService.parsePrivateKey` detects the unconverted form and throws with this exact
@@ -124,13 +124,13 @@ installed on.
 ## 3. Environment
 
 Property names below are the relaxed-binding form of `@ConfigurationProperties(prefix =
-"forge.github.app")` on `GithubAppProperties`, bound via `@ConfigurationPropertiesScan` on
-`ForgeApplication`.
+"forgestack.github.app")` on `GithubAppProperties`, bound via `@ConfigurationPropertiesScan` on
+`ForgeStackApplication`.
 
 ```bash
-export FORGE_GITHUB_APP_APP_ID=...            # numeric App ID, top of the App's General page
-export FORGE_GITHUB_APP_SLUG=...              # URL slug — see below, it is not the display name
-export FORGE_GITHUB_APP_PRIVATE_KEY_PEM="$(cat github-app.pkcs8.pem)"
+export FORGESTACK_GITHUB_APP_ID=...            # numeric App ID, top of the App's General page
+export FORGESTACK_GITHUB_APP_SLUG=...              # URL slug — see below, it is not the display name
+export FORGESTACK_GITHUB_APP_PRIVATE_KEY_PEM="$(cat forgestack-app.pkcs8.pem)"
 ```
 
 **The slug is not the App name.** Read it off the App's public page URL —
@@ -140,38 +140,54 @@ exact moment a user clicks Connect, with nothing else to indicate why.
 
 Pass these as environment variables, never by pasting into `application.yaml`.
 
-`FORGE_GITHUB_APP_WEBHOOK_SECRET` and `FORGE_GITHUB_APP_API_BASE_URL` also bind, but neither is
+`FORGESTACK_GITHUB_APP_WEBHOOK_SECRET` and `FORGESTACK_GITHUB_APP_API_BASE_URL` also bind, but neither is
 needed yet — webhooks arrive in Phase 6, and the base URL only changes for GitHub Enterprise.
 
 ---
 
 ## 4. Running it
 
-The session cookie is marked `Secure` by default (`forge.security.cookie-secure`, default `true`).
-Over plain `http://localhost:8080` **`curl` will not send it back**, so every authenticated request
-fails with a bare 401 that looks like broken authentication. Browsers are more forgiving — Chrome and
-Firefox both permit `Secure` cookies on `localhost` — which makes this worse, not better: it works in
-the browser and fails in `curl` in the same session.
-
-Override it at run time rather than changing the default, because a default that is insecure for
-local convenience is how it reaches production:
-
 ```bash
-SPRING_APPLICATION_JSON='{"forge":{"security":{"cookie-secure":false}}}' ./gradlew bootRun
+docker compose up -d          # Postgres and Redis
+cp .env.example .env          # then fill it in
+./scripts/dev.sh
 ```
 
-Postgres and Redis come from `docker compose up -d`.
+**Spring Boot does not read `.env`, and nothing else here does either.** `scripts/dev.sh` is what
+loads it — do not delete the script assuming the framework handles this, because it does not. The
+script *sources* the file rather than parsing it, which is what makes this work:
+
+```bash
+FORGESTACK_GITHUB_APP_PRIVATE_KEY_PEM="$(cat forgestack-app.pkcs8.pem)"
+```
+
+The key stays in its own gitignored file instead of being pasted as one enormous line.
+
+The script also passes `--forgestack.security.cookie-secure=false`. The cookie is `Secure` by
+default, and over plain `http://localhost:8080` **`curl` will not send it back** — every
+authenticated request fails with a bare 401 that reads as broken authentication. Browsers permit
+`Secure` on `localhost`, which makes it worse rather than better: the flow works in Chrome and
+fails in `curl` in the same session. It is overridden at run time rather than weakened in
+`application.yaml`, where it would follow the app to production.
+
+If the GitHub App is misconfigured you will get, on first use:
+
+```
+GitHub App is not configured: set forgestack.github.app.id and forgestack.github.app.private-key-pem
+```
+
+That is the expected failure, not a bug — it means the environment did not reach the app.
 
 ---
 
 ## 5. Where the browser lands afterwards
 
-Two knobs, both Forge's own configuration rather than anything GitHub knows about:
+Two knobs, both ForgeStack's own configuration rather than anything GitHub knows about:
 
 | Property | Default | Set by |
 |---|---|---|
-| `forge.security.login-success-redirect` | `/` | `SecurityConfig` |
-| `forge.github.app.setup-redirect` | `/` | `InstallationController` |
+| `forgestack.security.login-success-redirect` | `/` | `SecurityConfig` |
+| `forgestack.github.app.setup-redirect` | `/` | `InstallationController` |
 
 Both stay at `/` while there is no frontend, and no CORS configuration is needed while everything is
 same-origin on port 8080. When `forge-frontend` becomes real, these two point at it and a CORS bean

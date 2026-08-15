@@ -1,24 +1,24 @@
 spring:
   application:
-    name: Forge
+    name: ForgeStack
 
   datasource:
-    # The application connects as forge_app: no superuser, no BYPASSRLS, not the table
+    # The application connects as forgestack_app: no superuser, no BYPASSRLS, not the table
     # owner. Row-level security is the backstop for tenant isolation, so the app must
     # not be able to escape it.
-    url: jdbc:postgresql://localhost:5432/forge
-    username: forge_app
-    password: forge_app
+    url: jdbc:postgresql://localhost:5432/forgestack
+    username: forgestack_app
+    password: forgestack_app
     hikari:
       maximum-pool-size: 10
-      pool-name: forge-pool
+      pool-name: forgestack-pool
 
   flyway:
     enabled: true
     # Migrations run as the schema owner, which the application deliberately is not.
-    url: jdbc:postgresql://localhost:5432/forge
-    user: forge_migrator
-    password: forge_migrator
+    url: jdbc:postgresql://localhost:5432/forgestack
+    user: forgestack_migrator
+    password: forgestack_migrator
     locations: classpath:db/migration
     baseline-on-migrate: false
 
@@ -42,8 +42,8 @@ spring:
       client:
         registration:
           github:
-            client-id: ${GITHUB_OAUTH_CLIENT_ID:not-configured}
-            client-secret: ${GITHUB_OAUTH_CLIENT_SECRET:not-configured}
+            client-id: ${FORGESTACK_GITHUB_OAUTH_CLIENT_ID:not-configured}
+            client-secret: ${FORGESTACK_GITHUB_OAUTH_CLIENT_SECRET:not-configured}
             # Login identifies a human. It grants the agent nothing.
             #
             # Deliberately NOT 'repo'. Access to a repository comes only from explicitly
@@ -58,7 +58,7 @@ spring:
     virtual:
       enabled: true
 
-forge:
+forgestack:
   # Which responsibilities this process takes on. One artifact, three roles, so the API
   # and the agent workers scale and fail independently. "all" is for local development.
   role: all
@@ -74,4 +74,4 @@ management:
 
 logging:
   level:
-    dev.tushar.forge: DEBUG
+    dev.tushar.forgestack: DEBUG

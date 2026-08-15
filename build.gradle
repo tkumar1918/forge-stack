@@ -6,7 +6,7 @@ plugins {
 
 group = 'dev.tushar'
 version = '0.0.1-SNAPSHOT'
-description = 'Forge'
+description = 'ForgeStack'
 
 java {
     toolchain {
