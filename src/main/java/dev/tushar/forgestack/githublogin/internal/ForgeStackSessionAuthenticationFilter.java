@@ -35,16 +35,18 @@ public class ForgeStackSessionAuthenticationFilter extends OncePerRequestFilter 
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
 
-        if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            Optional<AuthenticatedSession> session = ForgeStackSessionCookie.read(request).flatMap(sessions::validate);
+        // Unconditional, deliberately. This used to be guarded on the holder being empty, which
+        // made the cookie lose to anything that got there first — and oauth2Login's servlet session
+        // always did, so the cookie was never read at all after a browser login. Nothing else is
+        // permitted to authenticate a request, so there is nothing here to defer to.
+        Optional<AuthenticatedSession> session = ForgeStackSessionCookie.read(request).flatMap(sessions::validate);
 
-            session.ifPresent(active -> {
-                ForgeStackPrincipal principal =
-                        new ForgeStackPrincipal(active.userId(), active.sessionId(), active.workspaceId());
-                var authentication = new UsernamePasswordAuthenticationToken(principal, null, List.of());
-                SecurityContextHolder.getContext().setAuthentication(authentication);
-            });
-        }
+        session.ifPresent(active -> {
+            ForgeStackPrincipal principal =
+                    new ForgeStackPrincipal(active.userId(), active.sessionId(), active.workspaceId());
+            var authentication = new UsernamePasswordAuthenticationToken(principal, null, List.of());
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+        });
 
         chain.doFilter(request, response);
     }

@@ -111,6 +111,86 @@ Testcontainers and never boots the packaged application, so anything that only f
 invisible. A smoke test that starts the app with production autoconfiguration would have caught all
 three. Recorded in §5.
 
+### 1.8 The OAuth servlet session shadowed the ForgeStack session — **fixed**
+
+The first real browser login succeeded — `users`, `user_identities` and a `sessions` row with a
+non-null `workspace_id`, which incidentally confirmed the session/workspace fix from Task #15.
+Sixteen seconds later, `GET /api/installations/start` returned a Whitelabel error page:
+
+```
+java.lang.NullPointerException: Cannot invoke
+  "dev.tushar.forgestack.githublogin.ForgeStackPrincipal.sessionId()" because "principal" is null
+```
+
+**All seven authenticated endpoints were unreachable from a browser** — every controller under
+`/api/**` declares `@AuthenticationPrincipal ForgeStackPrincipal`.
+
+Two authentication mechanisms were live and the wrong one won:
+
+1. `oauth2Login` persisted its `OAuth2AuthenticationToken` into the servlet session via the default
+   `HttpSessionSecurityContextRepository`.
+2. `SecurityContextHolderFilter` restored it early in the chain, well before
+   `ForgeStackSessionAuthenticationFilter`.
+3. That filter was guarded on `getAuthentication() == null`, so it **never read the cookie**.
+4. `authorizeHttpRequests(...).authenticated()` was satisfied by the OAuth2 token.
+5. `AuthenticationPrincipalArgumentResolver` answers a principal-type mismatch with **null**, not an
+   exception. Hence the NPE, four frames from the cause.
+
+The bitter part: `SecurityConfig` already carried the comment *"The API is authenticated by the
+ForgeStack session cookie, not by a servlet session."* The sentence was true as intent and false as
+description. **A comment describing intent is a belief, not an enforcement** — the same lesson §1.5
+records about this file, now found in production code.
+
+The fix makes the sentence structural rather than aspirational:
+
+| Change | Why |
+|---|---|
+| `NullSecurityContextRepository` | Nothing is stored, so nothing can be restored to shadow the cookie |
+| Guard deleted from `ForgeStackSessionAuthenticationFilter` | Nothing else may authenticate, so there is nothing to defer to. Making the cookie merely take *precedence* was rejected: it leaves the servlet session as a fallback whenever the cookie is absent or revoked, silently breaking the revocation-immediacy promise in that filter's own javadoc |
+| `/api/**` requires a `ForgeStackPrincipal`, not just `authenticated()` | States the invariant the controllers assume. A recurrence is now a 403 at the gate, not a 500 in seven places |
+| `DiscardedGithubUserTokens` | See below |
+
+#### 1.8b The GitHub user token was retained on the heap
+
+Found while fixing the above, and **not** where it first appeared to be. The token was never in the
+servlet session: Boot autoconfigures an `InMemoryOAuth2AuthorizedClientService` behind an
+`AuthenticatedPrincipalOAuth2AuthorizedClientRepository`, so every GitHub user access token
+ForgeStack had issued sat in a heap map keyed by GitHub login for the process lifetime. Nothing
+evicted it — the logout handler revokes the ForgeStack session but never calls
+`removeAuthorizedClient`.
+
+The plan's §6 (*"No GitHub user token is persisted"*) and the `ForgeStackOAuth2UserService` javadoc
+were both false as stated. They described our code; the framework's default did something else.
+**Not configuring something is still a decision.** Blast radius was bounded — the scopes really are
+only `read:user`/`user:email`, so a leaked token reads a profile and cannot touch code.
+
+Worth keeping: the first-guess assertion ("nothing in the servlet session") would have **passed
+without the fix**. Verifying where the data actually was, rather than where it seemed to be, is what
+made the test real.
+
+#### What the tests said before the fix
+
+Six of seven failed, watched failing before anything was changed:
+
+```
+a logged-in browser reaches the API as its ForgeStack principal
+  -> NullPointerException: ... ForgeStackPrincipal.userId() because "principal" is null
+the servlet session alone is not a credential                      -> same NPE
+revoking the session logs the browser out immediately              -> same NPE
+an OAuth2 token cannot reach the API                               -> same NPE
+login writes no security context into the servlet session
+  -> expected: null but was: SecurityContextImpl [Authentication=OAuth2AuthenticationToken ...]
+the GitHub user token is not kept after login
+  -> expected: null but was: org.springframework.security.oauth2.client.OAuth2AuthorizedClient@...
+```
+
+Three of them reproduce the browser's exact exception. `LoginSessionIntegrationTest` now covers the
+login handshake end to end against `FakeGithub`; suite is 67 → 74.
+
+**This bug was invisible to every check the project runs.** It needs a client holding `JSESSIONID`
+*and* `forge_session` at once, and the entire §7 checklist is `curl`-shaped — it could have been run
+to completion and passed. Recorded in §5 as its own category, beside §1.2b.
+
 ---
 
 ## 2. Security debt
@@ -207,14 +287,16 @@ When a user's email is private, GitHub omits it and provisioning falls back to a
 
 | Gap | Note |
 |---|---|
-| **No HTTP-layer tests** | Controllers are untested; every test drives services directly. Status codes, `@AuthenticationPrincipal` binding, and JSON shape are unverified. A MockMvc slice is the obvious next step. |
+| **No HTTP-layer tests** | **Partly closed.** `LoginSessionIntegrationTest` drives login → API through the real filter chain, so `@AuthenticationPrincipal` binding is now verified — that was §1.8. The other six endpoints still have no status-code or JSON coverage, and every other test drives services directly. |
+| **Stateful-client behaviour is untested** | §1.8 needed a client holding `JSESSIONID` *and* `forge_session` simultaneously to appear at all. Every manual check is `curl`-shaped and stateless, so the §7 checklist would have passed while the browser was broken. **Anything that only manifests when the client keeps state is invisible to a stateless check** — the client-side twin of the entry below. |
 | **Pagination untested** | `GithubAppClient.listRepositories` pages at 100 with `MAX_PAGES=50`. No test exercises more than one page. |
 | **No real-GitHub smoke test** | Everything runs against `FakeGithub`. The fake is a real HTTP server so serialization is genuine, but nothing has ever talked to github.com. |
 | **Error responses barely covered** | `FakeGithub` now serves 401 (`FakeGithub.unauthorized()`) and 404, which is enough for §1.1. No test exercises 403, a 5xx, or a timeout on any GitHub call. |
 | **`sandboxCannotReachGithubCredentials` is vacuous** | The `sandbox` module does not exist, so the rule passes trivially. It has been *proven to fire* against a temporary fixture — but it is not guarding anything yet. |
 | **`policyDoesNotDependOnLlm` is vacuous** | Same: neither module exists. |
 | **`interfacesMustJustifyThemselves` allows empty** | There are no production interfaces yet besides Spring Data ones. |
-| **No test boots the packaged application** | **The highest-value gap in this table.** Every test uses Testcontainers and overrides configuration, so nothing exercises `application.yaml` as shipped. Three separate startup failures (§1.2b, §1.6, §1.7) survived a month because of it — the compose stack had never started, actuator was never on the classpath, and Spring AI refused to boot. All three surfaced within ten minutes of first running the app for real. |
+| **No test boots the packaged application** | **The highest-value gap in this table, and still fully open.** Every test uses Testcontainers and overrides configuration, so nothing exercises `application.yaml` as shipped — `LoginSessionIntegrationTest` included, since MockMvc never starts the packaged app either. Three startup failures (§1.2b, §1.6, §1.7) survived a month because of it, and §1.8 makes four findings that came from *running* the app rather than testing it. All surfaced within minutes of first use. |
+| **`ForgeStackSessionAuthenticationFilter` is registered twice** | It is a `@Component` implementing `Filter`, so Boot registers it as a container-level servlet filter *in addition* to its place in the security chain. Benign only because the chain has precedence `-100` and `OncePerRequestFilter` suppresses the second invocation — but it is the same shape as §1.8: a second copy of an authentication mechanism running outside the chain. Fix is a `FilterRegistrationBean` with `setEnabled(false)`, or dropping `@Component` and constructing it in `SecurityConfig`. |
 
 ---
 

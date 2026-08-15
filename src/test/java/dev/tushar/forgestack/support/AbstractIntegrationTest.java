@@ -1,5 +1,6 @@
 package dev.tushar.forgestack.support;
 
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -17,7 +18,13 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  * stopped. The JUnit {@code @Testcontainers} extension stops {@code @Container} fields after each
  * test <em>class</em>, which for a shared static field means the second class inherits a dead
  * container. Ryuk removes these on JVM exit.
+ *
+ * <p>{@code @AutoConfigureMockMvc} is here rather than on the one class that needs it so the
+ * context-cache key stays identical across every subclass. Spring caches a context per distinct
+ * configuration, and an annotation on a single class would quietly buy a third context and a third
+ * wait for containers.
  */
+@AutoConfigureMockMvc
 @SpringBootTest(
         properties = {
             // The context must start without real credentials.
@@ -52,5 +59,16 @@ public abstract class AbstractIntegrationTest {
 
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+
+        // Point GitHub's OAuth endpoints at the fake, in the shared base class, so "no test can
+        // reach github.com" is a property of the harness rather than of each test remembering.
+        //
+        // Only these two are overridden on purpose: OAuth2ClientPropertiesMapper starts from
+        // CommonOAuth2Provider.GITHUB and overlays what is configured, so the authorization URI,
+        // user-name-attribute and client authentication method all keep their real values.
+        registry.add("spring.security.oauth2.client.provider.github.token-uri", FakeGithub::tokenUri);
+        registry.add("spring.security.oauth2.client.provider.github.user-info-uri", FakeGithub::userInfoUri);
+        registry.add("spring.security.oauth2.client.registration.github.client-id", () -> "test-client");
+        registry.add("spring.security.oauth2.client.registration.github.client-secret", () -> "test-secret");
     }
 }

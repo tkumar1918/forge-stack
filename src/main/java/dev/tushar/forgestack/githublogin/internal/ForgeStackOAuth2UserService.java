@@ -19,6 +19,11 @@ import org.springframework.stereotype.Service;
  * discarded — it is never persisted. A stored user OAuth token is a standing credential able to
  * act as that person on GitHub, and the agent never needs it: it uses short-lived,
  * repository-scoped GitHub App installation tokens instead.
+ *
+ * <p>That was true of this class and false of the running system until
+ * {@link DiscardedGithubUserTokens} was wired in: Boot's autoconfigured authorized-client store kept
+ * every token on the heap regardless of what this class did with it. Discarding the token here is
+ * necessary and was never sufficient.
  */
 @Service
 public class ForgeStackOAuth2UserService implements OAuth2UserService<OAuth2UserRequest, OAuth2User> {
