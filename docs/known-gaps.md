@@ -4,26 +4,54 @@ Everything deliberately left undone, deferred, or accepted as a trade — with t
 should force each one to be revisited. Written down because a gap nobody recorded is
 indistinguishable from a bug nobody noticed.
 
-Last updated at the end of Phase 1.6 (installation binding, repository sync, opt-in). 66 tests.
+Last updated at the end of Phase 1.6 (installation binding, repository sync, opt-in). 67 tests.
+
+Setting up real credentials for the first time is a separate document: [local-setup.md](local-setup.md).
 
 ---
 
 ## 1. Will bite during the first manual test with real credentials
 
-### 1.1 A bad App private key looks exactly like an unknown installation
+### 1.1 A bad App key looking like an unknown installation — **fixed**
 
-`GithubAppClient.fetchInstallation` swallows every 4xx and returns empty. That is right for a 404
-— we must not tell a caller whether an installation id exists — but it also swallows **401 (bad or
-missing App key)** and **403**.
+`GithubAppClient.fetchInstallation` used to swallow every 4xx and return empty. Right for 404 — we
+must not tell a caller whether an installation id exists — but it also swallowed **401**, so a wrong
+`app-id` or a key from a different App presented as `UNKNOWN_INSTALLATION` with nothing in the logs.
 
-The symptom: you complete the GitHub install flow, get `403 NOT_YOUR_ACCOUNT`… no, worse — you get
-`UNKNOWN_INSTALLATION`, with nothing in the logs saying the server's own credentials are wrong.
+`handleLookupFailure` now splits them:
 
-**Fix before the first real run:** log the status server-side, keep the response identical.
-Distinguishing them *to the caller* would be an information leak; not distinguishing them *in the
-logs* is a debugging trap.
+| Status | Caller sees | Server-side |
+|---|---|---|
+| 401 | **500** — `IllegalStateException` naming `app-id` and the private key | thrown, not logged away |
+| 403 | rejection, indistinguishable from 404 | WARN — usually a suspended App or a spent rate limit |
+| 404 | rejection, indistinguishable from 403 | DEBUG — the ordinary answer for a guessed id |
 
-### 1.2 GitHub hands out a PKCS#1 private key; the JDK cannot read it
+Surfacing the 401 leaks nothing: it depends only on Forge's own configuration and never on the id
+asked for, so it is not an oracle. 403 and 404 stay deliberately identical to the caller.
+
+Covered by `InstallationBindingServiceTest.badAppCredentialsFailLoudly`, watched failing
+("Expecting code to raise a throwable") against the old behaviour before the fix landed.
+
+*Never part of this gap:* a **malformed** key. `GithubAppJwtService.parsePrivateKey` already detects
+PKCS#1 and throws with the exact `openssl` command.
+
+### 1.2 The session cookie is `Secure`, and `curl` will not send it over HTTP
+
+`forge.security.cookie-secure` defaults to `true`, so `ForgeSessionCookie` marks the cookie
+`Secure`. Over plain `http://localhost:8080` **`curl` withholds it**, and every authenticated step
+of the §7 checklist fails with a bare 401 that reads as broken authentication.
+
+Browsers permit `Secure` cookies on `localhost`, which makes this worse rather than better: the flow
+works in Chrome and fails in `curl` within the same session.
+
+**Deliberately not fixed by changing the default** — a default that is insecure for local
+convenience is how it reaches production. Override at run time:
+
+```
+SPRING_APPLICATION_JSON='{"forge":{"security":{"cookie-secure":false}}}' ./gradlew bootRun
+```
+
+### 1.3 GitHub hands out a PKCS#1 private key; the JDK cannot read it
 
 Already handled with an actionable error naming the exact `openssl` command
 (`GithubAppJwtService.parsePrivateKey`), but expect to hit it once. Convert with:
@@ -33,12 +61,12 @@ openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
   -in github-app.private-key.pem -out github-app.pkcs8.pem
 ```
 
-### 1.3 Organization installs are refused
+### 1.4 Organization installs are refused
 
 Only personal-account installs bind. Install the App on a **personal account**, not an org, or you
 will get `409 ORGANIZATION_NOT_SUPPORTED`. See §4.1 — this is a product limitation, not a bug.
 
-### 1.4 An expired session on the setup callback gives a bare 401
+### 1.5 An expired session on the setup callback gives a bare 401
 
 The callback lives under `/api/**`, which requires authentication and has no login redirect. If the
 session expires mid-install you get a blank 401 rather than being sent to log in. Acceptable with no
@@ -143,6 +171,7 @@ When a user's email is private, GitHub omits it and provisioning falls back to a
 | **No HTTP-layer tests** | Controllers are untested; every test drives services directly. Status codes, `@AuthenticationPrincipal` binding, and JSON shape are unverified. A MockMvc slice is the obvious next step. |
 | **Pagination untested** | `GithubAppClient.listRepositories` pages at 100 with `MAX_PAGES=50`. No test exercises more than one page. |
 | **No real-GitHub smoke test** | Everything runs against `FakeGithub`. The fake is a real HTTP server so serialization is genuine, but nothing has ever talked to github.com. |
+| **Error responses barely covered** | `FakeGithub` now serves 401 (`FakeGithub.unauthorized()`) and 404, which is enough for §1.1. No test exercises 403, a 5xx, or a timeout on any GitHub call. |
 | **`sandboxCannotReachGithubCredentials` is vacuous** | The `sandbox` module does not exist, so the rule passes trivially. It has been *proven to fire* against a temporary fixture — but it is not guarding anything yet. |
 | **`policyDoesNotDependOnLlm` is vacuous** | Same: neither module exists. |
 | **`interfacesMustJustifyThemselves` allows empty** | There are no production interfaces yet besides Spring Data ones. |
@@ -197,3 +226,6 @@ Once real credentials exist, this is what has never been exercised end to end:
 - [ ] Hand-edit `installation_id` in the callback URL to any other number — rejected, and an
       `INSTALLATION_BIND_REJECTED` row appears in `audit_events`
 - [ ] Verify no GitHub token, and no App private key, appears in application logs
+- [ ] Restart with a deliberately wrong `FORGE_GITHUB_APP_APP_ID` and replay the callback — expect a
+      **500** naming the credentials, not a `403`. This is the §1.1 fix, and the one item here that
+      cannot be checked against `FakeGithub`

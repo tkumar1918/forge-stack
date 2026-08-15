@@ -35,3 +35,12 @@ out/
 
 ### VS Code ###
 .vscode/
+
+### Credentials ###
+# The GitHub App private key can act as the App on every account it is installed on.
+# Listed before anyone downloads one, not after.
+*.pem
+*.p8
+*.pkcs8
+.env
+.env.*
