@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -27,6 +28,7 @@ public final class FakeGithub {
 
     private static final Map<Long, String> INSTALLATIONS = new ConcurrentHashMap<>();
     private static final Map<Long, List<Repo>> REPOSITORIES = new ConcurrentHashMap<>();
+    private static final Set<Long> UNAUTHORIZED = ConcurrentHashMap.newKeySet();
     private static final AtomicLong NEXT_ID = new AtomicLong(9_000);
     private static final HttpServer SERVER = start();
 
@@ -79,6 +81,18 @@ public final class FakeGithub {
         long installationId = NEXT_ID.incrementAndGet();
         INSTALLATIONS.put(installationId, installationJson(installationId, accountId, login, accountType, "selected"));
         REPOSITORIES.put(installationId, List.of());
+        return installationId;
+    }
+
+    /**
+     * An installation id GitHub answers with 401 — the shape of a rejected App key.
+     *
+     * <p>Registered per id rather than as a global toggle: every test class shares this one static
+     * server, so a flag would be a way for one test to change another's GitHub.
+     */
+    public static long unauthorized() {
+        long installationId = NEXT_ID.incrementAndGet();
+        UNAUTHORIZED.add(installationId);
         return installationId;
     }
 
@@ -135,7 +149,15 @@ public final class FakeGithub {
             return;
         }
 
-        String body = INSTALLATIONS.get(Long.parseLong(path.substring(path.lastIndexOf('/') + 1)));
+        long installationId = Long.parseLong(path.substring(path.lastIndexOf('/') + 1));
+        if (UNAUTHORIZED.contains(installationId)) {
+            // What GitHub says when the App JWT itself is refused: a key from another App, a
+            // revoked one, or a wrong app id. Nothing to do with which installation was asked for.
+            respond(exchange, 401, "");
+            return;
+        }
+
+        String body = INSTALLATIONS.get(installationId);
         if (body == null) {
             respond(exchange, 404, "");
         } else {

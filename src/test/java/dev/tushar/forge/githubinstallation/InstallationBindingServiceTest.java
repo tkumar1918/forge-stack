@@ -1,6 +1,7 @@
 package dev.tushar.forge.githubinstallation;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import dev.tushar.forge.githubinstallation.InstallationBindingResult.Bound;
 import dev.tushar.forge.githubinstallation.InstallationBindingResult.Reason;
@@ -137,6 +138,27 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
         var result = bindings.completeSetup(404_404L, nonce, sessionId, userId, workspaceId);
 
         assertThat(result).isEqualTo(new Rejected(Reason.UNKNOWN_INSTALLATION));
+    }
+
+    /**
+     * A broken Forge must not look like a suspicious user.
+     *
+     * <p>GitHub answers 401 when it refuses the App credentials themselves — a wrong app id, a
+     * revoked key, a well-formed key belonging to a different App. That is a fact about our own
+     * configuration, identical for every installation id, so folding it into the rejection path
+     * told every user their installation was not theirs while the real fault sat in our config.
+     *
+     * <p>Surfacing it leaks nothing precisely because it does not depend on the id asked for.
+     */
+    @Test
+    @DisplayName("GitHub rejecting Forge's own credentials is a server fault, not a user rejection")
+    void badAppCredentialsFailLoudly() {
+        long installationId = FakeGithub.unauthorized();
+        String nonce = bindings.beginSetup(sessionId);
+
+        assertThatThrownBy(() -> bindings.completeSetup(installationId, nonce, sessionId, userId, workspaceId))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("401");
     }
 
     /**

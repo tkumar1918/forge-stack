@@ -8,6 +8,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
@@ -25,6 +28,8 @@ import org.springframework.web.client.RestClient;
  */
 @Component
 public class GithubAppClient {
+
+    private static final Logger log = LoggerFactory.getLogger(GithubAppClient.class);
 
     private final GithubAppJwtService appJwt;
     private final RestClient restClient;
@@ -75,14 +80,40 @@ public class GithubAppClient {
                 .uri("/app/installations/{id}", installationId)
                 .header("Authorization", "Bearer " + appJwt.mintAppJwt())
                 .retrieve()
-                .onStatus(HttpStatusCode::is4xxClientError, (request, response) -> {
-                    // Deliberately swallowed: a 404 here is the normal answer for a bad id, and
-                    // the binding flow must not distinguish "no such installation" from "not
-                    // yours" in what it tells the caller.
-                })
+                .onStatus(
+                        HttpStatusCode::is4xxClientError,
+                        (request, response) -> handleLookupFailure(installationId, response.getStatusCode()))
                 .body(InstallationView.class);
 
         return Optional.ofNullable(view);
+    }
+
+    /**
+     * What a 4xx on an installation lookup means, and — the part that matters — who it is about.
+     *
+     * <p>Only 404 is routine. Collapsing the rest into it is what turned a wrong App key into
+     * "that installation is not yours": a message about the caller, for a fault that is ours.
+     */
+    private void handleLookupFailure(long installationId, HttpStatusCode status) {
+        if (status.isSameCodeAs(HttpStatus.UNAUTHORIZED)) {
+            // Not about this installation at all — GitHub is refusing the App credentials
+            // themselves, so no binding by any user can succeed. Thrown rather than returned
+            // empty, because the caller-facing rejection path would bury it. Safe to surface:
+            // a 401 depends only on our configuration, never on the id asked for, so it tells
+            // the caller nothing about whether that installation exists.
+            throw new IllegalStateException("GitHub rejected the Forge App credentials (401). Check "
+                    + "forge.github.app.app-id and the private key — a well-formed key belonging to a "
+                    + "different App fails exactly here.");
+        }
+        if (status.isSameCodeAs(HttpStatus.NOT_FOUND)) {
+            // The ordinary answer for a guessed id. Callers must not be able to tell this from a
+            // 403, so only the server-side record distinguishes them.
+            log.debug("GitHub does not know installation {}", installationId);
+            return;
+        }
+        // Usually a suspended App or an exhausted rate limit. Both are operator concerns, and both
+        // were invisible while this was folded in with 404.
+        log.warn("Installation lookup for {} refused with {}", installationId, status.value());
     }
 
     /** One repository as the installation-repositories listing reports it. */
