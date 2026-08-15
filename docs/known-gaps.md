@@ -79,11 +79,37 @@ openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
 Only personal-account installs bind. Install the App on a **personal account**, not an org, or you
 will get `409 ORGANIZATION_NOT_SUPPORTED`. See §4.1 — this is a product limitation, not a bug.
 
-### 1.5 An expired session on the setup callback gives a bare 401
+### 1.5 An expired session on the setup callback — **not a gap; this entry was wrong**
 
-The callback lives under `/api/**`, which requires authentication and has no login redirect. If the
-session expires mid-install you get a blank 401 rather than being sent to log in. Acceptable with no
-browser client; revisit when there is one.
+Previously recorded as "you get a blank 401 rather than being sent to log in". Measured against the
+running app, `/api/session` returns **302 to `/oauth2/authorization/github`**: Spring Security's
+`oauth2Login()` installs a `LoginUrlAuthenticationEntryPoint`, and with exactly one registration it
+skips the chooser and goes straight to GitHub. An expired session mid-install re-authenticates and
+comes back.
+
+Kept rather than deleted, as a reminder that this file records beliefs. This one was written from
+reading the config instead of running it, and was wrong for a month.
+
+### 1.6 Actuator was configured but never on the classpath — **fixed**
+
+`application.yaml` had a `management.endpoints` block and `SecurityConfig` permitted
+`/actuator/health/**`, but `spring-boot-starter-actuator` was never declared. Every actuator URL
+404ed. Found the first time anyone asked the running app for its health.
+
+### 1.7 Spring AI blocked startup with no model in use — **fixed**
+
+Nothing calls a model until Phase 4, but Spring AI's OpenAI autoconfiguration builds its client
+beans eagerly and throws `At least one credential source must be specified` without a key. The app
+could not start at all. Tests never caught it because `AbstractIntegrationTest` sets
+`spring.ai.openai.api-key=test-key`; nothing set it for `bootRun`.
+
+`application.yaml` now defaults it to `${FORGESTACK_OPENAI_API_KEY:not-configured}`, matching how
+the GitHub credentials are handled — boot succeeds, and the first real call fails loudly.
+
+**§1.6 and §1.7 are the same finding as §1.2b**, three times over: the test suite runs on
+Testcontainers and never boots the packaged application, so anything that only fails at startup was
+invisible. A smoke test that starts the app with production autoconfiguration would have caught all
+three. Recorded in §5.
 
 ---
 
@@ -188,7 +214,7 @@ When a user's email is private, GitHub omits it and provisioning falls back to a
 | **`sandboxCannotReachGithubCredentials` is vacuous** | The `sandbox` module does not exist, so the rule passes trivially. It has been *proven to fire* against a temporary fixture — but it is not guarding anything yet. |
 | **`policyDoesNotDependOnLlm` is vacuous** | Same: neither module exists. |
 | **`interfacesMustJustifyThemselves` allows empty** | There are no production interfaces yet besides Spring Data ones. |
-| **No test that the app boots with real GitHub config** | Only the fake configuration is exercised at startup. |
+| **No test boots the packaged application** | **The highest-value gap in this table.** Every test uses Testcontainers and overrides configuration, so nothing exercises `application.yaml` as shipped. Three separate startup failures (§1.2b, §1.6, §1.7) survived a month because of it — the compose stack had never started, actuator was never on the classpath, and Spring AI refused to boot. All three surfaced within ten minutes of first running the app for real. |
 
 ---
 

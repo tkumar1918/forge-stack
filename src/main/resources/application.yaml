@@ -2,6 +2,15 @@ spring:
   application:
     name: ForgeStack
 
+  ai:
+    openai:
+      # Nothing calls a model yet — ModelRouter arrives in Phase 4. But Spring AI's
+      # autoconfiguration builds its client beans eagerly and refuses to start without a
+      # credential, so the app could not boot at all without this. A placeholder keeps
+      # startup honest: the first real call fails loudly rather than silently succeeding
+      # against someone else's key.
+      api-key: ${FORGESTACK_OPENAI_API_KEY:not-configured}
+
   datasource:
     # The application connects as forgestack_app: no superuser, no BYPASSRLS, not the table
     # owner. Row-level security is the backstop for tenant isolation, so the app must

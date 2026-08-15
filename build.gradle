@@ -26,6 +26,10 @@ ext {
 }
 
 dependencies {
+    // application.yaml has configured management.endpoints since Phase 1, and SecurityConfig
+    // permits /actuator/health/** — but the starter was never declared, so all of that was
+    // dead config and /actuator/health returned 404.
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
     implementation 'org.springframework.boot:spring-boot-starter-flyway'
