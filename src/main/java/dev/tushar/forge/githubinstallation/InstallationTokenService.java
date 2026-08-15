@@ -1,6 +1,6 @@
 package dev.tushar.forge.githubinstallation;
 
-import dev.tushar.forge.githubinstallation.internal.GithubAppClient;
+import dev.tushar.forge.githubinstallation.internal.app.GithubAppClient;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;

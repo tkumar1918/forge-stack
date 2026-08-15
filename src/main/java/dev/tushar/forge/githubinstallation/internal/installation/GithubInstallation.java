@@ -1,5 +1,6 @@
-package dev.tushar.forge.githubinstallation.internal;
+package dev.tushar.forge.githubinstallation.internal.installation;
 
+import dev.tushar.forge.githubinstallation.internal.app.GithubAppClient;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;

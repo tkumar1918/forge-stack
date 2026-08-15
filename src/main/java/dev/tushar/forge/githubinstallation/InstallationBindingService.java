@@ -5,10 +5,10 @@ import dev.tushar.forge.audit.AuditLog;
 import dev.tushar.forge.githubinstallation.InstallationBindingResult.Bound;
 import dev.tushar.forge.githubinstallation.InstallationBindingResult.Reason;
 import dev.tushar.forge.githubinstallation.InstallationBindingResult.Rejected;
-import dev.tushar.forge.githubinstallation.internal.GithubAppClient;
-import dev.tushar.forge.githubinstallation.internal.GithubInstallation;
-import dev.tushar.forge.githubinstallation.internal.GithubInstallationRepository;
-import dev.tushar.forge.githubinstallation.internal.InstallationSetupNonces;
+import dev.tushar.forge.githubinstallation.internal.app.GithubAppClient;
+import dev.tushar.forge.githubinstallation.internal.installation.GithubInstallation;
+import dev.tushar.forge.githubinstallation.internal.installation.GithubInstallationRepository;
+import dev.tushar.forge.githubinstallation.internal.installation.InstallationSetupNonces;
 import dev.tushar.forge.iam.IamQueries;
 import dev.tushar.forge.platform.tenancy.TenantScope;
 import java.util.Map;
@@ -54,6 +54,7 @@ public class InstallationBindingService {
     private final IamQueries iam;
     private final TenantScope tenantScope;
     private final AuditLog audit;
+    private final RepositorySyncService repositorySync;
 
     InstallationBindingService(
             GithubAppClient github,
@@ -61,13 +62,15 @@ public class InstallationBindingService {
             GithubInstallationRepository installations,
             IamQueries iam,
             TenantScope tenantScope,
-            AuditLog audit) {
+            AuditLog audit,
+            RepositorySyncService repositorySync) {
         this.github = github;
         this.nonces = nonces;
         this.installations = installations;
         this.iam = iam;
         this.tenantScope = tenantScope;
         this.audit = audit;
+        this.repositorySync = repositorySync;
     }
 
     /** Starts the flow: a nonce bound to this session, to be carried through GitHub and back. */
@@ -108,7 +111,31 @@ public class InstallationBindingService {
             return reject(workspaceId, userId, installationId, Reason.NOT_YOUR_ACCOUNT);
         }
 
-        return persist(workspaceId, userId, view);
+        InstallationBindingResult result = persist(workspaceId, userId, view);
+
+        if (result instanceof Bound) {
+            syncRepositories(workspaceId, view.id());
+        }
+        return result;
+    }
+
+    /**
+     * Best-effort first sync, after the binding has committed.
+     *
+     * <p>Deliberately outside the binding transaction. The binding is complete and correct on its
+     * own, and GitHub being briefly unavailable must not undo it — especially since the setup nonce
+     * is already spent, so the user could not simply retry the callback. A failed sync leaves an
+     * empty repository list that the sync endpoint fills in.
+     */
+    private void syncRepositories(UUID workspaceId, long installationId) {
+        try {
+            repositorySync.sync(workspaceId, installationId);
+        } catch (RuntimeException e) {
+            log.warn(
+                    "Bound installation {} but could not list its repositories; retry via sync",
+                    installationId,
+                    e);
+        }
     }
 
     private InstallationBindingResult persist(

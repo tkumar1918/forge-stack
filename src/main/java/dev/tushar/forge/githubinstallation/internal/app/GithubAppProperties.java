@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubinstallation.internal;
+package dev.tushar.forge.githubinstallation.internal.app;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 

@@ -1,8 +1,9 @@
-package dev.tushar.forge.githubinstallation.internal;
+package dev.tushar.forge.githubinstallation.internal.app;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import dev.tushar.forge.githubinstallation.TokenScope;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -82,6 +83,82 @@ public class GithubAppClient {
                 .body(InstallationView.class);
 
         return Optional.ofNullable(view);
+    }
+
+    /** One repository as the installation-repositories listing reports it. */
+    public record RepositoryView(
+            long id,
+            @JsonProperty("full_name") String fullName,
+            @JsonProperty("private") boolean isPrivate,
+            @JsonProperty("default_branch") @Nullable String defaultBranch,
+            boolean archived) {}
+
+    private record RepositoryPage(List<RepositoryView> repositories) {}
+
+    /** GitHub caps this at 100. */
+    private static final int PAGE_SIZE = 100;
+
+    /** Stops the loop paging forever if GitHub keeps returning full pages. */
+    private static final int MAX_PAGES = 50;
+
+    /**
+     * Lists every repository the installation exposes.
+     *
+     * <p>This is the one call that has to see the whole installation, so it cannot use
+     * {@link TokenScope} — that type refuses to express an unscoped token, deliberately, because
+     * everywhere else an unscoped token would be a mistake.
+     *
+     * <p>The token is narrowed the other way instead: {@code metadata: read} and nothing else, so
+     * it can learn repository <em>names</em> and cannot read a line of code. It is minted here,
+     * used here, and never returned — there is no way for a caller to obtain an installation-wide
+     * token from this class.
+     */
+    public List<RepositoryView> listRepositories(long installationId) {
+        String token = mintDiscoveryToken(installationId);
+        List<RepositoryView> all = new ArrayList<>();
+
+        for (int page = 1; page <= MAX_PAGES; page++) {
+            int currentPage = page;
+            RepositoryPage response = restClient
+                    .get()
+                    .uri(builder -> builder.path("/installation/repositories")
+                            .queryParam("per_page", PAGE_SIZE)
+                            .queryParam("page", currentPage)
+                            .build())
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve()
+                    .body(RepositoryPage.class);
+
+            if (response == null || response.repositories() == null || response.repositories().isEmpty()) {
+                break;
+            }
+            all.addAll(response.repositories());
+            if (response.repositories().size() < PAGE_SIZE) {
+                break;
+            }
+        }
+        return all;
+    }
+
+    /**
+     * An installation-wide token limited to {@code metadata: read}.
+     *
+     * <p>Private on purpose. Omitting {@code repositories} is what makes it span the installation,
+     * and that is only acceptable because the permission set cannot reach content.
+     */
+    private String mintDiscoveryToken(long installationId) {
+        InstallationToken response = restClient
+                .post()
+                .uri("/app/installations/{id}/access_tokens", installationId)
+                .header("Authorization", "Bearer " + appJwt.mintAppJwt())
+                .body(Map.of("permissions", Map.of("metadata", "read")))
+                .retrieve()
+                .body(InstallationToken.class);
+
+        if (response == null || response.token() == null) {
+            throw new IllegalStateException("GitHub returned no discovery token for installation " + installationId);
+        }
+        return response.token();
     }
 
     /**

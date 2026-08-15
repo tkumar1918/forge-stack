@@ -1,4 +1,4 @@
-package dev.tushar.forge.githubinstallation.internal;
+package dev.tushar.forge.githubinstallation.internal.installation;
 
 import java.util.List;
 import java.util.Optional;
