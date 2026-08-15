@@ -2,7 +2,10 @@ package dev.tushar.forge.iam;
 
 import dev.tushar.forge.iam.internal.session.Session;
 import dev.tushar.forge.iam.internal.session.SessionRepository;
+import dev.tushar.forge.iam.internal.workspace.WorkspaceMember;
+import dev.tushar.forge.iam.internal.workspace.WorkspaceMemberRepository;
 import java.nio.charset.StandardCharsets;
+import java.util.Comparator;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
@@ -35,10 +38,12 @@ public class SessionService {
     private static final int TOKEN_BYTES = 32;
 
     private final SessionRepository sessions;
+    private final WorkspaceMemberRepository members;
     private final SecureRandom random = new SecureRandom();
 
-    SessionService(SessionRepository sessions) {
+    SessionService(SessionRepository sessions, WorkspaceMemberRepository members) {
         this.sessions = sessions;
+        this.members = members;
     }
 
     @Transactional
@@ -49,9 +54,30 @@ public class SessionService {
 
         Instant expiresAt = Instant.now().plus(SESSION_TTL);
         Session session = Session.issue(userId, hash(token), userAgent, expiresAt);
+        session.selectWorkspace(defaultWorkspaceFor(userId));
         sessions.save(session);
 
         return new IssuedSession(session.getId(), token, expiresAt);
+    }
+
+    /**
+     * The workspace a new session starts in.
+     *
+     * <p>Without this, {@code sessions.workspace_id} stays null and nothing tenant-scoped can be
+     * written at all — {@link dev.tushar.forge.platform.tenancy.TenantScope} refuses a null
+     * workspace, which is the correct fail-closed behaviour but a dead end for the caller.
+     *
+     * <p>Owned workspaces win over ones merely joined, then workspace id breaks ties, so the choice
+     * is stable across logins rather than dependent on row order. Today every user has exactly one
+     * — {@code UserProvisioningService} creates a personal workspace at first login — so the
+     * ordering only starts to matter once invitations exist.
+     */
+    private UUID defaultWorkspaceFor(UUID userId) {
+        return members.findByIdUserId(userId).stream()
+                .min(Comparator.comparingInt((WorkspaceMember member) -> member.getRole() == WorkspaceRole.OWNER ? 0 : 1)
+                        .thenComparing(WorkspaceMember::getWorkspaceId))
+                .map(WorkspaceMember::getWorkspaceId)
+                .orElse(null);
     }
 
     /**

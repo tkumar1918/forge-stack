@@ -19,6 +19,9 @@ class SessionServiceTest extends AbstractIntegrationTest {
     private UserProvisioningService provisioning;
 
     @Autowired
+    private IamQueries iam;
+
+    @Autowired
     private JdbcTemplate jdbcTemplate;
 
     private UUID userId;
@@ -40,6 +43,25 @@ class SessionServiceTest extends AbstractIntegrationTest {
                 .isPresent()
                 .get()
                 .satisfies(session -> assertThat(session.userId()).isEqualTo(userId));
+    }
+
+    /**
+     * Regression: {@code Session.selectWorkspace} existed but had no callers, so every session was
+     * issued with a null workspace. Nothing tenant-scoped could be written by a logged-in user,
+     * because {@code TenantScope} refuses a null workspace — the failure was silent until something
+     * actually tried to write.
+     */
+    @Test
+    @DisplayName("a new session starts in the user's own workspace")
+    void issuedSessionCarriesDefaultWorkspace() {
+        UUID ownWorkspace = iam.workspacesFor(userId).getFirst().id();
+
+        var issued = sessions.issue(userId, "JUnit");
+
+        assertThat(sessions.validate(issued.token()))
+                .isPresent()
+                .get()
+                .satisfies(session -> assertThat(session.workspaceId()).isEqualTo(ownWorkspace));
     }
 
     @Test
