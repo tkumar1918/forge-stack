@@ -46,6 +46,17 @@ public class ManagedRepository {
     @Column(name = "github_repository_id", nullable = false, updatable = false)
     private UUID githubRepositoryId;
 
+    /**
+     * GitHub's own id for the repository, alongside the workspace-local row id above.
+     *
+     * <p>Carried here so that "at most one workspace maintains this repository" can be a unique
+     * index. Since V4 a repository's Forge-side identity is per workspace, so two workspaces hold
+     * different {@link #githubRepositoryId} values for the same real repository — a constraint on
+     * that column would not see the collision. The constraint has to be about GitHub's identifier.
+     */
+    @Column(name = "github_repo_id", nullable = false, updatable = false)
+    private long githubRepoId;
+
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false)
     private Status status;
@@ -75,11 +86,13 @@ public class ManagedRepository {
 
     protected ManagedRepository() {}
 
-    public static ManagedRepository enable(UUID workspaceId, UUID githubRepositoryId, UUID enabledBy) {
+    public static ManagedRepository enable(
+            UUID workspaceId, UUID githubRepositoryId, long githubRepoId, UUID enabledBy) {
         ManagedRepository managed = new ManagedRepository();
         managed.id = UUID.randomUUID();
         managed.workspaceId = workspaceId;
         managed.githubRepositoryId = githubRepositoryId;
+        managed.githubRepoId = githubRepoId;
         managed.status = Status.ACTIVE;
         managed.autonomyLevel = AutonomyLevel.PR_WITH_APPROVAL;
         managed.enabledBy = enabledBy;

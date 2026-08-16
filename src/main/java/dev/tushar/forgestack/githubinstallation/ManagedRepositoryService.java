@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 /**
@@ -51,8 +52,29 @@ public class ManagedRepositoryService {
      * <p>Empty when the repository is not one this workspace can see. Row-level security means a
      * repository belonging to another tenant simply is not there, so an id copied from elsewhere
      * cannot be enabled here.
+     *
+     * <p>Also empty when another workspace already maintains the same real repository. That is a
+     * different reason for the same answer, and deliberately indistinguishable to the caller: the
+     * controller renders both as 404 rather than 403, on the existing principle that saying
+     * "forbidden" would confirm the repository exists somewhere. The distinction is recorded in the
+     * log for operators, who do need it.
      */
     public Optional<ManagedRepositoryView> enable(UUID workspaceId, UUID repositoryId, UUID actorId) {
+        try {
+            return enableWithinTenant(workspaceId, repositoryId, actorId);
+        } catch (DataIntegrityViolationException e) {
+            // managed_repositories_single_writer fired. As with installation binding, the conflicting
+            // row is invisible to this tenant's SELECT, so the collision can only surface here — the
+            // database is what actually guarantees one writer per repository, not the lookup above.
+            log.warn(
+                    "Refused to maintain repository {} for workspace {}: another workspace already maintains it",
+                    repositoryId,
+                    workspaceId);
+            return Optional.empty();
+        }
+    }
+
+    private Optional<ManagedRepositoryView> enableWithinTenant(UUID workspaceId, UUID repositoryId, UUID actorId) {
         return tenantScope.runInTenant(workspaceId, () -> {
             Optional<GithubRepository> repository = repositories.findById(repositoryId);
             if (repository.isEmpty() || repository.get().getRemovedAt() != null) {
@@ -66,7 +88,8 @@ public class ManagedRepositoryService {
                         existing.reEnable(actorId);
                         return existing;
                     })
-                    .orElseGet(() -> managed.save(ManagedRepository.enable(workspaceId, repositoryId, actorId)));
+                    .orElseGet(() -> managed.save(ManagedRepository.enable(
+                            workspaceId, repositoryId, repository.get().getGithubRepoId(), actorId)));
 
             audit.record(
                     workspaceId,
