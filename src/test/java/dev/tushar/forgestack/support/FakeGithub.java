@@ -213,7 +213,15 @@ public final class FakeGithub {
 
         String body = INSTALLATIONS.get(installationId);
         if (body == null) {
-            respond(exchange, 404, "");
+            // GitHub's 404 carries a JSON body, and that detail is load-bearing: an empty one lets a
+            // client "handle" the status and then deserialize nothing, which looks like success.
+            // This fake returned an empty body and hid a 500 on the guessed-id path for months.
+            respond(
+                    exchange,
+                    404,
+                    """
+                    {"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}
+                    """);
         } else {
             respond(exchange, 200, body);
         }

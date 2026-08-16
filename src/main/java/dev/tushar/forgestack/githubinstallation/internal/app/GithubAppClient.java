@@ -75,17 +75,25 @@ public class GithubAppClient {
      * "assume it is fine".
      */
     public Optional<InstallationView> fetchInstallation(long installationId) {
-        InstallationView view = restClient
+        // exchange() rather than retrieve(): the body is read only after the status has been judged
+        // successful. With retrieve(), an onStatus handler that returns normally means "handled,
+        // carry on" — and carrying on means deserializing the *error* body into InstallationView.
+        // GitHub's 404 is `{"message":"Not Found",…}` with no id, so that threw
+        // "Cannot map null into type long" and surfaced as a 500 on the one path that must answer
+        // 403: a guessed installation id. It went unnoticed because the test double replied 404
+        // with an empty body, which deserialises to null and looks exactly like a clean miss.
+        return restClient
                 .get()
                 .uri("/app/installations/{id}", installationId)
                 .header("Authorization", "Bearer " + appJwt.mintAppJwt())
-                .retrieve()
-                .onStatus(
-                        HttpStatusCode::is4xxClientError,
-                        (request, response) -> handleLookupFailure(installationId, response.getStatusCode()))
-                .body(InstallationView.class);
-
-        return Optional.ofNullable(view);
+                .exchange((request, response) -> {
+                    HttpStatusCode status = response.getStatusCode();
+                    if (status.is2xxSuccessful()) {
+                        return Optional.ofNullable(response.bodyTo(InstallationView.class));
+                    }
+                    handleLookupFailure(installationId, status);
+                    return Optional.empty();
+                });
     }
 
     /**
