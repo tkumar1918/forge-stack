@@ -15,8 +15,27 @@ public sealed interface InstallationBindingResult {
     record Rejected(Reason reason) implements InstallationBindingResult {}
 
     enum Reason {
-        /** No such nonce, already used, expired, or issued to a different session. */
-        INVALID_SETUP_STATE,
+        /**
+         * No such nonce: expired, already spent, or never issued.
+         *
+         * <p>Split from {@link #SETUP_STATE_FOREIGN} because collapsing the two made the first real
+         * failure undiagnosable — one WARN line and one audit row covered a stale link and a
+         * possible CSRF attempt equally well. Same lesson as the 401/404 collapse in
+         * {@code GithubAppClient}: an operator has to be able to tell which happened.
+         *
+         * <p>Safe to explain to the caller. It is a fact about their own link, not about anyone
+         * else's installation, so it is no oracle.
+         */
+        SETUP_STATE_EXPIRED,
+
+        /**
+         * A live nonce, issued to a different user.
+         *
+         * <p>The CSRF rejection. Rendered to the caller identically to
+         * {@link #SETUP_STATE_EXPIRED}; distinct in the log and the audit row, where it is the one
+         * worth alerting on.
+         */
+        SETUP_STATE_FOREIGN,
 
         /** GitHub does not know this installation id. */
         UNKNOWN_INSTALLATION,

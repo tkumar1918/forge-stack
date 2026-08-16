@@ -30,7 +30,19 @@ class SecurityConfig {
     @Value("${forgestack.security.cookie-secure:true}")
     private boolean cookieSecure;
 
-    @Value("${forgestack.security.login-success-redirect:/}")
+    /**
+     * Where a successful login lands.
+     *
+     * <p>Defaulted to {@code /api/session} rather than {@code /}, because nothing serves {@code /}
+     * until a frontend exists — so every successful login rendered Spring's Whitelabel 404 and was
+     * indistinguishable from a broken one. It was reported as a failure three times before anyone
+     * realised it was the success path.
+     *
+     * <p>Landing on the session resource also answers the question a user actually has at that
+     * moment: it worked, and <em>which GitHub account am I signed in as</em> — which decides whether
+     * the install flow will accept their installation at all.
+     */
+    @Value("${forgestack.security.login-success-redirect:/api/session}")
     private String loginSuccessRedirect;
 
     SecurityConfig(

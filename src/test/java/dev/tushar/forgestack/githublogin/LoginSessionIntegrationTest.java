@@ -6,6 +6,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 
 import dev.tushar.forgestack.iam.SessionService;
 import dev.tushar.forgestack.support.AbstractIntegrationTest;
+import dev.tushar.forgestack.support.BrowserLogin;
 import dev.tushar.forgestack.support.FakeGithub;
 import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.BeforeEach;
@@ -18,11 +19,7 @@ import org.springframework.security.oauth2.client.OAuth2AuthorizedClientService;
 import org.springframework.security.web.context.HttpSessionSecurityContextRepository;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
-import org.springframework.web.util.UriComponentsBuilder;
 
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
-import java.util.Objects;
 
 /**
  * A browser logging in with GitHub, then using the API.
@@ -63,39 +60,9 @@ class LoginSessionIntegrationTest extends AbstractIntegrationTest {
         githubLogin = "octocat-" + FakeGithub.nextId();
         FakeGithub.oauthUser(githubLogin, githubLogin + "@example.invalid");
 
-        servletSession = new MockHttpSession();
-
-        // The authorization endpoint is never called: Spring stores the authorization request in
-        // the session keyed by state, so reading state out of the redirect is enough to play the
-        // callback ourselves.
-        MvcResult start = mvc.perform(get("/oauth2/authorization/github").session(servletSession))
-                .andReturn();
-        String location = Objects.requireNonNull(start.getResponse().getRedirectedUrl());
-
-        // Decoded deliberately. The state is base64 and routinely ends in '=', which reaches the
-        // Location header as %3D; UriComponents does not decode on build(), so handing it straight
-        // back produces a state matching nothing — surfacing as an OAuth2AuthenticationException
-        // of [authorization_request_not_found], several layers from the cause.
-        String state = URLDecoder.decode(
-                Objects.requireNonNull(UriComponentsBuilder.fromUriString(location)
-                        .build()
-                        .getQueryParams()
-                        .getFirst("state")),
-                StandardCharsets.UTF_8);
-
-        MvcResult callback = mvc.perform(get("/login/oauth2/code/github")
-                        .param("code", "fake-code")
-                        .param("state", state)
-                        .session(servletSession))
-                .andReturn();
-
-        // Asserted here rather than left to fail downstream: without it a broken handshake shows up
-        // as a NullPointerException on a null cookie, in four tests that are not about the handshake.
-        assertThat(callback.getResponse().getRedirectedUrl())
-                .as("login should redirect on success, not to /login?error")
-                .doesNotContain("error");
-
-        forgeSession = callback.getResponse().getCookie("forge_session");
+        BrowserLogin login = BrowserLogin.logIn(mvc);
+        servletSession = login.servletSession();
+        forgeSession = login.cookie();
     }
 
     @Test

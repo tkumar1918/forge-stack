@@ -186,10 +186,21 @@ Two knobs, both ForgeStack's own configuration rather than anything GitHub knows
 
 | Property | Default | Set by |
 |---|---|---|
-| `forgestack.security.login-success-redirect` | `/` | `SecurityConfig` |
+| `forgestack.security.login-success-redirect` | `/api/session` | `SecurityConfig` |
 | `forgestack.github.app.setup-redirect` | `/` | `InstallationController` |
 
-Both stay at `/` while there is no frontend, and no CORS configuration is needed while everything is
-same-origin on port 8080. When `forge-frontend` becomes real, these two point at it and a CORS bean
-allowing that origin with credentials gets added — in the same commit, when the dev server port is
-actually known rather than guessed.
+**Login lands on `/api/session`, not `/`.** Nothing serves `/` until a frontend exists, so a
+successful login used to render Spring's Whitelabel 404 — identical to a genuine failure, and
+reported as one three times before anyone realised it was the success path. Landing on the session
+resource answers the two questions you actually have at that moment: it worked, and **which GitHub
+account you are signed in as**.
+
+That second one matters more than it sounds. The install flow only accepts an installation owned by
+the *same* GitHub account you are signed into ForgeStack with. If you have more than one account,
+check `/api/session` before starting an install — otherwise the callback is refused with
+`NOT_YOUR_ACCOUNT`, which is the same answer an attacker gets and so deliberately does not tell you
+whose it is.
+
+No CORS configuration is needed while everything is same-origin on port 8080. When `forge-frontend`
+becomes real, both knobs point at it and a CORS bean allowing that origin with credentials gets
+added — in the same commit, when the dev server port is actually known rather than guessed.

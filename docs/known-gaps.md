@@ -191,6 +191,71 @@ login handshake end to end against `FakeGithub`; suite is 67 → 74.
 *and* `forge_session` at once, and the entire §7 checklist is `curl`-shaped — it could have been run
 to completion and passed. Recorded in §5 as its own category, beside §1.2b.
 
+### 1.9 The setup nonce was bound to a session, and its failure was unreadable — **fixed**
+
+With §1.8 in, the install flow ran for real. GitHub installed the App and returned the browser to
+the Setup URL. The browser showed *"This page is not working"*:
+
+```
+WARN InstallationBindingService : Rejected GitHub installation binding:
+     installation=153999617 reason=INVALID_SETUP_STATE
+```
+
+Everything else was right — `GET /app/installations` reported `id=153999617
+account=QL-Tushar-Kumar accountId=213618763`, matching `user_identities.provider_user_id` exactly,
+so the ownership check would have passed.
+
+**Two defects, and the second hid the first.**
+
+*The nonce was bound to a session id.* The flow spans the GitHub install screen, which takes
+minutes, and `local-setup.md` actively sends a first-timer off to verify their Setup URL on the way.
+The `sessions` table showed three logins in ten minutes and the flow straddled two of them. Now
+bound to the **user**: an attacker still cannot mint a nonce for someone else's account, and *same
+human, different session* was never the threat. TTL also raised 15 → 30 minutes. The `sessionId`
+parameter disappeared from `beginSetup`/`completeSetup`, which is the real tell that it was carrying
+a distinction that did not exist.
+
+*`INVALID_SETUP_STATE` covered four causes*, as its own javadoc admitted: *"No such nonce, already
+used, expired, or issued to a different session."* One enum, one WARN line, one audit row for both a
+stale link and a possible CSRF attempt. Split into `SETUP_STATE_EXPIRED` and `SETUP_STATE_FOREIGN` —
+identical to the caller, distinct in the log. **This is the §1.1 pattern recurring in another
+module**: a 401 and a 404 collapsed into one indistinguishable outcome.
+
+Because of that collapse the root cause of *this specific* failure is still **undetermined**, and no
+longer recoverable — the nonce is gone and the log recorded only the enum. The browser held exactly
+one `forge_session` cookie, which should make a session mismatch impossible, yet `last_seen_at`
+proves an older session served the callback. The fix is to make the next one self-explanatory rather
+than to keep guessing at this one.
+
+*The callback returned an empty body.* GitHub redirects a **real browser** here, so
+`ResponseEntity.status(...).build()` renders as Chrome's "This page is not working" and the user
+learns nothing. It now returns `text/plain` saying what happened and what to do. The ownership
+rejections still share one wording, per §7 — but that wording now names `/api/session`, because
+"you are signed in as the wrong GitHub account" is a live cause and revealing it discloses nothing
+about whether the installation exists.
+
+Covered by `InstallationSetupFlowTest`, which walks the flow over HTTP because the re-login case
+only exists there. Watched failing first:
+
+```
+an install survives the user logging in again ...  expected: 302 but was: 400
+a rejection explains itself ...                    Expecting not blank but was: ""
+```
+
+### 1.10 A successful login looked exactly like a failure — **fixed**
+
+`forgestack.security.login-success-redirect` defaulted to `/`, and nothing serves `/`. **Every
+successful login rendered Spring's Whitelabel 404.** It was reported as a failure three separate
+times during first setup before it was recognised as the success path — each time costing a round of
+diagnosis on a system that was working.
+
+Default is now `/api/session`, so login lands on the session resource: proof it worked, and which
+GitHub account is signed in — the fact that decides whether an install will be accepted at all.
+
+Worth keeping as a category: **the success path had no signal, so its output was borrowed from the
+failure path.** Nothing was broken and everything looked broken. Cheap to fix, and it was masking
+attention that belonged on §1.8 and §1.9.
+
 ---
 
 ## 2. Security debt
@@ -201,6 +266,7 @@ to completion and passed. Recorded in §5 as its own category, beside §1.2b.
 | **Database passwords in `application.yaml`** (`forgestack_app`/`forgestack_app`) | Local-only values, but the shape invites a real one being pasted there | Before any deployed environment |
 | **CSRF disabled for `/api/**`** | Session cookie is `SameSite=Lax` and the API is same-origin, so exposure is limited | Browser client lands |
 | **No sandbox isolation yet** | Not applicable until the sandbox exists, but the plan's residual-risk note (container ≠ VM boundary) stands | Before public self-serve signup — gVisor is the cheap next step |
+| **`ForgeStackSessionCookie.read` takes the first matching cookie** | `findFirst()` over the cookie array, so two `forge_session` cookies would be resolved arbitrarily and could flip the caller between sessions request to request. It was the leading theory for §1.9 until the browser turned out to hold exactly one, so there is no evidence it is reachable — recorded rather than fixed speculatively | Anything that can set a second cookie: a `Domain` attribute, a path change, or a second host |
 
 ---
 

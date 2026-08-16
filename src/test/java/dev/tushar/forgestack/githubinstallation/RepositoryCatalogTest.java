@@ -64,8 +64,7 @@ class RepositoryCatalogTest extends AbstractGithubAppTest {
         this.beta = Repo.named("octo/beta");
         FakeGithub.exposes(installationId, alpha, beta);
 
-        UUID sessionId = UUID.randomUUID();
-        bindings.completeSetup(installationId, bindings.beginSetup(sessionId), sessionId, userId, workspaceId);
+        bindings.completeSetup(installationId, bindings.beginSetup(userId), userId, workspaceId);
     }
 
     /**

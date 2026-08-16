@@ -7,6 +7,7 @@ import dev.tushar.forgestack.githublogin.ForgeStackPrincipal;
 import java.net.URI;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -45,7 +46,7 @@ class InstallationController {
      */
     @GetMapping("/start")
     ResponseEntity<Void> start(@AuthenticationPrincipal ForgeStackPrincipal principal) {
-        String state = bindings.beginSetup(principal.sessionId());
+        String state = bindings.beginSetup(principal.userId());
 
         URI install = UriComponentsBuilder.fromUriString("https://github.com/apps/{slug}/installations/new")
                 .queryParam("state", state)
@@ -65,13 +66,13 @@ class InstallationController {
      * redirect. Acceptable while there is no browser client; it needs revisiting when there is.
      */
     @GetMapping("/callback")
-    ResponseEntity<Void> callback(
+    ResponseEntity<String> callback(
             @RequestParam("installation_id") long installationId,
             @RequestParam(value = "state", required = false) String state,
             @AuthenticationPrincipal ForgeStackPrincipal principal) {
 
-        InstallationBindingResult result = bindings.completeSetup(
-                installationId, state, principal.sessionId(), principal.userId(), principal.activeWorkspaceId());
+        InstallationBindingResult result =
+                bindings.completeSetup(installationId, state, principal.userId(), principal.activeWorkspaceId());
 
         return switch (result) {
             case InstallationBindingResult.Bound(InstallationBinding installation) ->
@@ -79,7 +80,9 @@ class InstallationController {
                         .location(URI.create(setupRedirect + "?installation=" + installation.accountLogin()))
                         .build();
             case InstallationBindingResult.Rejected(var reason) ->
-                ResponseEntity.status(statusFor(reason)).build();
+                ResponseEntity.status(statusFor(reason))
+                        .contentType(MediaType.TEXT_PLAIN)
+                        .body(explain(reason));
         };
     }
 
@@ -91,9 +94,39 @@ class InstallationController {
      */
     private static HttpStatus statusFor(InstallationBindingResult.Reason reason) {
         return switch (reason) {
-            case INVALID_SETUP_STATE -> HttpStatus.BAD_REQUEST;
+            case SETUP_STATE_EXPIRED, SETUP_STATE_FOREIGN -> HttpStatus.BAD_REQUEST;
             case UNKNOWN_INSTALLATION, NOT_YOUR_ACCOUNT -> HttpStatus.FORBIDDEN;
             case ORGANIZATION_NOT_SUPPORTED, ALREADY_BOUND_ELSEWHERE -> HttpStatus.CONFLICT;
+        };
+    }
+
+    /**
+     * What the browser is told.
+     *
+     * <p>GitHub redirects a real browser here, so an empty body is not a neutral choice — it renders
+     * as "This page is not working" and the user learns nothing. That is how the first real install
+     * failed: GitHub had installed the App, ForgeStack had refused it, and the page said nothing at
+     * all.
+     *
+     * <p>The two setup-state reasons share one message even though the server distinguishes them,
+     * and so do the two ownership reasons, for the oracle reason above. Plain text rather than a
+     * template because there is no view layer yet and a browser renders it fine.
+     */
+    private static String explain(InstallationBindingResult.Reason reason) {
+        return switch (reason) {
+            case SETUP_STATE_EXPIRED, SETUP_STATE_FOREIGN ->
+                "This setup link is no longer valid — it expires, it only works once, and it "
+                        + "belongs to the account that started the flow. If you switched GitHub "
+                        + "accounts, sign in again and start over from /api/installations/start.";
+            case UNKNOWN_INSTALLATION, NOT_YOUR_ACCOUNT ->
+                "That installation cannot be connected to the account you are signed in as. "
+                        + "Check /api/session to see which GitHub account that is — it must be the "
+                        + "one that owns the installation. Then start again from "
+                        + "/api/installations/start.";
+            case ORGANIZATION_NOT_SUPPORTED ->
+                "ForgeStack cannot yet connect organization installations, only personal accounts. "
+                        + "Install the App on your own account instead.";
+            case ALREADY_BOUND_ELSEWHERE -> "That installation is already connected to another workspace.";
         };
     }
 }

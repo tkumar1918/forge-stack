@@ -73,9 +73,9 @@ public class InstallationBindingService {
         this.repositorySync = repositorySync;
     }
 
-    /** Starts the flow: a nonce bound to this session, to be carried through GitHub and back. */
-    public String beginSetup(UUID sessionId) {
-        return nonces.issue(sessionId);
+    /** Starts the flow: a nonce bound to this user, to be carried through GitHub and back. */
+    public String beginSetup(UUID userId) {
+        return nonces.issue(userId);
     }
 
     /**
@@ -85,11 +85,16 @@ public class InstallationBindingService {
      * to see, and an unrecorded rejection is indistinguishable from one that never happened.
      */
     public InstallationBindingResult completeSetup(
-            long installationId, String setupState, UUID sessionId, UUID userId, UUID workspaceId) {
+            long installationId, String setupState, UUID userId, UUID workspaceId) {
 
-        Optional<UUID> boundSession = nonces.consume(setupState);
-        if (boundSession.isEmpty() || !boundSession.get().equals(sessionId)) {
-            return reject(workspaceId, userId, installationId, Reason.INVALID_SETUP_STATE);
+        Optional<UUID> boundUser = nonces.consume(setupState);
+        if (boundUser.isEmpty()) {
+            // A stale link, overwhelmingly: the nonce expired, or the callback was replayed from
+            // browser history. Distinct from the case below, which is not routine at all.
+            return reject(workspaceId, userId, installationId, Reason.SETUP_STATE_EXPIRED);
+        }
+        if (!boundUser.get().equals(userId)) {
+            return reject(workspaceId, userId, installationId, Reason.SETUP_STATE_FOREIGN);
         }
 
         // GitHub is asked directly rather than trusting the query parameter. Everything below

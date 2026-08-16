@@ -46,14 +46,12 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
     private UUID userId;
     private UUID workspaceId;
     private String githubUserId;
-    private UUID sessionId;
 
     @BeforeEach
     void provisionUser() {
         this.githubUserId = String.valueOf(FakeGithub.nextId());
         this.userId = newUser(githubUserId).id();
         this.workspaceId = iam.workspacesFor(userId).getFirst().id();
-        this.sessionId = UUID.randomUUID();
     }
 
     /**
@@ -69,8 +67,8 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
     void cannotBindAnInstallationOwnedBySomeoneElse() {
         long victimInstallation = FakeGithub.installation(999_001L, "victim", "User");
 
-        String ownNonce = bindings.beginSetup(sessionId);
-        var result = bindings.completeSetup(victimInstallation, ownNonce, sessionId, userId, workspaceId);
+        String ownNonce = bindings.beginSetup(userId);
+        var result = bindings.completeSetup(victimInstallation, ownNonce, userId, workspaceId);
 
         assertThat(result).isEqualTo(new Rejected(Reason.NOT_YOUR_ACCOUNT));
         assertThat(installationRowsIn(workspaceId, victimInstallation)).isZero();
@@ -81,8 +79,8 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
     void bindsOwnInstallation() {
         long installationId = FakeGithub.installation(Long.parseLong(githubUserId), "octo", "User");
 
-        String nonce = bindings.beginSetup(sessionId);
-        var result = bindings.completeSetup(installationId, nonce, sessionId, userId, workspaceId);
+        String nonce = bindings.beginSetup(userId);
+        var result = bindings.completeSetup(installationId, nonce, userId, workspaceId);
 
         assertThat(result).isInstanceOfSatisfying(Bound.class, bound -> {
             assertThat(bound.installation().installationId()).isEqualTo(installationId);
@@ -98,8 +96,8 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
         // Failing closed beats binding something we cannot prove the caller controls.
         long orgInstallation = FakeGithub.installation(Long.parseLong(githubUserId), "acme-corp", "Organization");
 
-        String nonce = bindings.beginSetup(sessionId);
-        var result = bindings.completeSetup(orgInstallation, nonce, sessionId, userId, workspaceId);
+        String nonce = bindings.beginSetup(userId);
+        var result = bindings.completeSetup(orgInstallation, nonce, userId, workspaceId);
 
         assertThat(result).isEqualTo(new Rejected(Reason.ORGANIZATION_NOT_SUPPORTED));
         assertThat(installationRowsIn(workspaceId, orgInstallation)).isZero();
@@ -109,33 +107,46 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
     @DisplayName("a nonce cannot be replayed")
     void nonceIsSingleUse() {
         long installationId = FakeGithub.installation(Long.parseLong(githubUserId), "octo", "User");
-        String nonce = bindings.beginSetup(sessionId);
+        String nonce = bindings.beginSetup(userId);
 
-        assertThat(bindings.completeSetup(installationId, nonce, sessionId, userId, workspaceId))
+        assertThat(bindings.completeSetup(installationId, nonce, userId, workspaceId))
                 .isInstanceOf(Bound.class);
 
         // An install link leaking through browser history or a referrer header must be inert.
-        assertThat(bindings.completeSetup(installationId, nonce, sessionId, userId, workspaceId))
-                .isEqualTo(new Rejected(Reason.INVALID_SETUP_STATE));
+        assertThat(bindings.completeSetup(installationId, nonce, userId, workspaceId))
+                .isEqualTo(new Rejected(Reason.SETUP_STATE_EXPIRED));
     }
 
     @Test
-    @DisplayName("a nonce issued to another session is rejected")
-    void nonceIsBoundToItsSession() {
+    @DisplayName("a nonce issued to another user is rejected as foreign, not as expired")
+    void nonceIsBoundToItsUser() {
         long installationId = FakeGithub.installation(Long.parseLong(githubUserId), "octo", "User");
         String someoneElsesNonce = bindings.beginSetup(UUID.randomUUID());
 
-        var result = bindings.completeSetup(installationId, someoneElsesNonce, sessionId, userId, workspaceId);
+        var result = bindings.completeSetup(installationId, someoneElsesNonce, userId, workspaceId);
 
-        assertThat(result).isEqualTo(new Rejected(Reason.INVALID_SETUP_STATE));
+        // The distinction is the point. A stale link and a nonce belonging to someone else look
+        // identical to the caller and must not look identical in the log: one is routine, the other
+        // is the CSRF attempt the nonce exists to stop.
+        assertThat(result).isEqualTo(new Rejected(Reason.SETUP_STATE_FOREIGN));
+    }
+
+    @Test
+    @DisplayName("a nonce that was never issued is expired, not foreign")
+    void unknownNonceIsExpired() {
+        long installationId = FakeGithub.installation(Long.parseLong(githubUserId), "octo", "User");
+
+        var result = bindings.completeSetup(installationId, "never-issued", userId, workspaceId);
+
+        assertThat(result).isEqualTo(new Rejected(Reason.SETUP_STATE_EXPIRED));
     }
 
     @Test
     @DisplayName("an installation GitHub does not know is rejected")
     void unknownInstallationIsRejected() {
-        String nonce = bindings.beginSetup(sessionId);
+        String nonce = bindings.beginSetup(userId);
 
-        var result = bindings.completeSetup(404_404L, nonce, sessionId, userId, workspaceId);
+        var result = bindings.completeSetup(404_404L, nonce, userId, workspaceId);
 
         assertThat(result).isEqualTo(new Rejected(Reason.UNKNOWN_INSTALLATION));
     }
@@ -154,9 +165,9 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
     @DisplayName("GitHub rejecting ForgeStack's own credentials is a server fault, not a user rejection")
     void badAppCredentialsFailLoudly() {
         long installationId = FakeGithub.unauthorized();
-        String nonce = bindings.beginSetup(sessionId);
+        String nonce = bindings.beginSetup(userId);
 
-        assertThatThrownBy(() -> bindings.completeSetup(installationId, nonce, sessionId, userId, workspaceId))
+        assertThatThrownBy(() -> bindings.completeSetup(installationId, nonce, userId, workspaceId))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("401");
     }
@@ -174,12 +185,12 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
         long installationId = FakeGithub.installation(Long.parseLong(githubUserId), "octo", "User");
 
         assertThat(bindings.completeSetup(
-                        installationId, bindings.beginSetup(sessionId), sessionId, userId, workspaceId))
+                        installationId, bindings.beginSetup(userId), userId, workspaceId))
                 .isInstanceOf(Bound.class);
 
         UUID secondWorkspace = newWorkspaceFor(userId);
         var result = bindings.completeSetup(
-                installationId, bindings.beginSetup(sessionId), sessionId, userId, secondWorkspace);
+                installationId, bindings.beginSetup(userId), userId, secondWorkspace);
 
         assertThat(result).isEqualTo(new Rejected(Reason.ALREADY_BOUND_ELSEWHERE));
         assertThat(installationRowsIn(workspaceId, installationId)).isEqualTo(1);
@@ -190,12 +201,12 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
     @DisplayName("re-running setup on an installation this workspace already holds refreshes it")
     void rebindingInOwnWorkspaceIsARefresh() {
         long installationId = FakeGithub.installation(Long.parseLong(githubUserId), "octo", "User");
-        bindings.completeSetup(installationId, bindings.beginSetup(sessionId), sessionId, userId, workspaceId);
+        bindings.completeSetup(installationId, bindings.beginSetup(userId), userId, workspaceId);
 
         // The user changed which repositories the App can see; GitHub is the authority on that.
         FakeGithub.reconfigure(installationId, Long.parseLong(githubUserId), "octo", "all");
         var result = bindings.completeSetup(
-                installationId, bindings.beginSetup(sessionId), sessionId, userId, workspaceId);
+                installationId, bindings.beginSetup(userId), userId, workspaceId);
 
         assertThat(result).isInstanceOf(Bound.class);
         assertThat(installationRowsIn(workspaceId, installationId)).isEqualTo(1);
@@ -213,7 +224,7 @@ class InstallationBindingServiceTest extends AbstractGithubAppTest {
     void rejectionIsAudited() {
         long victimInstallation = FakeGithub.installation(999_002L, "victim", "User");
 
-        bindings.completeSetup(victimInstallation, bindings.beginSetup(sessionId), sessionId, userId, workspaceId);
+        bindings.completeSetup(victimInstallation, bindings.beginSetup(userId), userId, workspaceId);
 
         // A failed hijack attempt is exactly the event an operator needs to see.
         Integer rejections = tenantScope.runInTenant(
