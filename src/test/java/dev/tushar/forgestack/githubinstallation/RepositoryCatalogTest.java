@@ -41,6 +41,7 @@ class RepositoryCatalogTest extends AbstractGithubAppTest {
 
     private UUID userId;
     private UUID workspaceId;
+    private long accountId;
     private long installationId;
 
     // Held as fields so a test can re-expose the same repository. Repo.named() mints a fresh
@@ -59,7 +60,8 @@ class RepositoryCatalogTest extends AbstractGithubAppTest {
         this.userId = user.id();
         this.workspaceId = iam.workspacesFor(userId).getFirst().id();
 
-        this.installationId = FakeGithub.installation(Long.parseLong(githubUserId), "octo", "User");
+        this.accountId = Long.parseLong(githubUserId);
+        this.installationId = FakeGithub.installation(accountId, "octo", "User");
         this.alpha = Repo.named("octo/alpha");
         this.beta = Repo.named("octo/beta");
         FakeGithub.exposes(installationId, alpha, beta);
@@ -171,6 +173,55 @@ class RepositoryCatalogTest extends AbstractGithubAppTest {
         sync.sync(workspaceId, installationId);
 
         assertThat(managedStatusOf(beta)).isEqualTo("ACCESS_LOST");
+    }
+
+    /**
+     * Reinstalling the App must not duplicate the catalog.
+     *
+     * <p>GitHub issues a brand new {@code installation_id} on every install, so uninstall-then-
+     * reinstall leaves the old installation row looking exactly as valid as the new one. Both then
+     * carry their own copy of the same repositories, and nothing in the listing can tell them
+     * apart. Found live: two rounds of this left 18 rows for 9 real repositories.
+     *
+     * <p>A repository's identity is the workspace it belongs to plus GitHub's numeric id. Which
+     * installation currently exposes it is a mutable fact about it, not part of what it is.
+     */
+    @Test
+    @DisplayName("reinstalling the App does not duplicate the repository catalog")
+    void reinstallingDoesNotDuplicateTheCatalog() {
+        long reinstalled = FakeGithub.installation(accountId, "octo", "User");
+        FakeGithub.exposes(reinstalled, alpha, beta);
+
+        bindings.completeSetup(reinstalled, bindings.beginSetup(userId), userId, workspaceId);
+
+        assertThat(sync.available(workspaceId)).extracting(AvailableRepository::fullName)
+                .containsExactly("octo/alpha", "octo/beta");
+    }
+
+    /**
+     * The opt-in has to survive a reinstall.
+     *
+     * <p>If a reinstall created fresh repository rows, the {@code managed_repositories} row would
+     * still point at the old ones — so a repository the user had chosen would silently come back
+     * unmanaged while still appearing in the list. Losing that consent quietly is the same class of
+     * failure as losing access quietly.
+     */
+    @Test
+    @DisplayName("a managed repository stays managed across a reinstall")
+    void reinstallingKeepsMaintenanceEnabled() {
+        managed.enable(workspaceId, repositoryNamed("octo/alpha").id(), userId);
+
+        long reinstalled = FakeGithub.installation(accountId, "octo", "User");
+        FakeGithub.exposes(reinstalled, alpha, beta);
+        bindings.completeSetup(reinstalled, bindings.beginSetup(userId), userId, workspaceId);
+
+        // Asserted over every matching row rather than through repositoryNamed(), which takes the
+        // first match: with a duplicate present that picks one of two arbitrarily and would report
+        // consent intact while an unmanaged twin sat beside it.
+        assertThat(sync.available(workspaceId))
+                .filteredOn(repository -> repository.fullName().equals("octo/alpha"))
+                .singleElement()
+                .satisfies(repository -> assertThat(repository.managed()).isTrue());
     }
 
     @Test

@@ -306,6 +306,43 @@ names.
 and it only helps for the installation you tell it about — it does nothing about a *different*,
 now-dead installation's rows sitting alongside it.
 
+**This was not fully fixed by the webhook alone — investigated concretely 2026-08-16.** The
+duplicate-listing symptom was two independent problems, and only one of them needs Phase 6:
+
+1. `github_repositories` carries `workspace_id` directly (`V2__github_app.sql`), but its
+   uniqueness constraint is `UNIQUE (github_installation_id, github_repo_id)` — scoped per
+   installation, not per workspace. The database has no objection to two installations, one live
+   and one dead, each owning a row for the same real repository.
+2. `RepositorySyncService.available()` (backing `GET /api/repositories`) queries
+   `findByWorkspaceIdAndRemovedAtIsNullOrderByFullName(workspaceId)` — it never looks at
+   `github_installations.suspended_at` or `.deleted_at`. And `GithubInstallation.deletedAt` is in
+   fact never assigned anywhere in the codebase today (checked directly); only `suspendedAt` is
+   ever refreshed, in `refreshFrom()`.
+
+So even once Phase 6 correctly marks a superseded installation `deleted_at`, `available()` would
+keep listing its repositories as duplicates unless it is *also* taught to exclude dead
+installations — or unless the constraint is tightened to `(workspace_id, github_repo_id)` so a
+duplicate cannot be inserted in the first place, independent of whether or when a webhook arrives.
+
+**Split verdict:** "notice the uninstall" genuinely is Phase 6 — it needs the webhook. "Stop
+showing the same repo twice" was a data-integrity fix that did not need one.
+
+**The second half is fixed** (`V4__repository_identity_is_workspace_scoped.sql`). A repository's
+identity is now `(workspace_id, github_repo_id)`, and which installation exposes it is a mutable
+attribute: `RepositorySyncService` matches per workspace and re-points the existing row, so a
+reinstall adopts the catalog instead of duplicating it. This also fixes a quieter bug found while
+testing it — the `managed_repositories` opt-in pointed at the *old* repository row, so a reinstall
+left a repository the user had explicitly enabled sitting unmanaged next to its managed twin.
+Losing consent silently is the same class of failure as losing access silently. Both cases are
+covered by tests in `RepositoryCatalogTest`, each watched failing first
+(`["octo/alpha", "octo/alpha", "octo/beta", "octo/beta"]`, and `managed=true` beside
+`managed=false`).
+
+**Still open, and genuinely Phase 6:** nothing marks a superseded installation dead.
+`GithubInstallation.deletedAt` is still never assigned anywhere; only `suspendedAt` is refreshed,
+in `refreshFrom()`. A dead installation's rows can no longer duplicate a live one's, but ForgeStack
+still does not *know* it is dead, and `InstallationTokenService.evict` still has no caller.
+
 ### 3.3 No GitHub rate-limit handling
 
 No ETag caching, no `Retry-After` handling, no per-installation token bucket. Arrives with the

@@ -15,7 +15,13 @@ import org.springframework.data.jpa.repository.JpaRepository;
  */
 public interface GithubRepositories extends JpaRepository<GithubRepository, UUID> {
 
-    Optional<GithubRepository> findByGithubInstallationIdAndGithubRepoId(UUID installationId, long githubRepoId);
+    /**
+     * Looked up by workspace rather than by installation, because that is the row's identity.
+     *
+     * <p>Matching on the installation would miss a repository the workspace already knows through a
+     * previous install of the App, and insert a duplicate beside it.
+     */
+    Optional<GithubRepository> findByWorkspaceIdAndGithubRepoId(UUID workspaceId, long githubRepoId);
 
     List<GithubRepository> findByGithubInstallationId(UUID installationId);
 

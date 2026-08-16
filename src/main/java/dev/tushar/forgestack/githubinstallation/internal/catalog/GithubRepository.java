@@ -29,7 +29,15 @@ public class GithubRepository {
     @Column(name = "workspace_id", nullable = false, updatable = false)
     private UUID workspaceId;
 
-    @Column(name = "github_installation_id", nullable = false, updatable = false)
+    /**
+     * Which installation currently exposes this repository.
+     *
+     * <p>Mutable, unlike the workspace and the GitHub id that identify the row. GitHub issues a new
+     * installation id on every install, so a reinstall re-points the existing row instead of
+     * creating a rival copy — which is what kept the opt-in in {@link ManagedRepository} attached
+     * to it.
+     */
+    @Column(name = "github_installation_id", nullable = false)
     private UUID githubInstallationId;
 
     @Column(name = "github_repo_id", nullable = false, updatable = false)
@@ -88,8 +96,19 @@ public class GithubRepository {
         return repository;
     }
 
-    /** Re-observed during a sync: refresh the mutable facts and clear any prior removal. */
-    public void seenAgain(String fullName, boolean isPrivate, @Nullable String defaultBranch, boolean archived) {
+    /**
+     * Re-observed during a sync: refresh the mutable facts and clear any prior removal.
+     *
+     * <p>Takes the installation that saw it, so a repository re-observed through a reinstalled App
+     * follows the new installation rather than being stranded behind the old one.
+     */
+    public void seenAgain(
+            UUID githubInstallationId,
+            String fullName,
+            boolean isPrivate,
+            @Nullable String defaultBranch,
+            boolean archived) {
+        this.githubInstallationId = githubInstallationId;
         this.fullName = fullName;
         this.isPrivate = isPrivate;
         this.defaultBranch = defaultBranch;

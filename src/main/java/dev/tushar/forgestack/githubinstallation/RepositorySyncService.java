@@ -55,6 +55,14 @@ public class RepositorySyncService {
      * <p>Reconciles rather than replaces: repositories are matched on GitHub's numeric id, so a
      * rename updates a row instead of orphaning one. Anything GitHub no longer lists is marked
      * removed, never deleted.
+     *
+     * <p>Matching is per workspace, not per installation. A reinstalled App arrives with a new
+     * installation id and the same repositories; adopting the existing rows keeps one row per real
+     * repository and keeps any {@code ManagedRepository} opt-in attached to it.
+     *
+     * <p>Rows left pointing at another installation are deliberately untouched — one installation's
+     * listing is no evidence that a different one has gone away. Noticing that needs the uninstall
+     * webhook (Phase 6).
      */
     public RepositorySyncReport sync(UUID workspaceId, long installationId) {
         List<GithubAppClient.RepositoryView> current = github.listRepositories(installationId);
@@ -70,10 +78,15 @@ public class RepositorySyncService {
 
             for (GithubAppClient.RepositoryView view : current) {
                 seen.add(view.id());
-                var existing = repositories.findByGithubInstallationIdAndGithubRepoId(installation.getId(), view.id());
+                var existing = repositories.findByWorkspaceIdAndGithubRepoId(workspaceId, view.id());
 
                 if (existing.isPresent()) {
-                    existing.get().seenAgain(view.fullName(), view.isPrivate(), view.defaultBranch(), view.archived());
+                    existing.get().seenAgain(
+                            installation.getId(),
+                            view.fullName(),
+                            view.isPrivate(),
+                            view.defaultBranch(),
+                            view.archived());
                 } else {
                     repositories.save(GithubRepository.seen(
                             workspaceId,
