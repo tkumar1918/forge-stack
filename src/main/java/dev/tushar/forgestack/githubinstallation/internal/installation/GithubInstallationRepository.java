@@ -17,4 +17,13 @@ public interface GithubInstallationRepository extends JpaRepository<GithubInstal
     Optional<GithubInstallation> findByInstallationId(long installationId);
 
     List<GithubInstallation> findByWorkspaceIdAndDeletedAtIsNull(UUID workspaceId);
+
+    /**
+     * Live installations this workspace holds for one GitHub account.
+     *
+     * <p>There should never be more than one. GitHub allows a single installation of an App per
+     * account, so a second row for the same account means the first was replaced — reinstalling
+     * issues a brand new {@code installation_id} rather than reviving the old one.
+     */
+    List<GithubInstallation> findByWorkspaceIdAndAccountIdAndDeletedAtIsNull(UUID workspaceId, long accountId);
 }

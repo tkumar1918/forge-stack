@@ -224,6 +224,46 @@ class RepositoryCatalogTest extends AbstractGithubAppTest {
                 .satisfies(repository -> assertThat(repository.managed()).isTrue());
     }
 
+    /**
+     * Reinstalling with a narrower selection must not leave the old repositories behind.
+     *
+     * <p>Found in real use: install with all repositories, uninstall, reinstall picking four. The
+     * four synced correctly, but the five the old installation had exposed stayed in the catalog
+     * with {@code removed_at} null, so {@code GET /api/repositories} listed nine — four reachable
+     * and five that ForgeStack could no longer touch at all. Confirmed against GitHub: the old
+     * installation answers 404.
+     *
+     * <p>No webhook is needed to know this. GitHub allows one installation of an App per account
+     * and never revives an id, so a second live installation for the same account proves the first
+     * is dead.
+     */
+    @Test
+    @DisplayName("reinstalling with fewer repositories retires the ones the old installation exposed")
+    void reinstallingWithANarrowerSelectionRetiresTheRest() {
+        long reinstalled = FakeGithub.installation(accountId, "octo", "User");
+        FakeGithub.exposes(reinstalled, alpha);
+
+        bindings.completeSetup(reinstalled, bindings.beginSetup(userId), userId, workspaceId);
+
+        assertThat(sync.available(workspaceId)).extracting(AvailableRepository::fullName)
+                .as("beta was only ever reachable through the installation that has been replaced")
+                .containsExactly("octo/alpha");
+    }
+
+    /** Losing a repository to a replaced installation is as loud as losing it any other way. */
+    @Test
+    @DisplayName("a managed repository dropped by a reinstall becomes ACCESS_LOST")
+    void managedRepositoryDroppedByAReinstallIsFlagged() {
+        UUID beta = repositoryNamed("octo/beta").id();
+        managed.enable(workspaceId, beta, userId);
+
+        long reinstalled = FakeGithub.installation(accountId, "octo", "User");
+        FakeGithub.exposes(reinstalled, alpha);
+        bindings.completeSetup(reinstalled, bindings.beginSetup(userId), userId, workspaceId);
+
+        assertThat(managedStatusOf(beta)).isEqualTo("ACCESS_LOST");
+    }
+
     @Test
     @DisplayName("a repository id from another workspace cannot be enabled")
     void cannotEnableAnotherWorkspacesRepository() {

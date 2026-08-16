@@ -11,6 +11,7 @@ import dev.tushar.forgestack.githubinstallation.internal.installation.GithubInst
 import dev.tushar.forgestack.githubinstallation.internal.installation.InstallationSetupNonces;
 import dev.tushar.forgestack.iam.IamQueries;
 import dev.tushar.forgestack.platform.tenancy.TenantScope;
+import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -55,6 +56,7 @@ public class InstallationBindingService {
     private final TenantScope tenantScope;
     private final AuditLog audit;
     private final RepositorySyncService repositorySync;
+    private final InstallationTokenService tokens;
 
     InstallationBindingService(
             GithubAppClient github,
@@ -63,7 +65,8 @@ public class InstallationBindingService {
             IamQueries iam,
             TenantScope tenantScope,
             AuditLog audit,
-            RepositorySyncService repositorySync) {
+            RepositorySyncService repositorySync,
+            InstallationTokenService tokens) {
         this.github = github;
         this.nonces = nonces;
         this.installations = installations;
@@ -71,6 +74,7 @@ public class InstallationBindingService {
         this.tenantScope = tenantScope;
         this.audit = audit;
         this.repositorySync = repositorySync;
+        this.tokens = tokens;
     }
 
     /** Starts the flow: a nonce bound to this user, to be carried through GitHub and back. */
@@ -119,7 +123,12 @@ public class InstallationBindingService {
         InstallationBindingResult result = persist(workspaceId, userId, view);
 
         if (result instanceof Bound) {
+            // Order matters. The sync runs first so the new installation adopts every repository it
+            // still exposes; only then is whatever is left pointing at the old installation genuinely
+            // unreachable. Retiring first would mark repositories ACCESS_LOST a moment before the
+            // sync re-adopted them, and nothing resets that.
             syncRepositories(workspaceId, view.id());
+            retireReplacedInstallations(workspaceId, view);
         }
         return result;
     }
@@ -186,6 +195,68 @@ public class InstallationBindingService {
             log.warn("Rejected binding installation {}: already bound to another workspace", view.id());
             return reject(workspaceId, userId, view.id(), Reason.ALREADY_BOUND_ELSEWHERE);
         }
+    }
+
+    /**
+     * Retires any earlier installation this workspace held for the same GitHub account.
+     *
+     * <p>GitHub allows exactly one installation of an App per account, and reinstalling issues a
+     * brand new {@code installation_id} rather than reviving the old one. So a second live row for
+     * one account is not an ambiguity to resolve — it is proof the earlier one is dead, and that
+     * conclusion is available here without waiting for the uninstall webhook (Phase 6).
+     *
+     * <p>Without this, an uninstall/reinstall leaves the old installation's repositories in the
+     * catalog looking exactly as valid as the new one's, and {@code GET /api/repositories} lists
+     * repositories ForgeStack can no longer reach. Confirmed against real GitHub: the superseded
+     * installation answers 404 while the new one answers 200.
+     *
+     * <p>Scoped to one account deliberately. A workspace may legitimately hold installations on
+     * several accounts, and those are untouched — only a same-account predecessor can have been
+     * replaced.
+     *
+     * <p>Runs after the sync, in its own transaction, for the ordering reason given at the call
+     * site: anything the new installation still exposes has been adopted by then, so what remains
+     * on the old row is exactly what is genuinely gone.
+     */
+    private void retireReplacedInstallations(UUID workspaceId, GithubAppClient.InstallationView view) {
+        tenantScope.runInTenant(workspaceId, () -> {
+            Instant now = Instant.now();
+
+            for (GithubInstallation stale :
+                    installations.findByWorkspaceIdAndAccountIdAndDeletedAtIsNull(workspaceId, view.account().id())) {
+
+                if (stale.getInstallationId() == view.id()) {
+                    continue;
+                }
+
+                stale.supersededAt(now);
+                int unreachable = repositorySync.markInstallationGone(stale.getId());
+
+                // The first caller this has ever had. A token minted against a dead installation is
+                // useless, but it is still a credential sitting in Redis with minutes left to run.
+                tokens.evict(stale.getInstallationId());
+
+                log.info(
+                        "Installation {} replaces {} on account {}; {} repositories are now unreachable",
+                        view.id(),
+                        stale.getInstallationId(),
+                        view.account().login(),
+                        unreachable);
+
+                audit.record(
+                        workspaceId,
+                        ActorType.SYSTEM,
+                        null,
+                        "INSTALLATION_SUPERSEDED",
+                        RESOURCE_TYPE,
+                        stale.getId(),
+                        Map.of(
+                                "superseded_installation_id", stale.getInstallationId(),
+                                "replaced_by_installation_id", view.id(),
+                                "repositories_now_unreachable", unreachable));
+            }
+            return null;
+        });
     }
 
     private InstallationBindingResult reject(UUID workspaceId, UUID userId, long installationId, Reason reason) {

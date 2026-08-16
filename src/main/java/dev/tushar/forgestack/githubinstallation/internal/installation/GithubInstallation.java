@@ -112,6 +112,25 @@ public class GithubInstallation {
         this.updatedAt = Instant.now();
     }
 
+    /**
+     * This installation has been replaced by a newer one for the same GitHub account.
+     *
+     * <p>GitHub issues a new {@code installation_id} every time an App is installed, and never
+     * revives an old one, so the arrival of a second installation for one account is proof the
+     * first is gone. Recording it is what lets the repositories it exposed be marked unreachable
+     * instead of sitting in the catalog looking exactly as valid as the live ones.
+     */
+    public void supersededAt(Instant when) {
+        if (this.deletedAt == null) {
+            this.deletedAt = when;
+        }
+        this.updatedAt = Instant.now();
+    }
+
+    public @Nullable Instant getDeletedAt() {
+        return deletedAt;
+    }
+
     public UUID getId() {
         return id;
     }

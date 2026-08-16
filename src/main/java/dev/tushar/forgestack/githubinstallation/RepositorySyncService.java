@@ -113,6 +113,21 @@ public class RepositorySyncService {
     }
 
     /**
+     * Marks everything an installation exposed as unreachable, because the installation itself is
+     * gone.
+     *
+     * <p>Nothing it exposed is visible any more, so the "still visible" set is empty and every
+     * repository it owns is removed. Managed ones move to {@code ACCESS_LOST} down the same path as
+     * any other loss of access — which is the reason this routes through the existing rule instead
+     * of restating it.
+     *
+     * <p>Assumes an active tenant scope; the only caller is already inside one.
+     */
+    int markInstallationGone(UUID installationRowId) {
+        return markMissingAsRemoved(installationRowId, Set.of());
+    }
+
+    /**
      * Marks anything absent from the listing as gone, and flags managed repositories loudly.
      *
      * <p>A customer must never find out that ForgeStack quietly stopped maintaining a repository three
