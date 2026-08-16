@@ -187,19 +187,21 @@ Two knobs, both ForgeStack's own configuration rather than anything GitHub knows
 | Property | Default | Set by |
 |---|---|---|
 | `forgestack.security.login-success-redirect` | `/api/session` | `SecurityConfig` |
-| `forgestack.github.app.setup-redirect` | `/` | `InstallationController` |
+| `forgestack.github.app.setup-redirect` | `/api/repositories` | `InstallationController` |
 
-**Login lands on `/api/session`, not `/`.** Nothing serves `/` until a frontend exists, so a
-successful login used to render Spring's Whitelabel 404 — identical to a genuine failure, and
-reported as one three times before anyone realised it was the success path. Landing on the session
-resource answers the two questions you actually have at that moment: it worked, and **which GitHub
-account you are signed in as**.
+**Neither defaults to `/`, deliberately.** Nothing serves `/` until a frontend exists, so both used
+to render Spring's Whitelabel 404 on success — indistinguishable from a genuine failure, and each
+was reported as one before anyone realised it was the success path.
 
-That second one matters more than it sounds. The install flow only accepts an installation owned by
-the *same* GitHub account you are signed into ForgeStack with. If you have more than one account,
-check `/api/session` before starting an install — otherwise the callback is refused with
-`NOT_YOUR_ACCOUNT`, which is the same answer an attacker gets and so deliberately does not tell you
-whose it is.
+Login lands on `/api/session`, which answers the two questions you actually have right then: it
+worked, and **which GitHub account you are signed in as**. That second one matters more than it
+sounds — the install flow only accepts an installation owned by the *same* GitHub account you are
+signed into ForgeStack with. If you have more than one account, check `/api/session` before starting
+an install; otherwise the callback is refused with `NOT_YOUR_ACCOUNT`, the same answer an attacker
+gets, so it deliberately does not say whose account it was.
+
+A successful install lands on `/api/repositories` — proof the binding worked, and the list of
+repositories it just granted access to.
 
 No CORS configuration is needed while everything is same-origin on port 8080. When `forge-frontend`
 becomes real, both knobs point at it and a CORS bean allowing that origin with credentials gets

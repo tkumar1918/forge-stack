@@ -33,7 +33,11 @@ class InstallationController {
     InstallationController(
             InstallationBindingService bindings,
             @Value("${forgestack.github.app.slug:}") String appSlug,
-            @Value("${forgestack.github.app.setup-redirect:/}") String setupRedirect) {
+            // Was "/". Nothing serves it, so a successful install rendered a Whitelabel 404 —
+            // exactly the §1.10 login-redirect mistake, just on the other side of the flow. Landing
+            // on the repository list is proof the binding worked and the natural next step: it is
+            // what the install just granted access to.
+            @Value("${forgestack.github.app.setup-redirect:/api/repositories}") String setupRedirect) {
         this.bindings = bindings;
         this.appSlug = appSlug;
         this.setupRedirect = setupRedirect;

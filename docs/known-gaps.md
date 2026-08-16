@@ -242,7 +242,7 @@ an install survives the user logging in again ...  expected: 302 but was: 400
 a rejection explains itself ...                    Expecting not blank but was: ""
 ```
 
-### 1.10 A successful login looked exactly like a failure — **fixed**
+### 1.10 A successful login (and a successful install) looked exactly like a failure — **fixed**
 
 `forgestack.security.login-success-redirect` defaulted to `/`, and nothing serves `/`. **Every
 successful login rendered Spring's Whitelabel 404.** It was reported as a failure three separate
@@ -252,9 +252,16 @@ diagnosis on a system that was working.
 Default is now `/api/session`, so login lands on the session resource: proof it worked, and which
 GitHub account is signed in — the fact that decides whether an install will be accepted at all.
 
-Worth keeping as a category: **the success path had no signal, so its output was borrowed from the
-failure path.** Nothing was broken and everything looked broken. Cheap to fix, and it was masking
-attention that belonged on §1.8 and §1.9.
+**The same mistake existed on the other side of the flow and was found the same way.** After §1.9's
+fix, the first genuinely-new install (via uninstall/reinstall) bound correctly — confirmed by an
+`INSTALLATION_BOUND` audit row and a `github_installations` row — and then rendered the identical
+Whitelabel 404, because `forgestack.github.app.setup-redirect` also defaulted to `/`. Default is now
+`/api/repositories`: proof the binding worked, and the list of what it just granted.
+
+Worth keeping as a category: **a success path with no signal borrows its output from the failure
+path**, and it will keep doing so at every redirect target that shares the mistake, not just the
+first one found. Nothing was broken and everything looked broken, twice. Cheap to fix, and each
+instance was masking attention that belonged on §1.8 and §1.9's real defects.
 
 ---
 
