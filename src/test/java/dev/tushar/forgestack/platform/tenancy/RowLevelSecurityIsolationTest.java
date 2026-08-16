@@ -110,6 +110,67 @@ class RowLevelSecurityIsolationTest extends AbstractIntegrationTest {
                 .hasStackTraceContaining("permission denied");
     }
 
+    /**
+     * The same guarantee, checked where it is actually easy to lose.
+     *
+     * <p>{@link #auditIsAppendOnly()} goes through the parent table, and permission is checked on
+     * the relation the statement names — so it passes on the parent's grants no matter what any
+     * partition allows. {@code UPDATE audit_events_2027_01} is a different check, against a
+     * different set of grants.
+     *
+     * <p>Those grants default to permissive: {@code ALTER DEFAULT PRIVILEGES} hands the application
+     * full DML on every table the migrator creates, and each partition is only pulled back to
+     * INSERT + SELECT by an explicit REVOKE. Forgetting it on one month's partition would leave
+     * that month rewritable while every test above still passed. Asserted over all partitions at
+     * once so it covers the ones that do not exist yet.
+     */
+    @Test
+    @DisplayName("no audit partition is directly writable by the application role")
+    void noAuditPartitionIsDirectlyWritable() {
+        List<String> writable = jdbcTemplate.queryForList(
+                """
+                SELECT c.relname || ':' || a.privilege_type
+                  FROM pg_class c
+                  JOIN pg_inherits i ON i.inhrelid = c.oid
+                  JOIN pg_class parent ON parent.oid = i.inhparent
+                 CROSS JOIN LATERAL aclexplode(c.relacl) a
+                  JOIN pg_roles grantee ON grantee.oid = a.grantee
+                 WHERE parent.relname = 'audit_events'
+                   AND grantee.rolname = 'forgestack_app'
+                   AND a.privilege_type IN ('UPDATE', 'DELETE', 'TRUNCATE')
+                 ORDER BY 1
+                """,
+                String.class);
+
+        assertThat(writable)
+                .as("every audit_events partition must be INSERT + SELECT only for the app role")
+                .isEmpty();
+    }
+
+    /** Partitions exist well past today, so rows are not quietly accumulating in DEFAULT. */
+    @Test
+    @DisplayName("audit partitions are provisioned ahead of time")
+    void auditPartitionsAreProvisionedAhead() {
+        Integer monthsAhead = jdbcTemplate.queryForObject(
+                """
+                SELECT count(*) FROM pg_class c
+                  JOIN pg_inherits i ON i.inhrelid = c.oid
+                  JOIN pg_class parent ON parent.oid = i.inhparent
+                 WHERE parent.relname = 'audit_events'
+                   AND c.relname ~ '^audit_events_[0-9]{4}_[0-9]{2}$'
+                   AND to_date(right(c.relname, 7), 'YYYY_MM') > now()
+                """,
+                Integer.class);
+
+        // Not a specific count: the point is runway, and pinning the exact horizon would make this
+        // fail every time someone extends it.
+        assertThat(monthsAhead)
+                .as("audit_events has no future partitions, so rows will land in DEFAULT — and once "
+                        + "they do, that month's partition can no longer be created without moving them")
+                .isNotNull()
+                .isGreaterThanOrEqualTo(6);
+    }
+
     private List<String> selectAllActions() {
         // Deliberately no workspace_id predicate: the point is that the database adds it.
         return jdbcTemplate.queryForList("SELECT action FROM audit_events", String.class);

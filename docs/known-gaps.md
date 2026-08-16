@@ -279,13 +279,38 @@ instance was masking attention that belonged on §1.8 and §1.9's real defects.
 
 ## 3. Operational gaps
 
-### 3.1 `audit_events` partitions run out
+### 3.1 `audit_events` partitions run out — **fixed**
 
-`V1__baseline.sql` creates partitions for **2026-08 and 2026-09 only**, plus a DEFAULT partition.
-Nothing creates future ones. Rows will land in DEFAULT and keep working, so this fails quietly
-rather than loudly — which is why it is written down.
+`V1__baseline.sql` created partitions for **2026-08 and 2026-09 only**. Rows past that would land in
+DEFAULT and keep working, so it failed quietly — and worse than it first looked: once October rows
+sit in DEFAULT, the October partition can no longer be created without moving them out, so the cost
+grew with the delay.
 
-**Needs:** a scheduled partition-creation job, or partitions provisioned a year ahead.
+`V6__audit_partitions_ahead.sql` provisions through **2027-12** (18 partitions including DEFAULT)
+and adds `create_audit_events_partition(date)`, which creates a partition *and* revokes the app
+role's UPDATE/DELETE/TRUNCATE in one call. The scheduled job this gap originally asked for should
+call that function rather than issue its own `CREATE TABLE`.
+
+**The reason the function exists is a hole this investigation found.**
+`docker/postgres/init/01-roles.sql` sets `ALTER DEFAULT PRIVILEGES … GRANT SELECT, INSERT, UPDATE,
+DELETE ON TABLES TO forgestack_app`, so every table the migrator creates arrives fully writable, and
+V1's per-partition `REVOKE` is what pulls it back. Verified directly: a partition created without
+the revoke reports `DELETE,INSERT,SELECT,UPDATE` for the app role against `INSERT,SELECT` on the
+others. Permission is checked on the relation actually named, so `UPDATE audit_events` stays refused
+by the parent's grants while `UPDATE audit_events_2027_01` would have succeeded — **append-only
+would have been false for every future month, with every existing test still green.**
+
+`RowLevelSecurityIsolationTest.noAuditPartitionIsDirectlyWritable` now asserts it across all
+partitions at once, so it covers the ones that do not exist yet.
+
+**A second bug, found only because the test JVM is not UTC.** The first draft passed a bare `date`
+through `format('%L', …)`, producing `'2026-10-01'` — which `timestamptz` resolves in the *session*
+timezone, and the JDBC connection inherits the JVM's rather than the server's. On a `+05:30` machine
+every boundary shifted back 5.5 hours. It failed loudly only because the first month collided with
+an existing partition; the months after it would have been created crooked and silently misfiled
+rows written near midnight UTC on the 1st. Bounds now carry an explicit `+00`, matching V1's
+literals. Worth remembering as a category: **a migration that reads correctly can still be wrong on
+a machine in a different timezone than the one it was written on.**
 
 ### 3.2 Uninstalls and suspensions are not noticed
 
