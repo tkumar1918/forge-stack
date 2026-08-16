@@ -82,19 +82,27 @@ public class GithubAppClient {
         // "Cannot map null into type long" and surfaced as a 500 on the one path that must answer
         // 403: a guessed installation id. It went unnoticed because the test double replied 404
         // with an empty body, which deserialises to null and looks exactly like a clean miss.
-        return restClient
+        Lookup lookup = restClient
                 .get()
                 .uri("/app/installations/{id}", installationId)
                 .header("Authorization", "Bearer " + appJwt.mintAppJwt())
                 .exchange((request, response) -> {
                     HttpStatusCode status = response.getStatusCode();
-                    if (status.is2xxSuccessful()) {
-                        return Optional.ofNullable(response.bodyTo(InstallationView.class));
-                    }
-                    handleLookupFailure(installationId, status);
-                    return Optional.empty();
+                    return status.is2xxSuccessful()
+                            ? new Lookup(Optional.ofNullable(response.bodyTo(InstallationView.class)), status)
+                            : new Lookup(Optional.empty(), status);
                 });
+
+        if (lookup.view().isPresent()) {
+            return lookup.view();
+        }
+        // Judged outside the exchange so the response is already closed — the failure path may make
+        // a second call, and nesting one inside an open response is asking for trouble.
+        handleLookupFailure(installationId, lookup.status());
+        return Optional.empty();
     }
+
+    private record Lookup(Optional<InstallationView> view, HttpStatusCode status) {}
 
     /**
      * What a 4xx on an installation lookup means, and — the part that matters — who it is about.
@@ -114,6 +122,19 @@ public class GithubAppClient {
                     + "different App fails exactly here.");
         }
         if (status.isSameCodeAs(HttpStatus.NOT_FOUND)) {
+            // A 404 means one of two things that could not be further apart: the caller guessed an
+            // installation id, or *our* App id is wrong. Verified against real GitHub — a JWT whose
+            // `iss` is not a real App returns 404 "Integration not found", not 401. So the original
+            // §1.1 fix, which only caught 401, still reported a misconfigured deployment as "that
+            // installation is not yours" to every user who tried.
+            //
+            // Asking who we are separates them without parsing GitHub's prose. Only on the 404 path,
+            // which is rare and already behind a valid nonce and an authenticated session.
+            if (!appCredentialsRecognised()) {
+                throw new IllegalStateException("GitHub does not recognise the ForgeStack App itself (404 "
+                        + "'Integration not found'). Check forgestack.github.app.id — an id that is not a "
+                        + "real App fails exactly here, and looks identical to a guessed installation id.");
+            }
             // The ordinary answer for a guessed id. Callers must not be able to tell this from a
             // 403, so only the server-side record distinguishes them.
             log.debug("GitHub does not know installation {}", installationId);
@@ -122,6 +143,21 @@ public class GithubAppClient {
         // Usually a suspended App or an exhausted rate limit. Both are operator concerns, and both
         // were invisible while this was folded in with 404.
         log.warn("Installation lookup for {} refused with {}", installationId, status.value());
+    }
+
+    /**
+     * Whether GitHub recognises the App these credentials claim to be.
+     *
+     * <p>{@code GET /app} answers for the App alone and names no installation, so it separates "your
+     * id is wrong" from "that installation does not exist" without reading GitHub's message text —
+     * which is prose, and not a contract.
+     */
+    private boolean appCredentialsRecognised() {
+        return Boolean.TRUE.equals(restClient
+                .get()
+                .uri("/app")
+                .header("Authorization", "Bearer " + appJwt.mintAppJwt())
+                .exchange((request, response) -> response.getStatusCode().is2xxSuccessful()));
     }
 
     /** One repository as the installation-repositories listing reports it. */

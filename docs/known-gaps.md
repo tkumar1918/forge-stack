@@ -263,6 +263,46 @@ path**, and it will keep doing so at every redirect target that shares the mista
 first one found. Nothing was broken and everything looked broken, twice. Cheap to fix, and each
 instance was masking attention that belonged on §1.8 and §1.9's real defects.
 
+### 1.11 A guessed installation id returned 500, and a wrong App ID still blamed the user — **fixed**
+
+Both found by working the §7 checklist against real GitHub for the first time.
+
+**The 500.** `GET /api/installations/callback?installation_id=99999999` answered **500 with a stack
+trace** instead of 403 — on the one path whose entire purpose is refusing an id the caller does not
+own. `fetchInstallation` used `retrieve()` with an `onStatus` handler that *returns* on 404; in
+`RestClient` that means "handled, carry on", and carrying on deserialises the **error** body into
+`InstallationView`. GitHub's 404 is `{"message":"Not Found",…}` with no `id`, so Jackson threw
+`Cannot map null into type long`. Now uses `exchange()`, reading the body only after the status has
+been judged successful.
+
+**Why no test caught it:** `FakeGithub` answered 404 with an **empty** body, which deserialises to
+null and looks exactly like a clean miss. The fake was wrong about GitHub in the one way that
+mattered. It now returns GitHub's real 404 shape, and reproduces the failure before the fix.
+
+**The wrong App ID.** §1.1's fix only handled 401, on the assumption that bad App credentials
+produce one. They do not. Verified directly against GitHub:
+
+| Credential fault | GitHub answers |
+|---|---|
+| Wrong App ID (`iss` is not a real App) | **404** `Integration not found` |
+| Correct App ID, wrong private key | **401** `A JSON web token could not be decoded` |
+
+So a completely misconfigured deployment took the 404 path and told **every** user "that
+installation cannot be connected to the account you are signed in as" — precisely the complaint
+§1.1 was written to fix, still true for the more likely of the two faults. On a 404 the client now
+asks `GET /app`, which answers for the App alone and names no installation, and throws a 500 naming
+`forgestack.github.app.id` when the App itself is unrecognised. Prose is not parsed; the status of a
+different endpoint is.
+
+Verified live on a second instance started with `FORGESTACK_GITHUB_APP_ID=1`: 500 naming the
+credential, while a guessed id against correct credentials still answers 403 and a real bind still
+redirects. The `GET /app` branch is **not** covered by the suite — `FakeGithub` is always driven with
+credentials it issued itself, so an App id GitHub has never heard of cannot arise against it.
+
+**The category, again:** every bug in this section was invisible to a green suite because the test
+double was politer than the real system. A fake that never returns a body, never returns 404 for the
+right reason, or never disagrees with itself is a fake that certifies code the world will reject.
+
 ---
 
 ## 2. Security debt
@@ -493,6 +533,7 @@ Once real credentials exist, this is what has never been exercised end to end:
 - [ ] Hand-edit `installation_id` in the callback URL to any other number — rejected, and an
       `INSTALLATION_BIND_REJECTED` row appears in `audit_events`
 - [ ] Verify no GitHub token, and no App private key, appears in application logs
-- [ ] Restart with a deliberately wrong `FORGESTACK_GITHUB_APP_ID` and replay the callback — expect a
+- [x] Restart with a deliberately wrong `FORGESTACK_GITHUB_APP_ID` and replay the callback — expect a
       **500** naming the credentials, not a `403`. This is the §1.1 fix, and the one item here that
-      cannot be checked against `FakeGithub`
+      cannot be checked against `FakeGithub`.
+      **Ran 2026-08-17 and it failed**, then was fixed — see §1.11.

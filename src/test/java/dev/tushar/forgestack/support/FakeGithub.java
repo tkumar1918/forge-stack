@@ -150,6 +150,10 @@ public final class FakeGithub {
     private static HttpServer start() {
         try {
             HttpServer server = HttpServer.create(new InetSocketAddress(0), 0);
+            // Answers for the App itself, naming no installation. The client asks here on a 404 to
+            // tell "your App id is wrong" apart from "that installation does not exist" — real
+            // GitHub returns 404 for both, so without this the two are indistinguishable.
+            server.createContext("/app", FakeGithub::handleApp);
             server.createContext("/app/installations", FakeGithub::handleInstallations);
             server.createContext("/installation/repositories", FakeGithub::handleRepositories);
             server.createContext("/login/oauth/access_token", FakeGithub::handleAccessToken);
@@ -183,6 +187,23 @@ public final class FakeGithub {
             return;
         }
         respond(exchange, 200, body);
+    }
+
+    /**
+     * The App behind the presented JWT.
+     *
+     * <p>Always recognised here. The credentials this fake is driven with are always the ones it
+     * issued, so the interesting case — an App id GitHub has never heard of — cannot arise against
+     * it. That path is verified against real GitHub instead; see known-gaps.md §1.1.
+     */
+    private static void handleApp(HttpExchange exchange) throws IOException {
+        if (!"/app".equals(exchange.getRequestURI().getPath())) {
+            respond(exchange, 404, "");
+            return;
+        }
+        respond(exchange, 200, """
+                {"id":1,"slug":"forgestack-test","name":"ForgeStack Test"}
+                """);
     }
 
     private static void handleInstallations(HttpExchange exchange) throws IOException {
