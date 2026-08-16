@@ -1,0 +1,332 @@
+FORGESTACK - SESSION HANDOFF
+Written 2026-08-16. Plain text, for handing this work to another agent cold.
+
+
+WHAT THIS PROJECT IS
+
+ForgeStack (renamed from "Forge" mid-project - watch for stray "Forge" references,
+most were swept but the frontend directory forge-frontend/ was deliberately left
+unrenamed since it is empty). A multi-tenant SaaS: give it ownership of a
+repository and it continuously maintains it - detects work, plans, implements,
+verifies, opens PRs, escalates to a human when it must.
+
+The full architecture plan (27 sections plus several addenda and task logs) lives
+at:
+
+    docs/architecture-plan.md (copied into this repo)
+
+That file is the single source of truth for design decisions, and it has been
+kept up to date as an execution log - each Task (A, B, C, D, E...) has a Status
+line at the top saying whether it is implemented, and a Context section
+explaining why. Read that file first. This handoff is a pointer into it, not a
+replacement for it.
+
+Repo: /home/user/Self/Forge/forge-backend
+Branch: feature/phase1-github-app
+Sibling repo forge-frontend/ exists but is empty - out of scope, backend only
+for now.
+
+
+WHERE THINGS STAND RIGHT NOW
+
+Working tree is clean. Latest commit: a52ab9b
+    docs(known-gaps): confirm section 3.2 concretely from the first real install
+
+Postgres and Redis containers are up and healthy (forgestack-postgres,
+forgestack-redis, via docker compose). The Spring Boot app itself is NOT
+currently running - a background bootRun process was killed earlier in this
+session and not restarted. To bring it up:
+
+    docker compose up -d          (if containers are down)
+    ./scripts/dev.sh
+
+scripts/dev.sh sources .env (which is NOT read by Spring Boot natively - the
+script does `set -a; . ./.env; set +a` to load it) and runs
+`./gradlew bootRun --args='--forgestack.security.cookie-secure=false'`. The
+cookie-secure override is required for curl testing over plain HTTP; browsers
+tolerate Secure cookies on localhost but curl does not send them back, so
+without this every authenticated curl request looks like a 401 that is
+actually just a missing cookie.
+
+Real GitHub credentials exist and are wired up: App ID 4602643, slug
+forgestack-app, private key at forgestack-app.pkcs8.pem (gitignored,
+PKCS8-converted from GitHub's PKCS1 download). .env holds the real values.
+GITHUB_APP_CLIENT_ID and GITHUB_APP_CLIENT_SECRET are present in .env but
+UNUSED by the app (App auth is private key -> JWT, not client secret) - the
+user explicitly asked that these stay in .env rather than being deleted,
+because they want to reintroduce that flow later. Do not remove them.
+
+Test suite as of the last full run (before the doc-only final commit, so this
+should still hold): 78 tests, 0 failures. Re-run `./gradlew test` to confirm
+before trusting this number, since nothing here re-verified it after the last
+commit.
+
+Database has one real installation bound: GitHub account QL-Tushar-Kumar,
+installation_id 154085757, 9 repositories synced, all repository_selection:
+all, all currently unmanaged (managed_repositories table is empty - nobody has
+called POST /api/repositories/{id}/manage yet). There is also a second
+ForgeStack user/workspace for the same person's personal account
+(tkumar1918, provider_user_id 55305135) with no installation bound - that is
+a second Chrome profile they tested with, not a bug, just an artifact of
+testing with two accounts.
+
+
+WHAT HAPPENED THIS SESSION, IN ORDER
+
+This session picked up after a large prior rename (Forge -> ForgeStack) and
+credential setup had already landed. The work here was: get a real human
+through login and GitHub App install for the first time ever, and fix
+whatever broke. Four real, previously-invisible bugs were found and fixed,
+entirely by actually running the app rather than trusting the test suite -
+this is a recurring theme in known-gaps.md and worth internalizing before
+touching this code: the test suite runs everything against Testcontainers
+with overridden config and has NEVER booted the packaged application the way
+a user actually runs it. That gap is explicitly still open (see
+known-gaps.md, section 5, "No test boots the packaged application" - marked
+the highest-value gap in the whole document).
+
+Bug 1 (commit 6234e78) - the OAuth servlet session shadowed the ForgeStack
+session. oauth2Login's default SecurityContextRepository persisted the
+OAuth2AuthenticationToken into the servlet session; SecurityContextHolderFilter
+restored it on every later request; ForgeStackSessionAuthenticationFilter was
+guarded on "no authentication present" so it never read the actual ForgeStack
+cookie at all. Result: every one of the seven @AuthenticationPrincipal
+endpoints NPE'd with a 500 the moment a real browser (which holds a servlet
+session cookie AND the ForgeStack cookie at once) tried to use them. curl never
+caught this because curl does not carry a servlet session unless you make it.
+Fixed with NullSecurityContextRepository, deleting the filter's guard entirely
+(not inverting it - "cookie takes precedence" would have silently broken
+session revocation), and requiring a ForgeStackPrincipal specifically at the
+authorization layer instead of just authenticated(). Also found and fixed
+along the way: GitHub's user access token was being retained forever in
+Boot's autoconfigured InMemoryOAuth2AuthorizedClientService, contradicting the
+plan's explicit claim that no user token is persisted. New class
+DiscardedGithubUserTokens throws it away on write. Test:
+LoginSessionIntegrationTest, six of seven assertions watched failing first
+against the real bug before the fix landed.
+
+Bug 2 (commit 0c2b542) - the GitHub App setup nonce was bound to a session id,
+and its rejection reason was unreadable. The install flow spans GitHub's own
+install screen, which takes minutes; a session churn in that window (re-login,
+or in the user's actual case, switching Chrome profiles/GitHub accounts mid
+test) meant the nonce no longer matched by the time the callback arrived.
+Fixed by binding the nonce to the USER instead of the session (this is a
+real, deliberate loosening - "same human, different session" was never the
+threat the nonce defends against; account substitution is caught separately
+by the GitHub-identity ownership check, which was untouched). Also: the single
+rejection reason INVALID_SETUP_STATE covered four different causes (missing,
+expired, replayed, wrong session) with one log line and one audit row - split
+into SETUP_STATE_EXPIRED and SETUP_STATE_FOREIGN so an operator can actually
+tell a stale link apart from a real CSRF attempt. Also: the callback endpoint
+was returning an empty body on rejection, which a real browser renders as a
+blank "This page is not working" - it now returns a readable text/plain
+explanation.
+
+Bug 3 (commit d098409) - same class of bug as Bug 1's symptom, on the other
+side of the flow. forgestack.security.login-success-redirect defaulted to "/"
+and nothing serves "/", so a SUCCESSFUL login rendered a Whitelabel 404,
+indistinguishable from a failure - reported as a failure three times before
+anyone realized it was actually the success path. Fixed the default to
+/api/session (proof it worked, plus which GitHub account you are signed in
+as - important because the install flow only accepts an installation owned by
+the SAME GitHub account you are logged into ForgeStack with). The identical
+mistake existed on forgestack.github.app.setup-redirect (also defaulted to
+"/"), found the same way after the nonce fix: a genuinely successful install
+bound correctly (confirmed via an INSTALLATION_BOUND audit row) and then hit
+the same blank 404. Fixed its default to /api/repositories.
+
+Bug 4 (not a code bug, a confirmed-live instance of an already-documented gap,
+commit a52ab9b) - during testing, the user uninstalled and reinstalled the
+GitHub App twice on the same account. GitHub issues a brand new installation_id
+every time, and ForgeStack has no webhook handler (that is Phase 6 work,
+not built yet) to notice that the OLD installation_id is now dead. Result: two
+live-looking github_installations rows for the same account, each with its own
+synced copy of the same 9 repositories - 18 rows for 9 real repos, and
+GET /api/repositories could not tell them apart. This is known-gaps.md section
+3.2 ("Uninstalls and suspensions are not noticed"), now confirmed concretely
+rather than theoretically. Cleaned up by hand this session (deleted the stale
+github_installations row, which correctly cascades to github_repositories and
+managed_repositories via ON DELETE CASCADE - confirmed via pg_constraint before
+deleting, nothing was lost since managed_repositories was empty at the time).
+NOT fixed in code - see the open question below, this is unresolved.
+
+
+TWO QUESTIONS THE USER ASKED THAT ARE NOT YET FULLY ANSWERED
+
+The user pushed back on two things right at the end of this session, and I did
+not get to finish answering either before running out of context/session time.
+Both deserve real investigation before being taken as settled, not just
+accepted from the plan document.
+
+Question 1: "Are you sure the duplicate-repository bug should be deferred to
+Phase 6?"
+
+My working answer, reached mid-investigation: probably NOT fully correct as
+originally stated. What I found before being cut off:
+
+  - The unique constraint on github_repositories is
+    UNIQUE (github_installation_id, github_repo_id) - scoped per installation,
+    not per workspace. Confirmed by reading
+    src/main/resources/db/migration/V2__github_app.sql directly. This means
+    the database will happily accept two rows for the same real GitHub repo as
+    long as they hang off two different installation rows, regardless of
+    whether webhooks exist.
+
+  - RepositorySyncService.available() (the method backing
+    GET /api/repositories) queries
+    findByWorkspaceIdAndRemovedAtIsNullOrderByFullName(workspaceId) - it
+    dedupes nothing across installations. Every non-removed repository row
+    for the workspace is returned, full stop.
+
+  - RepositorySyncService.sync(workspaceId, installationId) only reconciles
+    the ONE installation it is told about. It has no way to know a
+    DIFFERENT installation row for the same workspace has gone stale, because
+    it only ever sees repositories.findByGithubInstallationId(installation.getId())
+    for the installation it was called with.
+
+  - I had NOT yet checked whether github_installations even has
+    suspended_at / deleted_at columns in the actual schema (the plan document
+    mentions them as intended columns, but I did not verify the real migration
+    file), nor whether any code path currently sets them.
+
+The real implication: even once Phase 6 webhooks exist and correctly mark an
+old installation as deleted, that alone does NOT fix the duplicate-listing
+problem unless something ALSO teaches available() (or the webhook handler
+itself) to exclude repositories belonging to a deleted/suspended installation,
+not just individually-removed repositories. Marking the installation dead and
+filtering the repository list are two separate pieces of work, and only the
+first one is unambiguously "wait for the webhook." The second one - fixing
+available() to filter by installation status, or tightening the unique
+constraint to (workspace_id, github_repo_id) so duplication cannot even be
+inserted regardless of webhook timing - could arguably be done NOW,
+independent of Phase 6, as a data-integrity fix rather than an
+event-plumbing fix.
+
+Next agent should: read github_installations' actual columns
+(V2__github_app.sql), decide whether a workspace-scoped uniqueness fix belongs
+in this session's scope or genuinely waits, and update known-gaps.md section
+3.2 with whichever answer is reached - right now it still says "wait for
+Phase 6" unconditionally, which this investigation suggests is not the whole
+truth.
+
+Question 2: "Confirm Phase 1 is fully complete."
+
+NOT VERIFIED. I did not get to do a line-by-line audit against the plan's
+Phase 1 exit criteria before running out of session. The plan document's
+Phase 1 table (search for "Phase 1 - Foundation, identity, GitHub authority"
+in the plan file) lists six steps, 1.1 through 1.6, each with a stated
+deliverable and exit criterion:
+
+  1.1 Modulith package skeleton, role profiles, docker-compose, Testcontainers
+      - exit criterion: ApplicationModules.verify() passes in CI
+  1.2 ArchUnit suite (module deps, @Port hygiene, no-Impl, no dockerjava
+      outside its adapter) - exit criterion: a deliberate FooService/
+      FooServiceImpl on a scratch branch fails the build
+  1.3 Flyway V1 baseline: tenancy, identity, audit, RLS - exit criterion:
+      tenant A's query returns zero of tenant B's rows; missing GUC throws
+      rather than returning everything
+  1.4 platform.crypto, audit (append-only, no UPDATE/DELETE grant) - exit
+      criterion: audit rows cannot be modified by the app role
+  1.5 GitHub OAuth login: read:user, user:email only; opaque sessions - exit
+      criterion: log in with GitHub; a workspace exists; assert no repo scope
+      requested
+  1.6 GitHub App: install flow WITH installation-admin verification, app JWT
+      -> scoped installation tokens, Redis token cache, repo sync,
+      ManagedRepository opt-in - exit criterion: install, pick repos, enable
+      one; a narrowed token is minted and cached; binding a stranger's
+      installation_id is rejected
+
+Circumstantial evidence that all six are done: the task list (visible via
+TaskList/TaskGet in this environment) shows tasks 1 through 21 marked
+completed, covering exactly this ground by title, and this session's own work
+exercised 1.5 and 1.6 against REAL GitHub for the first time and found real
+bugs in them (which are now fixed). That is reasonably strong evidence 1.5
+and 1.6 are functionally done. It is NOT the same as having actually re-run
+ApplicationModules.verify(), re-read the ArchUnit suite to confirm it still
+fires on a deliberate violation (the project's own stated rule is "a rule
+nobody has seen fied is a rule nobody knows works" - a rule that was proven to
+fire once, months ago, is not the same guarantee as one still known to fire
+today after everything that has changed since), or re-run the RLS
+cross-tenant isolation test.
+
+Next agent should: actually re-run `./gradlew test` fresh and confirm which
+specific test classes correspond to 1.1-1.4 (ModularityTest,
+AbstractionHygieneTest, an RLS isolation test - exact names not confirmed here,
+grep for them) and confirm they are present, passing, and not vacuous
+(check known-gaps.md section 5 - it already flags that
+sandboxCannotReachGithubCredentials and policyDoesNotDependOnLlm currently
+pass vacuously because the modules they guard do not exist yet; there may be
+other tests in a similar state worth naming explicitly against the Phase 1
+checklist specifically, not just the general testing-gaps table).
+
+
+DOCUMENTATION TO READ, IN ORDER OF USEFULNESS
+
+1. docs/architecture-plan.md (copied into this repo)
+   The full architecture plan plus every Task done this session and prior
+   sessions, each with a Status line and Context section. Long but
+   authoritative - addenda near the bottom cover module renames
+   (githubauth -> githublogin, githubapp -> githubinstallation) and API
+   naming decisions (/api/me -> /api/session) with the reasoning kept
+   deliberately, not deleted, even where later corrected.
+
+2. docs/known-gaps.md (in this repo)
+   Everything known to be incomplete, wrong, or deferred, organized by
+   category: will-bite-during-first-manual-test, security debt, operational
+   gaps, product limitations, testing gaps, dependency notes, and a manual
+   verification checklist (section 7) that is partially worked through -
+   items 1 through 3 are done (login creates a session with non-null
+   activeWorkspaceId; install callback binds and redirects; repository list
+   matches GitHub and all show managed:false). Remaining checklist items:
+   flip one repository to managed:true via POST /api/repositories/{id}/manage;
+   change selection on GitHub and resync; remove a managed repository's access
+   and confirm ACCESS_LOST; replay an old setup link; hand-edit
+   installation_id in a callback to someone else's number and confirm 403 plus
+   an audit row; grep logs for leaked credentials; restart with a wrong App ID
+   and confirm a 500 naming the credential problem, not a 403.
+
+3. docs/local-setup.md (in this repo)
+   How to point ForgeStack at real GitHub credentials from scratch: which
+   GitHub App/OAuth App fields matter (Setup URL, Redirect URI) versus which
+   are cosmetic (Homepage URL), how to generate and convert the private key,
+   what each environment variable does, and what the two post-flow redirect
+   defaults now are (/api/session, /api/repositories) and why they are not
+   "/" anymore.
+
+4. This file's own memory-system counterpart: there is a persistent memory
+   directory at
+   /home/user/.claude/projects/-home-user-Self-Forge-forge-backend/memory/
+   with a few standing rules worth reading before making claims about
+   external systems (GitHub's UI, framework defaults) or about code
+   guarantees:
+     - verify-external-claims.md: never assert GitHub/framework behavior
+       from training data, always check with WebSearch/WebFetch or a live
+       call first. Written after getting a GitHub UI detail wrong three
+       times in a row earlier in this project's history.
+     - watch-guarantees-fail-first.md: a test for a guarantee must be seen
+       failing for the right reason before the fix lands, or the test proves
+       nothing. Applied consistently this session - every bug fix above has
+       a note on which assertions were watched failing first and what the
+       actual failure text was.
+     - forge-reader-bar-naming.md: naming standard - a name that needs a
+       disclaiming comment to explain it is not confusable is the wrong name;
+       "the compiler resolves it" is not sufficient justification.
+
+
+IMMEDIATE NEXT STEPS, IN ROUGH PRIORITY ORDER
+
+1. Bring the app back up (docker compose up -d if needed, then
+   ./scripts/dev.sh) and confirm health before doing anything else.
+
+2. Resolve Question 1 and Question 2 above properly - both were live,
+   legitimate pushback from the user that got interrupted by session limits,
+   not settled.
+
+3. Continue the known-gaps.md section 7 manual checklist from item 4 onward
+   (managed-repository flip, resync, ACCESS_LOST, nonce replay, installation
+   hijack attempt, log credential grep, wrong-App-ID restart).
+
+4. Only after 2 and 3: move on to whatever the plan's Phase 2 work is
+   (mechanical substrate - task/attempt state machine, job queue with
+   fencing, all still zero-LLM per the plan's stated ordering principle of
+   proving the substrate correct before any model is wired in).
