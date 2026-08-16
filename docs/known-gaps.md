@@ -293,7 +293,18 @@ There is no webhook handling (Phase 6). If a customer uninstalls the App or susp
 believing it has access until something fails. `InstallationTokenService.evict` exists for this but
 has no caller.
 
-**Until then:** `POST /api/repositories/sync/{installationId}` is the only way to notice a change.
+**Confirmed concretely** during the first real install: uninstalling and reinstalling on the same
+account gets a *new* `installation_id` from GitHub every time, and the old `github_installations`
+row — and its synced `github_repositories` — stayed exactly as valid-looking as the new one. Two
+rounds of uninstall/reinstall left 18 repository rows for 9 real repositories, each doubled, with
+`GET /api/repositories` unable to tell the difference. Cleaned up by hand (`DELETE FROM
+github_installations WHERE installation_id = <stale>`, which cascades to `github_repositories` and
+`managed_repositories`) — not a code fix, since the correct fix is the webhook this gap already
+names.
+
+**Until then:** `POST /api/repositories/sync/{installationId}` is the only way to notice a change,
+and it only helps for the installation you tell it about — it does nothing about a *different*,
+now-dead installation's rows sitting alongside it.
 
 ### 3.3 No GitHub rate-limit handling
 
