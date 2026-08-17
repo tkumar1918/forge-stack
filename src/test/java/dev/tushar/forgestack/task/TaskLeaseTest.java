@@ -22,6 +22,9 @@ class TaskLeaseTest extends AbstractIntegrationTest {
     private TaskLeases leases;
 
     @Autowired
+    private LeaseScope leaseScope;
+
+    @Autowired
     private TenantScope tenantScope;
 
     @Autowired
@@ -33,7 +36,7 @@ class TaskLeaseTest extends AbstractIntegrationTest {
 
     @BeforeEach
     void aTaskToClaim() {
-        this.rows = new TaskRows(tenantScope, jdbc);
+        this.rows = new TaskRows(tenantScope, leases, leaseScope, jdbc);
         this.workspaceId = rows.newWorkspace();
         this.taskId = rows.newTask(workspaceId, "QUEUED");
     }
@@ -64,7 +67,7 @@ class TaskLeaseTest extends AbstractIntegrationTest {
     void releasingFreesTheTask() {
         Lease lease = leases.acquire(workspaceId, taskId, "worker-1", TTL).orElseThrow();
 
-        assertThat(leases.release(workspaceId, lease)).isTrue();
+        assertThat(leases.release(lease)).isTrue();
 
         // The point of releasing rather than letting the lease lapse: a graceful handover costs no
         // waiting, and a whole TTL of dead time per deploy is what makes people stop draining.
@@ -77,7 +80,7 @@ class TaskLeaseTest extends AbstractIntegrationTest {
         Lease lease = leases.acquire(workspaceId, taskId, "worker-1", Duration.ofSeconds(5))
                 .orElseThrow();
 
-        assertThat(leases.renew(workspaceId, lease, Duration.ofSeconds(120))).isTrue();
+        assertThat(leases.renew(lease, Duration.ofSeconds(120))).isTrue();
 
         assertThat(leases.current(workspaceId, taskId).orElseThrow().expiresAt())
                 .isAfter(lease.expiresAt());

@@ -467,20 +467,45 @@ binding transaction, so the fix is to move it to a job once `platform.jobs` exis
 Documented trade in `InstallationTokenService.evict`. Costs one narrowly-scoped token living out its
 remaining minutes, versus stalling Redis with `KEYS`. Accepted.
 
-### 3.7 Nothing forces a worker's writes to carry its lease epoch
+### 3.7 Nothing forces a worker's writes to carry its lease epoch — **fixed**
 
-**The gap with the widest blast radius in Phase 2.** Fencing works only if every write a worker makes
-to its task carries `AND lease_epoch = :epoch` in the same statement. `TaskLeases` does this for the
-three operations it owns, and `CrashRecoveryTest` proves a superseded worker cannot renew or release.
-Nothing checks the *next* write somebody adds.
+The gap with the widest blast radius in Phase 2, and it was fixed one layer lower than planned.
 
-A lease that is consulted rather than made part of the write does not stop the stalled worker it
-exists to stop, and the failure is silent: two workers, both convinced they hold the task, both
-writing. The rule is stated in `TaskLeases`' class javadoc, which is discipline, not enforcement.
+Fencing used to work only for the three statements that remembered to ask for it: `TaskLeases` puts
+`AND lease_epoch = ?` in its own `WHERE` clauses, so a superseded worker's renew and release do
+nothing. Nothing checked the *next* write somebody added, and that write would not fail, would not
+warn, and would not look wrong in review — it would simply mean two workers writing to a task they
+both believed they held. The rule lived in a class javadoc, which is discipline, not enforcement.
 
-Candidate fixes when `TaskStateService` lands in 2.3: route every task write through it and take the
-`Lease` as a parameter, so a caller without a lease cannot express the write at all. That is stronger
-than any ArchUnit rule and should be preferred over one.
+The plan's fix for 2.3 was to route every task write through `TaskStateService` taking a `Lease`
+parameter. That binds code that goes through the service, and nothing else. `V10__lease_fencing.sql`
+puts the rule where it cannot be skipped instead: a `BEFORE UPDATE` trigger refuses any write to a
+task under a live claim unless the session carries that exact claim in `app.lease_task` and
+`app.lease_epoch` — the same mechanism as row-level security, aimed at a different question.
+`LeaseScope` is the `TenantScope`-shaped way to bind it.
+
+Stronger than RLS in one respect worth noting: RLS is bypassed by a superuser, and this is not.
+Verified live — a `postgres` superuser `UPDATE` against a leased task is refused.
+
+**Expiry is the only way past it, and that is deliberate.** A lapsed claim is exactly what the
+reconciler exists to take back and cannot carry an epoch, because the point is that its holder is
+gone. Making expiry the boundary means the escape hatch and the recovery path are the same thing, so
+there is no bypass to add and none to reach for by mistake. The case that will eventually want one —
+a human cancelling a task a worker is actively running — is §3.12.
+
+### 3.12 There is no way to intervene in a task a worker currently holds
+
+A consequence of §3.7's fix, and the one legitimate write the fence has no path for: a human
+cancelling a `RUNNING` task cannot write to it while its lease is live, and bumping the epoch to
+fence the worker off is itself a write. Nothing needs this yet — there is no cancellation endpoint —
+so no bypass was built for it, on the principle that an escape hatch with no caller is one people
+find and use for the wrong thing.
+
+The shape to prefer when it arrives is a cancellation *request* the worker observes at its next
+checkpoint, not a stomp: an `UPDATE` that wins a race against a running worker leaves a sandbox, a
+branch, and possibly an open PR behind it. Only if that proves insufficient should a fenced override
+exist, and it should look like `TenantScope.runWithoutTenant` — named, documented, and obvious in a
+diff.
 
 ### 3.8 The reconciler sweep is O(active workspaces)
 

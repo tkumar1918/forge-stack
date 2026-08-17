@@ -17,19 +17,27 @@ import org.springframework.stereotype.Service;
  * and the act it may already have been replaced. Every method here asks the database to do the thing
  * <em>if</em> the claim is still ours, and reports whether it did.
  *
- * <p><strong>A rule for everything built on top of this.</strong> Any write a worker makes to its
- * task must carry {@code AND lease_epoch = :epoch} in the same statement. A lease that is only
- * consulted, rather than made part of the write, does not stop the stalled worker it exists to stop.
- * Nothing enforces this mechanically yet — see {@code docs/known-gaps.md}.
+ * <p><strong>The rule for everything built on top of this</strong> — that a worker's writes must
+ * carry its epoch — is not enforced here. It is enforced by the {@code tasks_reject_unfenced_write}
+ * trigger (V10), which refuses any update to a task under a live claim unless the session carries
+ * that claim. Stating it as a convention in this javadoc was the previous arrangement and it was not
+ * good enough: the statement that forgets is written somewhere else, by someone who never read this.
+ *
+ * <p>The predicates below therefore duplicate what the trigger enforces, and they earn it. A
+ * predicate that matches no rows returns {@code false}, which is an ordinary answer a caller can act
+ * on; the trigger raises, which is a failure. Losing a claim is expected — it should not read like a
+ * fault. {@link LeaseScope} is how everything else writes.
  */
 @Service
 public class TaskLeases {
 
     private final TenantScope tenantScope;
+    private final LeaseScope leaseScope;
     private final JdbcTemplate jdbc;
 
-    TaskLeases(TenantScope tenantScope, JdbcTemplate jdbc) {
+    TaskLeases(TenantScope tenantScope, LeaseScope leaseScope, JdbcTemplate jdbc) {
         this.tenantScope = tenantScope;
+        this.leaseScope = leaseScope;
         this.jdbc = jdbc;
     }
 
@@ -38,6 +46,9 @@ public class TaskLeases {
      *
      * <p>Empty means somebody else has it. That is an ordinary answer, not an error: it is what a
      * duplicate queue delivery looks like from here, and duplicates are expected.
+     *
+     * <p>Needs no lease scope of its own — the trigger lets a write through exactly when the claim
+     * being replaced has lapsed, which is the only case this statement can match.
      */
     public Optional<Lease> acquire(UUID workspaceId, UUID taskId, String owner, Duration ttl) {
         return tenantScope.runInTenant(workspaceId, () -> {
@@ -56,8 +67,11 @@ public class TaskLeases {
                     RETURNING lease_epoch, lease_expires_at
                     """,
                     (rs, row) -> new Lease(
-                            taskId, owner, rs.getLong("lease_epoch"), rs.getTimestamp("lease_expires_at")
-                                    .toInstant()),
+                            taskId,
+                            workspaceId,
+                            owner,
+                            rs.getLong("lease_epoch"),
+                            rs.getTimestamp("lease_expires_at").toInstant()),
                     owner,
                     (double) ttl.toMillis() / 1000,
                     taskId);
@@ -71,8 +85,8 @@ public class TaskLeases {
      * <p>Not "retry the heartbeat": a false here means another worker is already running this task,
      * and continuing would mean two workers doing the same work with the same side effects.
      */
-    public boolean renew(UUID workspaceId, Lease lease, Duration ttl) {
-        return tenantScope.runInTenant(workspaceId, () -> jdbc.update(
+    public boolean renew(Lease lease, Duration ttl) {
+        return leaseScope.runUnderLease(lease, () -> jdbc.update(
                         """
                         UPDATE tasks
                            SET lease_expires_at = now() + make_interval(secs => ?),
@@ -92,8 +106,8 @@ public class TaskLeases {
      * <p>Also epoch-conditional, so a worker that has already been superseded cannot release a lease
      * its successor now holds — releasing someone else's claim is the same bug as writing over it.
      */
-    public boolean release(UUID workspaceId, Lease lease) {
-        return tenantScope.runInTenant(workspaceId, () -> jdbc.update(
+    public boolean release(Lease lease) {
+        return leaseScope.runUnderLease(lease, () -> jdbc.update(
                         """
                         UPDATE tasks
                            SET lease_owner = NULL,
@@ -116,7 +130,9 @@ public class TaskLeases {
                             Instant expiresAt = rs.getTimestamp("lease_expires_at") == null
                                     ? null
                                     : rs.getTimestamp("lease_expires_at").toInstant();
-                            return new Lease(taskId, rs.getString("lease_owner"), rs.getLong("lease_epoch"), expiresAt);
+                            return new Lease(
+                                    taskId, workspaceId, rs.getString("lease_owner"), rs.getLong("lease_epoch"),
+                                    expiresAt);
                         },
                         taskId)
                 .stream()

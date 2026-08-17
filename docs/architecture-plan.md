@@ -3756,3 +3756,77 @@ job placed on `forge:q:task` with the right resource id, and the outbox row comp
 2.3 `TaskStateService` — the declared transition table and its guards (§10.3). V7 created the states;
 nothing yet enforces which transitions between them are legal, and `LeaseReconciler` currently writes
 `RUNNING → QUEUED` directly. That write moves behind the state service when it exists.
+
+# Phase 2 — step 2.3a: lease enforcement moves into the database
+
+**Status: implemented.** `V10__lease_fencing.sql`, `LeaseScope`, 7 tests. Suite 120 → 127 green.
+Verified live. Closes `known-gaps.md` §3.7, which was the widest-blast-radius gap in Phase 2.
+
+The rest of 2.3 — the declared transition table and its guards (§10.3) — is still open. This is the
+half the concern was actually about.
+
+## The plan's fix, and why it was not enough
+
+§10.3 funnels every state change through `TaskStateService`, and the intended answer to §3.7 was to
+give it a `Lease` parameter so a caller without a claim could not express the write. That is a real
+guarantee and worth having — the compiler is a good place for a rule.
+
+It binds code that goes *through the service*. The gap was never about code that goes through the
+service; it was about the statement someone adds in six months against `tasks` directly, without
+thinking about leases at all. A service cannot refuse a write it never sees.
+
+So the rule went where it cannot be skipped, on exactly the terms this schema already uses for
+tenancy. RLS does not ask modules to filter by workspace; Postgres refuses rows that do not match a
+session GUC. `V10` does the same for claims: a `BEFORE UPDATE` trigger on `tasks` refuses any write
+to a task under a live lease unless the session carries that claim in `app.lease_task` and
+`app.lease_epoch`. `LeaseScope.runUnderLease` binds them with `SET LOCAL`, the way `TenantScope` binds
+the workspace, and clears them on the way out because a `TransactionTemplate` joins rather than nests.
+
+**Stronger than RLS in one respect:** a superuser bypasses row-level security and does not bypass a
+trigger. Verified live — a `postgres` `UPDATE` against a leased task is refused.
+
+## Two GUCs, not one
+
+An epoch alone would let a scope opened for task A authorise a write to task B sitting at the same
+epoch. Epochs are per-row counters starting at zero, so collisions are the normal case rather than a
+coincidence. `aClaimDoesNotTravel` asserts it with both tasks deliberately at the same epoch.
+
+## Expiry is the only way past the fence, deliberately
+
+A lapsed claim is precisely what the reconciler exists to take back, and it cannot carry an epoch
+because the point is that its holder is gone. Making expiry the boundary means the escape hatch and
+the recovery path are the same thing — there is no bypass to add, and none to reach for by mistake.
+
+Every current writer already satisfies this without a special case: `acquire` can only match a task
+whose claim has lapsed, `renew` and `release` run under `LeaseScope`, the reconciler reclaims only
+lapsed leases, and `requeued_at` is written to tasks nobody holds. The one legitimate write with no
+path — a human cancelling a task a worker is actively running — has no caller yet and is recorded as
+`known-gaps.md` §3.12 rather than pre-empted with a bypass.
+
+## What the trigger found
+
+A latent bug in the reconciler, on the first run. `findStrandedQueuedTasks` selected on `state =
+'QUEUED'` alone, and a worker claims a task *before* moving it to `RUNNING` — so there is a real
+window where a task is both queued and held. Re-queueing then would hand the same work to a second
+worker while the first was starting on it. The trigger turned that into a loud failure (the
+`requeued_at` write is refused, taking the whole sweep with it) instead of a duplicate nobody would
+have traced back. The scan now excludes live claims, which it should always have done.
+
+## The layer above still gets built
+
+The predicates in `TaskLeases` stay, and they earn their place: a predicate that matches no rows
+returns `false`, which a caller can act on, while the trigger raises, which is a failure. Losing a
+claim is expected and should not read like a fault. When `TaskStateService` lands it takes a `Lease`
+for worker-initiated transitions as §10.3 intended — the compiler layer on top of the database one,
+with the database as the layer that holds when the compiler is not consulted.
+
+## Tests
+
+`LeaseFencingTest`, written as the naive statements someone would actually add: plain `UPDATE tasks`
+through a `JdbcTemplate`. Watched failing first by disabling the trigger — four of the seven flipped
+to "Expecting code to raise a throwable", and the three permissive cases stayed green.
+
+The fixture had to change too: `TaskRows` backdates through whatever claim the task currently holds,
+because the trigger gives test fixtures no exemption. That is worth having rather than working
+around — a fixture that could write past the rule could set up states the real system cannot reach,
+and tests against those prove nothing.

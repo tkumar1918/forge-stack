@@ -47,6 +47,9 @@ class CrashRecoveryTest extends AbstractIntegrationTest {
     private StringRedisTemplate redis;
 
     @Autowired
+    private LeaseScope leaseScope;
+
+    @Autowired
     private TenantScope tenantScope;
 
     @Autowired
@@ -63,7 +66,7 @@ class CrashRecoveryTest extends AbstractIntegrationTest {
 
     @BeforeEach
     void aWorkspace() {
-        this.rows = new TaskRows(tenantScope, jdbc);
+        this.rows = new TaskRows(tenantScope, leases, leaseScope, jdbc);
         this.workspaceId = rows.newWorkspace();
         drained.clear();
     }
@@ -113,16 +116,16 @@ class CrashRecoveryTest extends AbstractIntegrationTest {
         rows.expireLease(workspaceId, taskId);
         reconciler.reconcile(workspaceId);
 
-        assertThat(leases.renew(workspaceId, stale, TTL))
+        assertThat(leases.renew(stale, TTL))
                 .as("renewing must fail: the correct response is to stop, not to try harder")
                 .isFalse();
-        assertThat(leases.release(workspaceId, stale))
+        assertThat(leases.release(stale))
                 .as("nor may it release a claim that now belongs to someone else")
                 .isFalse();
 
         Lease fresh = leases.acquire(workspaceId, taskId, "worker-2", TTL).orElseThrow();
         assertThat(fresh.epoch()).isGreaterThan(stale.epoch());
-        assertThat(leases.renew(workspaceId, stale, TTL))
+        assertThat(leases.renew(stale, TTL))
                 .as("and still fails once the successor is actually running")
                 .isFalse();
     }
@@ -152,13 +155,13 @@ class CrashRecoveryTest extends AbstractIntegrationTest {
                 leases.acquire(workspaceId, taskId, "worker-1", TTL).orElseThrow();
         assertThat(afterTheRestart.epoch()).isGreaterThan(beforeTheCrash.epoch());
 
-        assertThat(leases.renew(workspaceId, beforeTheCrash, TTL))
+        assertThat(leases.renew(beforeTheCrash, TTL))
                 .as("the owner column matches and the claim is still not the old one's")
                 .isFalse();
-        assertThat(leases.release(workspaceId, beforeTheCrash))
+        assertThat(leases.release(beforeTheCrash))
                 .as("nor may the old process release the new one's claim on its way out")
                 .isFalse();
-        assertThat(leases.renew(workspaceId, afterTheRestart, TTL))
+        assertThat(leases.renew(afterTheRestart, TTL))
                 .as("while the current holder is unaffected")
                 .isTrue();
     }

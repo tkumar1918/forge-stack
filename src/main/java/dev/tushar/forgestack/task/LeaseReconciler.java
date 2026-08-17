@@ -173,6 +173,13 @@ public class LeaseReconciler {
                         """
                         SELECT id FROM tasks
                          WHERE state = 'QUEUED'
+                           -- A task somebody currently holds is not stranded, whatever its state
+                           -- says. A worker claims the task before moving it to RUNNING, so there is
+                           -- a real window where both are true, and re-queueing then would hand the
+                           -- same work to a second worker while the first is starting on it.
+                           -- V10's trigger would also refuse the requeued_at write and take the
+                           -- whole sweep down with it — which is how this was noticed.
+                           AND (lease_expires_at IS NULL OR lease_expires_at <= now())
                            AND state_entered_at <= now() - make_interval(secs => ?)
                            -- Without this the reconciler competes with itself: a task nobody has
                            -- capacity for looks lost on every single sweep, and one task becomes a
