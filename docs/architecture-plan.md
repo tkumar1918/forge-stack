@@ -3830,3 +3830,97 @@ The fixture had to change too: `TaskRows` backdates through whatever claim the t
 because the trigger gives test fixtures no exemption. That is worth having rather than working
 around — a fixture that could write past the rule could set up states the real system cannot reach,
 and tests against those prove nothing.
+
+# Phase 2 — step 2.3: the transition table and its guards
+
+**Status: implemented.** `TaskState`, `TaskEvent`, `Actor`, `TaskFacts`, `TaskGuard`,
+`TaskTransitions`, `TaskStateService` and two exceptions; 18 tests. Suite 127 → 145 green. Closes
+`known-gaps.md` §3.10.
+
+## Exit criteria
+
+> *Every illegal (state, event) pair throws; `COMPLETE` is refused when any single guard precondition
+> is removed.*
+
+**All 228 pairs, not a sample.** `TaskTransitionTableTest` walks the full state × event product and
+asserts that anything undeclared has no transition at all. An unhandled pair that quietly did nothing
+would be worse than one that throws: a task silently ignoring `COMPLETE` looks exactly like a task
+still working. `TaskStateServiceTest.anIllegalEventThrows` covers the service end, watched failing
+first by letting an undeclared pair fall back to a self-transition.
+
+**Each guard disarmed in turn**, one run per guard, and each failed exactly its own test and nothing
+else:
+
+| Guard disarmed | Test that failed |
+|---|---|
+| `NO_ATTEMPT_IN_FLIGHT` | completion is refused while an attempt is still running |
+| `LATEST_ATTEMPT_SUCCEEDED` | the latest attempt did not succeed; an earlier success does not rescue a later failure |
+| `WITHIN_BUDGET` | completion is refused when the budget was exceeded |
+| `ATTEMPT_CAP_REACHED` | giving up needs the attempt cap actually reached |
+
+That "and nothing else" needed a design change to be true. `latestAttemptOutcome` originally read the
+highest-numbered attempt, so an in-flight attempt failed *both* `NO_ATTEMPT_IN_FLIGHT` and
+`LATEST_ATTEMPT_SUCCEEDED` — meaning either could be disarmed while the other covered for it. It now
+reads the most recent *finished* attempt, keeping "nothing is running" and "the last thing that ran
+succeeded" as two separate questions. Same failure mode as the lease-epoch test earlier in this
+phase, caught the same way.
+
+## The five guards that decide nothing
+
+Of §10.3's seven completion preconditions, two have data today. The rest need `evidence`,
+`human_interventions`, diff guards, a policy engine, and pull-request state — none of which exist.
+
+They are declared anyway, marked `PENDING`, and they pass. A guard list that quietly contained three
+checks while looking like eight would be believed, and that is the failure this project keeps finding
+in its own work. So the unenforced half is made visible in the one place nobody can avoid reading:
+**every transition writes each guard's verdict into `task_state_transitions.guard_results`**, and a
+task completed today carries a permanent record that five of its preconditions were `NOT_ENFORCED`.
+The set is pinned by a test, so shrinking it is a deliberate edit and growing it is a conversation.
+
+Passing rather than blocking is the uncomfortable half of the trade: blocking every completion would
+make the phases that build the missing data impossible to build. **The gate on Phase 4 is that this
+set is empty** — nothing autonomous may complete a task under a rule this weak (`known-gaps.md`
+§3.13).
+
+## Decisions inside the table
+
+- **`REJECT` and `TIMEOUT` land in different states.** A person saying no is `CANCELLED`; nobody
+  answering is `ABANDONED`. Collapsing them would lose the distinction between a decision and the
+  absence of one, which is exactly what somebody triaging a stalled queue needs.
+- **`ATTEMPT_FAILED` is a self-loop on `RUNNING`.** A new attempt is not a new lifecycle — the worker
+  still holds the task, and only the approach is being discarded.
+- **`UNSUSPEND` returns to `READY`, not to where it left.** Capacity, dependencies and budget all
+  have to be re-examined after an interval nobody bounded.
+- **`SUSPEND` and `CANCEL` are generated from a set of live states** rather than written out, so
+  adding a state cannot silently create one that ignores a budget breach or refuses cancellation.
+- **The expected transition set is written out a second time in the test.** Deriving it from the table
+  would assert only that the code equals itself. Adding a transition should mean editing two places
+  on purpose, in a diff a reviewer reads.
+
+## Where this meets the fence
+
+`apply` has two entry points: one taking a `Lease`, one taking a workspace and task id. The second is
+for admission, cancellation, and the reconciler; the first is for a worker acting on a task it holds.
+Choosing wrong is not silent — V10 refuses an unfenced write to a task under a live claim, so
+transitioning a running task from outside fails at the database instead of racing the worker.
+`aRunningTaskIsProtectedFromOutside` asserts both directions.
+
+Entering `QUEUED` publishes the enqueue intent, so queueing is a consequence of the state rather than
+a second thing to remember. That let `LeaseReconciler` drop its own `tasks.state` write, its
+hand-written transition insert, and its separate enqueue for reclaimed tasks.
+
+## Verified live
+
+The reconciler's `LEASE_EXPIRED` path, through the new service, against the running app: a task with
+a lapsed claim moved `RUNNING → QUEUED`, epoch 2 → 3, `requeued_at` stamped, the transition row
+written by the service, and the job on `forge:q:task`.
+
+Everything else in the FSM has only ever run under Testcontainers, because there is no HTTP surface
+until 2.4 — recorded as `known-gaps.md` §3.14, since every phase so far has found bugs live that a
+green suite missed.
+
+## Next
+
+2.4 — the task REST API with fake phase handlers simulating success, failure and escalation. That is
+what finally drives this FSM from outside a test, and what makes the `COMPLETE` path reachable by
+something other than a fixture.

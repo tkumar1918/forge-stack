@@ -49,6 +49,7 @@ public class LeaseReconciler {
     private static final int BATCH = 200;
 
     private final IamQueries iam;
+    private final TaskStateService taskStates;
     private final TenantScope tenantScope;
     private final JdbcTemplate jdbc;
     private final ApplicationEventPublisher events;
@@ -58,6 +59,7 @@ public class LeaseReconciler {
 
     LeaseReconciler(
             IamQueries iam,
+            TaskStateService taskStates,
             TenantScope tenantScope,
             JdbcTemplate jdbc,
             ApplicationEventPublisher events,
@@ -65,6 +67,7 @@ public class LeaseReconciler {
             @Value("${forgestack.jobs.queued-grace:PT2M}") Duration queuedGrace,
             @Value("${forgestack.jobs.leadership-ttl:PT2M}") Duration leadershipTtl) {
         this.iam = iam;
+        this.taskStates = taskStates;
         this.tenantScope = tenantScope;
         this.jdbc = jdbc;
         this.events = events;
@@ -110,10 +113,11 @@ public class LeaseReconciler {
      * inferred from a schedule firing.
      */
     public Outcome reconcile(UUID workspaceId) {
+        // Reclaimed tasks are queued by TaskStateService on the way into QUEUED, so only the
+        // stranded ones — which change no state — need queueing from here.
         List<UUID> reclaimed = reclaimLapsedLeases(workspaceId);
         List<UUID> stranded = findStrandedQueuedTasks(workspaceId, reclaimed);
-        enqueue(workspaceId, reclaimed);
-        enqueue(workspaceId, stranded);
+        reQueue(workspaceId, stranded);
         return new Outcome(reclaimed.size(), reclaimed.size() + stranded.size());
     }
 
@@ -124,47 +128,61 @@ public class LeaseReconciler {
 
     private List<UUID> reclaimLapsedLeases(UUID workspaceId) {
         return tenantScope.runInTenant(workspaceId, () -> {
-            List<UUID> reclaimed = jdbc.query(
+            List<UUID> lapsed = jdbc.query(
                     """
-                    UPDATE tasks
-                       SET state = 'QUEUED',
-                           state_entered_at = now(),
-                           lease_owner = NULL,
-                           lease_epoch = lease_epoch + 1,
-                           lease_expires_at = NULL,
-                           version = version + 1,
-                           updated_at = now()
-                     WHERE id IN (
-                         SELECT id FROM tasks
-                          WHERE state = 'RUNNING'
-                            AND lease_expires_at IS NOT NULL
-                            AND lease_expires_at <= now()
-                          ORDER BY lease_expires_at
-                          LIMIT ?
-                          -- Another sweep running concurrently takes a different batch rather than
-                          -- waiting for this one, which is what keeps a duplicate scheduler harmless.
-                          FOR UPDATE SKIP LOCKED)
-                    RETURNING id
+                    SELECT id FROM tasks
+                     WHERE state = 'RUNNING'
+                       AND lease_expires_at IS NOT NULL
+                       AND lease_expires_at <= now()
+                     ORDER BY lease_expires_at
+                     LIMIT ?
+                     -- Another sweep running concurrently takes a different batch rather than
+                     -- waiting for this one, which is what keeps a duplicate scheduler harmless.
+                     FOR UPDATE SKIP LOCKED
                     """,
                     (rs, row) -> rs.getObject("id", UUID.class),
                     BATCH);
 
-            // Same transaction as the state change, because the schema's claim is that every state
-            // change has exactly one row here. A transition log with holes in it answers nothing,
-            // and the holes would be precisely the incidents anyone ever goes looking for.
-            for (UUID taskId : reclaimed) {
-                jdbc.update(
-                        """
-                        INSERT INTO task_state_transitions
-                            (task_id, workspace_id, from_state, to_state, event, actor_type, reason)
-                        VALUES (?, ?, 'RUNNING', 'QUEUED', 'LEASE_EXPIRED', 'SCHEDULER', ?)
-                        """,
-                        taskId,
+            // One transaction for the whole reclaim, and this is not a preference. Releasing the
+            // claim and moving the task back to QUEUED have to commit together: in any gap between
+            // them a worker can claim the freed task, and the transition would then be applied to a
+            // task somebody is already running — which V10's fence would refuse, taking the sweep
+            // down with it.
+            for (UUID taskId : lapsed) {
+                releaseLapsedClaim(taskId);
+                taskStates.applyAlreadyScoped(
                         workspaceId,
+                        taskId,
+                        TaskEvent.LEASE_EXPIRED,
+                        Actor.scheduler(),
                         "the worker holding this task stopped renewing its lease");
             }
-            return reclaimed;
+            return lapsed;
         });
+    }
+
+    /**
+     * Hands a lapsed claim back to nobody, and moves the epoch on so its old holder cannot return.
+     *
+     * <p>The epoch bump is the part that matters. The previous worker may still be alive and about to
+     * wake up, and after this its every write is refused — by its own predicates if it is using
+     * {@link TaskLeases}, and by the fence if it is not.
+     */
+    private void releaseLapsedClaim(UUID taskId) {
+        jdbc.update(
+                """
+                UPDATE tasks
+                   SET lease_owner = NULL,
+                       lease_epoch = lease_epoch + 1,
+                       lease_expires_at = NULL,
+                       -- Stamped here rather than after the transition, so the backoff covers the
+                       -- queueing the state change is about to cause.
+                       requeued_at = now(),
+                       version = version + 1,
+                       updated_at = now()
+                 WHERE id = ?
+                """,
+                taskId);
     }
 
     private List<UUID> findStrandedQueuedTasks(UUID workspaceId, List<UUID> alreadyReclaimed) {
@@ -202,7 +220,7 @@ public class LeaseReconciler {
                 .toList());
     }
 
-    private void enqueue(UUID workspaceId, List<UUID> taskIds) {
+    private void reQueue(UUID workspaceId, List<UUID> taskIds) {
         if (taskIds.isEmpty()) {
             return;
         }

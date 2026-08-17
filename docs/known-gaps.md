@@ -528,12 +528,37 @@ latency per deploy on every in-flight task.
 Belongs with the attempt loop in Phase 3, where `SIGTERM → stop claiming → finish the step →
 checkpoint → release the lease` is a sequence something actually performs.
 
-### 3.10 `LeaseReconciler` writes `RUNNING → QUEUED` directly
+### 3.10 `LeaseReconciler` writes `RUNNING → QUEUED` directly — **fixed**
 
-It writes the state change and its `task_state_transitions` row itself, because the state machine
-that should own that decision arrives in 2.3. It is the only writer of a task state today, and moves
-behind `TaskStateService` when there is one. Flagged so it is not mistaken for a sanctioned pattern —
-it is the exception that exists because the rule has not been written yet.
+It now calls `TaskStateService`, so the transition is declared in the table like every other and
+`tasks.state` has exactly one writer. Both halves run in one transaction, which is not a preference:
+between releasing a lapsed claim and moving the task back to `QUEUED`, a worker can claim the freed
+task, and the transition would then be applied to something somebody is already running — which V10's
+fence refuses, taking the sweep down with it.
+
+### 3.13 Five of the eight completion guards decide nothing
+
+`COMPLETE` declares §10.3's full precondition list, and five of those guards read data that does not
+exist: no `evidence` table, no `human_interventions`, no diff guards, no policy engine, no record of
+a merge or an acceptance. They are marked `PENDING` and pass.
+
+**This is a real hole and it is meant to read like one.** What makes it survivable is that it is
+never silent: every transition writes each guard's verdict into
+`task_state_transitions.guard_results`, so a task completed today carries a permanent record that
+five of its preconditions were `NOT_ENFORCED`, and nobody reading its history later has to
+reconstruct what was actually checked. `CompletionGuardsTest.theUnenforcedGuardsAreKnown` pins the
+set, so shrinking it is a deliberate edit and growing it is a conversation.
+
+They pass rather than block because blocking every completion would make the phases that build the
+missing data impossible to build. **Nothing autonomous may be allowed to complete a task until this
+set is empty** — that is the gate on Phase 4, not a nice-to-have.
+
+### 3.14 `COMPLETE` has never run outside a test
+
+The FSM has no HTTP surface until step 2.4, so the only live exercise of `TaskStateService` is the
+reconciler's `LEASE_EXPIRED` path — verified against the running app. Admission, claiming, escalation
+and completion are covered by tests against Testcontainers and nothing else. Given that every phase
+so far has found bugs live that a green suite missed, that distinction is worth keeping in view.
 
 ### 3.11 Nothing consumes the queue
 
