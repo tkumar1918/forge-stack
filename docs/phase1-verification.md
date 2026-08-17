@@ -119,6 +119,15 @@ Then work `known-gaps.md` §7 in a browser signed in as the account that owns th
 install flow only accepts an installation owned by the same GitHub account you are logged into
 ForgeStack with, and `/api/session` is what tells you which that is.
 
-**One process note, learned the hard way three times today:** stop the app before editing a
-migration. DevTools restarts the running instance, applies whatever version of the file is on disk,
-and a later edit then fails Flyway's checksum validation and refuses to start.
+**One process note, learned the hard way four times in a day** — and now fixed in `scripts/dev.sh`
+rather than left as advice, because advice did not work.
+
+DevTools watches `build/classes`, so *any* `./gradlew test` in another terminal recompiles main
+classes, triggers a restart, and re-runs Flyway against whatever migration files are on disk at that
+instant. Editing a migration to watch a test fail — the standard way to prove a constraint works —
+therefore applies the half-written version to the dev database. The next restart fails checksum
+validation and the app will not start, reporting an `entityManagerFactory` dependency error that
+names nothing to do with migrations.
+
+`dev.sh` now passes `--spring.devtools.restart.enabled=false`. Restart by hand to pick up changes.
+

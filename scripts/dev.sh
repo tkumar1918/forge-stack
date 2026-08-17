@@ -26,4 +26,15 @@ set +a
 # which makes it worse: the flow works in the browser and fails in curl. Overridden here
 # rather than weakened in application.yaml, where it would follow the app to production.
 # See docs/known-gaps.md §1.2.
-exec ./gradlew bootRun --args='--forgestack.security.cookie-secure=false'
+# DevTools restart is off, and that is a deliberate trade.
+#
+# It watches build/classes, so *any* `./gradlew test` in another terminal recompiles main classes and
+# triggers a restart — which re-runs Flyway against whatever migration files happen to be on disk at
+# that instant. Editing a migration to watch a test fail, the normal way to prove a constraint works,
+# therefore applies the half-written version to the dev database. The next restart then fails
+# checksum validation and the app will not start at all, with an error about entityManagerFactory
+# that names nothing to do with migrations.
+#
+# That cost real time four separate times before it was worth a line of script. Restart the app by
+# hand to pick up changes; drop this flag if you want live reload and are not touching db/migration.
+exec ./gradlew bootRun --args='--forgestack.security.cookie-secure=false --spring.devtools.restart.enabled=false'
