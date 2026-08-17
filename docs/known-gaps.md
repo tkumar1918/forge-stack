@@ -618,17 +618,38 @@ exist** — `SessionService.defaultWorkspaceFor` already sorts owned workspaces 
 Lives on Spring Security's `/logout` handler rather than `DELETE /api/session`. Deliberate: moving
 it belongs with the browser client, not with a rename.
 
-### 4.5 Unauthenticated `/api/**` redirects to GitHub instead of refusing
+### 4.5 Unauthenticated `/api/**` redirected to GitHub instead of refusing — **fixed**
 
-A request with no session gets `302` to `/oauth2/authorization/github`. Right for a browser someone
-typed a URL into; wrong for a `fetch`, which follows the redirect to github.com and fails on CORS
-with nothing resembling "you are not signed in".
+A request with no session used to get `302` to `/oauth2/authorization/github`. Right for a browser
+someone typed a URL into; wrong for a `fetch`, which follows the redirect to github.com and fails on
+CORS with nothing resembling "you are not signed in".
 
-**This bites the moment a frontend exists**, which is the next thing likely to be built. The fix is an
-`AuthenticationEntryPoint` that answers `401` for `/api/**` and redirects for everything else — a
-change to the entry point rather than to any controller, which is why it was not made inside 2.4.
-`TaskApiTest.unauthenticatedIsRedirectedToLogin` pins the current behaviour so the day it changes,
-a test says so.
+`SignInRequired` now answers per caller rather than per path: `Sec-Fetch-Mode: navigate` gets the
+redirect, everything else gets `401` with a JSON body carrying the sign-in URL. Deciding by path was
+rejected because `/api/session` is where login lands, so it is a URL people navigate to and bookmark —
+a path rule would have turned an expired session there into a bare 401, which §1.5 records as the
+wrong answer after it was mistaken for a bug once already.
+
+`Accept: text/html` is the fallback for clients that send no `Sec-Fetch-Mode`. `curl` therefore gets
+`401`, which is what it wants: §1.2 is the same confusion from the other direction.
+
+**Not covered:** the `Sec-Fetch-Mode` heuristic is verified against the headers Chrome sends, as
+transcribed by hand into tests and `curl`. No test drives a real browser.
+
+### 4.6 Refusing a request no longer creates a servlet session — **fixed**
+
+Found while reading the headers on the new 401. `ExceptionTranslationFilter` stashes the current
+request before sending anyone to sign in, and stashing it creates a session — so every unauthenticated
+API call was answered with `Set-Cookie: JSESSIONID`, and anything scanning or polling the API while
+signed out accumulated sessions on the server for nothing.
+
+Nothing ever read them back: login lands on a fixed URL, so the saved request is discarded. Replaced
+with `NullRequestCache`, verified against the running app before and after. The OAuth handshake is
+unaffected — its state lives in a different session attribute, written when a login actually starts.
+
+**Revisit if login ever needs to return people where they were.** That is the feature the request
+cache exists for, and turning it back on means giving it a matcher that excludes `/api/**` rather
+than removing this line.
 
 ### 4.4 Private GitHub emails get a placeholder
 

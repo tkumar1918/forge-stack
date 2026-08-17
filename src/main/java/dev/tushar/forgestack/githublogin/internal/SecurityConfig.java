@@ -19,6 +19,7 @@ import org.springframework.security.web.access.intercept.RequestAuthorizationCon
 import org.springframework.security.web.authentication.SimpleUrlAuthenticationSuccessHandler;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.security.web.context.NullSecurityContextRepository;
+import org.springframework.security.web.savedrequest.NullRequestCache;
 
 @Configuration
 class SecurityConfig {
@@ -93,6 +94,21 @@ class SecurityConfig {
                 // owned by HttpSessionOAuth2AuthorizationRequestRepository and untouched by the line
                 // above. Hence IF_REQUIRED rather than STATELESS.
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED))
+                // Without this, an unauthenticated API call is answered with a 302 to github.com.
+                // A browser follows it and signs in; fetch() follows it too, fails on CORS, and
+                // reports something that mentions neither authentication nor this application.
+                // See SignInRequired for why the choice is made per caller rather than per path.
+                .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(new SignInRequired()))
+                // Nothing is saved for later, so nothing needs a session to save it in.
+                //
+                // ExceptionTranslationFilter stashes the current request before sending anyone to
+                // log in, and stashing it creates a servlet session — so every unauthenticated API
+                // call was answered with a Set-Cookie, and anything scanning or polling the API
+                // while signed out accumulated sessions on the server. Nothing ever read them back:
+                // login lands on a fixed URL (loginSuccessRedirect), so the saved request is
+                // discarded. The handshake's own state lives in a different attribute, written when
+                // the login actually starts.
+                .requestCache(cache -> cache.requestCache(new NullRequestCache()))
                 .addFilterBefore(sessionFilter, UsernamePasswordAuthenticationFilter.class)
                 // The session cookie is SameSite=Lax and the API is called from our own origin;
                 // CSRF protection is reinstated with the browser client in a later phase.

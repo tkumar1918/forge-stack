@@ -166,21 +166,19 @@ class TaskApiTest extends AbstractIntegrationTest {
     }
 
     /**
-     * The API needs a session, and says so by redirecting to GitHub.
+     * The API needs a session, and says so in a way a program can read.
      *
-     * <p>Asserted as it behaves rather than as it should. A redirect is the right answer for a
-     * browser typing a URL and the wrong one for a {@code fetch} — which follows it, hits github.com,
-     * and fails on CORS with nothing that resembles "you are not signed in". That is a cross-cutting
-     * change to the entry point rather than a task-API one, so it is recorded as `known-gaps.md`
-     * §4.5 and pinned here so the day it changes, this test says so.
+     * <p>This was a 302 to github.com until the entry point learned to tell a person from a program —
+     * a redirect that {@code fetch} follows, fails on CORS, and reports as something mentioning
+     * neither authentication nor this application. The browser half of that decision is pinned in
+     * {@code ApiAuthenticationTest}.
      */
     @Test
-    @DisplayName("the API needs a session, and currently redirects rather than refusing")
-    void unauthenticatedIsRedirectedToLogin() throws Exception {
+    @DisplayName("the API refuses a request with no session")
+    void unauthenticatedIsRefused() throws Exception {
         mvc.perform(get("/api/tasks"))
-                .andExpect(status().isFound())
-                .andExpect(result -> assertThat(result.getResponse().getRedirectedUrl())
-                        .contains("/oauth2/authorization/github"));
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("unauthenticated"));
     }
 
     // ---------------------------------------------------------------------------------------

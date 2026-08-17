@@ -91,8 +91,10 @@ class LoginSessionIntegrationTest extends AbstractIntegrationTest {
         MvcResult result =
                 mvc.perform(get("/api/session").session(servletSession)).andReturn();
 
-        assertThat(result.getResponse().getStatus()).isEqualTo(302);
-        assertThat(result.getResponse().getRedirectedUrl()).endsWith("/oauth2/authorization/github");
+        // 401 rather than a redirect, because MockMvc sends none of the headers a browser navigating
+        // to a page would. What is being pinned is the refusal; which form it takes for a person in
+        // an address bar is ApiAuthenticationTest's job.
+        assertThat(result.getResponse().getStatus()).isEqualTo(401);
     }
 
     @Test
@@ -115,7 +117,7 @@ class LoginSessionIntegrationTest extends AbstractIntegrationTest {
                         get("/api/session").session(servletSession).cookie(forgeSession))
                 .andReturn();
 
-        assertThat(result.getResponse().getStatus()).isEqualTo(302);
+        assertThat(result.getResponse().getStatus()).isEqualTo(401);
     }
 
     @Test
