@@ -3560,3 +3560,56 @@ Repository concurrency must be keyed on **`github_repo_id`**, never on a `Manage
 semaphore, not a stub. In a 1:1 world the two choices are indistinguishable, which is exactly why
 Phase 2 would otherwise pick the workspace-local one and be silently wrong once installations are
 shared.
+
+
+# Phase 2 — step 2.2: the task/attempt/step schema
+
+**Status: implemented.** `V7__task_model.sql`, `TaskModelSchemaTest` (7 tests). Suite 90 → 97 green.
+
+## Ordering — 2.2 before 2.1, deliberately
+
+The Phase 2 table lists `platform.jobs` (2.1) before the task schema (2.2). That order does not
+work. 2.1's exit criterion is *"`FLUSHALL` on Redis loses no work"*, and the durable copy the
+reconciler rebuilds from is `tasks.lease_owner / lease_epoch / lease_expires_at` — columns defined
+in 2.2. §5 says so directly: "`tasks.lease_expires_at` is the durable copy; reconciler reclaims".
+So the schema comes first, and 2.1 follows against something real rather than a toy job type.
+
+Noted rather than silently reordered, because the numbering is referenced elsewhere.
+
+## What landed
+
+`tasks`, `task_state_transitions`, `task_attempts`, `task_steps` — with RLS forced on all four, the
+scheduler and reconciler indexes from §4.4, and `task_state_transitions` revoked to append-only on
+the same terms as `audit_events`.
+
+**The exit criterion is `one_live_attempt_per_task`**, a partial unique index on
+`task_attempts(task_id) WHERE ended_at IS NULL`. Watched failing first with the index commented
+out: eight concurrent racers all opened an attempt, leaving eight live attempts on one task. That is
+the whole argument for the constraint — each racer read "no live attempt" and each was individually
+correct, and no check before the write closes that window.
+
+Three constraints beyond the plan's sketch, each guarding a shape that would quietly break something
+above it:
+
+- `task_attempts_ended_ck` — `(outcome IS NULL) = (ended_at IS NULL)`. A half-ended row releases the
+  single-writer slot while the attempt is still running.
+- `tasks_terminal_reason_ck` — only terminal states may carry a `terminal_reason`. `ABANDONED` and
+  `FAILED` mean different things operationally and both must say which.
+- `tasks_state_ck` — the twelve FSM states and no others, so `BLOCKED` cannot creep back in and
+  `RESUMED` cannot be mistaken for a state.
+
+## Deferred, with reasons
+
+- **`tool_calls`, `tool_results`, `evidence`, `plans`, `llm_invocations`, `human_interventions`.**
+  All of §4.4, none of it reachable until there is a runtime to write it. Arrives with the phase
+  that first needs it rather than as a speculative empty schema.
+- **Partitioning `task_steps`.** Against the plan's advice to set it up front. There are zero rows
+  and no observed access pattern, and partitioning now means carrying `created_at` through every
+  primary key. The cost the plan warns about is retrofitting onto a *large live* table; the trigger
+  is therefore volume, and V6's create-and-lock-down function is the pattern to reuse.
+
+## Next
+
+2.1 `platform.jobs` — outbox relay, Redis Streams queue, fenced leases, reconciler. Needs
+`spring-modulith-starter-jpa` added: only `-core` is on the classpath today, so the
+`event_publication` registry the plan relies on as the transactional outbox is not present.
