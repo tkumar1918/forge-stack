@@ -319,6 +319,14 @@ missing state straight to `nonces.consume`, got nothing back, and reported `SETU
 ForgeStack's catalog now disagreed with reality and nothing said so — the rejection looked like the
 update had been prevented. Only an unprompted `POST /api/repositories/sync/{id}` reconciled it.
 
+**And it was believed.** The tester reported having abandoned the save part-way through, because the
+error page said the link was invalid. GitHub's API, asked directly afterwards, listed three
+repositories rather than four: the removal had committed before the redirect ever happened. So the
+message did not merely fail to help — it produced a confident, wrong belief about the state of an
+external system, and the only way to settle it was to go and ask GitHub. That is the most expensive
+form §1.10's category takes: a success path borrowing the failure path's output, where the operation
+being reported on is not ours to re-check cheaply.
+
 A missing nonce and a failed nonce are different events and now take different paths. A missing one
 may **refresh a binding the workspace already holds** — which grants no authority it did not already
 have, and is what makes accepting it safe without the nonce. It may never **create** a binding;
