@@ -264,6 +264,47 @@ class RepositoryCatalogTest extends AbstractGithubAppTest {
         assertThat(managedStatusOf(beta)).isEqualTo("ACCESS_LOST");
     }
 
+    /**
+     * GitHub's own "Redirect on update" carries no nonce, and it is not an error.
+     *
+     * <p>Changing repository access from GitHub's settings sends the user to the setup URL with an
+     * {@code installation_id} and no {@code state}. That was being refused as a stale link — with a
+     * message suggesting the user had switched accounts — while the change itself had already taken
+     * effect on GitHub, so ForgeStack's catalog silently disagreed with reality until someone
+     * happened to call sync.
+     */
+    @Test
+    @DisplayName("GitHub's update redirect carries no nonce and still refreshes the catalog")
+    void updateRedirectWithoutANonceRefreshesTheCatalog() {
+        FakeGithub.exposes(installationId, alpha);
+
+        var result = bindings.completeSetup(installationId, null, userId, workspaceId);
+
+        assertThat(result).isInstanceOf(InstallationBindingResult.Bound.class);
+        assertThat(sync.available(workspaceId)).extracting(AvailableRepository::fullName)
+                .containsExactly("octo/alpha");
+    }
+
+    /**
+     * The one thing the nonce still guards.
+     *
+     * <p>Refreshing a binding the workspace already holds grants nothing new, which is what makes
+     * accepting a missing nonce safe. Creating one does grant something, so it still has to start
+     * from {@code /api/installations/start}.
+     */
+    @Test
+    @DisplayName("a callback with no nonce cannot connect an installation for the first time")
+    void updateRedirectCannotCreateANewBinding() {
+        long unconnected = FakeGithub.installation(accountId, "octo", "User");
+        FakeGithub.exposes(unconnected, alpha);
+
+        var result = bindings.completeSetup(unconnected, null, userId, workspaceId);
+
+        assertThat(result)
+                .isEqualTo(new InstallationBindingResult.Rejected(
+                        InstallationBindingResult.Reason.SETUP_NOT_STARTED_HERE));
+    }
+
     @Test
     @DisplayName("a repository id from another workspace cannot be enabled")
     void cannotEnableAnotherWorkspacesRepository() {

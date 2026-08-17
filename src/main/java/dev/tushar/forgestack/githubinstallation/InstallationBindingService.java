@@ -91,14 +91,28 @@ public class InstallationBindingService {
     public InstallationBindingResult completeSetup(
             long installationId, String setupState, UUID userId, UUID workspaceId) {
 
-        Optional<UUID> boundUser = nonces.consume(setupState);
-        if (boundUser.isEmpty()) {
-            // A stale link, overwhelmingly: the nonce expired, or the callback was replayed from
-            // browser history. Distinct from the case below, which is not routine at all.
-            return reject(workspaceId, userId, installationId, Reason.SETUP_STATE_EXPIRED);
-        }
-        if (!boundUser.get().equals(userId)) {
-            return reject(workspaceId, userId, installationId, Reason.SETUP_STATE_FOREIGN);
+        // A missing nonce and a failed nonce are different events. GitHub's "Redirect on update"
+        // sends the user here with an installation_id and no state every time they change
+        // repository access from GitHub's own settings — a routine, legitimate action that was
+        // being refused as a stale link, with a message blaming the user for switching accounts.
+        //
+        // So a missing nonce is allowed to *refresh* a binding this workspace already holds, and
+        // never to create one. That grants no authority the workspace did not already have, which
+        // is what makes it safe to accept without the nonce's protection.
+        boolean mayCreateBinding;
+        if (setupState == null || setupState.isBlank()) {
+            mayCreateBinding = false;
+        } else {
+            Optional<UUID> boundUser = nonces.consume(setupState);
+            if (boundUser.isEmpty()) {
+                // A stale link, overwhelmingly: the nonce expired, or the callback was replayed from
+                // browser history. Distinct from the case below, which is not routine at all.
+                return reject(workspaceId, userId, installationId, Reason.SETUP_STATE_EXPIRED);
+            }
+            if (!boundUser.get().equals(userId)) {
+                return reject(workspaceId, userId, installationId, Reason.SETUP_STATE_FOREIGN);
+            }
+            mayCreateBinding = true;
         }
 
         // GitHub is asked directly rather than trusting the query parameter. Everything below
@@ -120,7 +134,7 @@ public class InstallationBindingService {
             return reject(workspaceId, userId, installationId, Reason.NOT_YOUR_ACCOUNT);
         }
 
-        InstallationBindingResult result = persist(workspaceId, userId, view);
+        InstallationBindingResult result = persist(workspaceId, userId, view, mayCreateBinding);
 
         if (result instanceof Bound) {
             // Order matters. The sync runs first so the new installation adopts every repository it
@@ -153,18 +167,25 @@ public class InstallationBindingService {
     }
 
     private InstallationBindingResult persist(
-            UUID workspaceId, UUID userId, GithubAppClient.InstallationView view) {
+            UUID workspaceId, UUID userId, GithubAppClient.InstallationView view, boolean mayCreateBinding) {
 
         try {
             return tenantScope.runInTenant(workspaceId, () -> {
                 // Re-running setup on an installation this workspace already holds is a refresh,
                 // not an error: GitHub is the authority on what it currently grants, and the user
                 // may have just changed it.
-                GithubInstallation installation = installations
-                        .findByInstallationId(view.id())
-                        .map(existing -> {
-                            existing.refreshFrom(view);
-                            return existing;
+                Optional<GithubInstallation> existing = installations.findByInstallationId(view.id());
+
+                if (existing.isEmpty() && !mayCreateBinding) {
+                    // No nonce, and nothing to refresh. Establishing a new binding is the one thing
+                    // the nonce still guards, so this is where the flow has to restart properly.
+                    return reject(workspaceId, userId, view.id(), Reason.SETUP_NOT_STARTED_HERE);
+                }
+
+                GithubInstallation installation = existing
+                        .map(found -> {
+                            found.refreshFrom(view);
+                            return found;
                         })
                         .orElseGet(() -> installations.save(GithubInstallation.bind(workspaceId, userId, view)));
 

@@ -303,6 +303,37 @@ credentials it issued itself, so an App id GitHub has never heard of cannot aris
 double was politer than the real system. A fake that never returns a body, never returns 404 for the
 right reason, or never disagrees with itself is a fake that certifies code the world will reject.
 
+### 1.12 Changing repository access on GitHub was refused as a stale link — **fixed**
+
+Removing a repository from the installation on GitHub and clicking Save produced:
+
+> This setup link is no longer valid — it expires, it only works once, and it belongs to the account
+> that started the flow. If you switched GitHub accounts, sign in again…
+
+Nothing about that was true. GitHub's **Redirect on update** setting sends the user to the setup URL
+with an `installation_id` and **no `state`** whenever they change repository access, because that
+flow never passed through `/api/installations/start` to be issued a nonce. `completeSetup` fed the
+missing state straight to `nonces.consume`, got nothing back, and reported `SETUP_STATE_EXPIRED`.
+
+**The damage was worse than the message.** The change had already taken effect on GitHub, so
+ForgeStack's catalog now disagreed with reality and nothing said so — the rejection looked like the
+update had been prevented. Only an unprompted `POST /api/repositories/sync/{id}` reconciled it.
+
+A missing nonce and a failed nonce are different events and now take different paths. A missing one
+may **refresh a binding the workspace already holds** — which grants no authority it did not already
+have, and is what makes accepting it safe without the nonce. It may never **create** a binding;
+that still requires starting from `/api/installations/start`, and is refused with the new
+`SETUP_NOT_STARTED_HERE`, whose message explains which of the two situations the caller is in.
+
+Verified live: a no-state callback for the connected installation redirects to the repository list,
+and a no-state callback for an unknown id is still refused.
+
+**Worth noting against §1.9.** The nonce was loosened once already, from session-bound to
+user-bound. This is the second time it has been found refusing something legitimate, and the pattern
+is the same both times: it was written to guard *binding*, and kept being applied to flows that
+were not binding anything. Its remaining job is now exactly one sentence long, which is the right
+size for it.
+
 ---
 
 ## 2. Security debt
@@ -518,21 +549,23 @@ plural if this spreads.
 
 ## 7. Manual verification checklist
 
-Once real credentials exist, this is what has never been exercised end to end:
+**Worked through completely on 2026-08-17.** Every item below has now been run against real
+GitHub. Four of them failed the first time and are recorded in §1.9 through §1.12.
 
-- [ ] Log in with GitHub; a user, workspace and owner membership are created
-- [ ] `GET /api/session` returns a **non-null** `activeWorkspaceId`
-- [ ] Confirm the OAuth consent screen requests **only** `read:user` and `user:email` — no repo access
-- [ ] `GET /api/installations/start` redirects to the right App install page
-- [ ] Complete the install; the callback binds and redirects
-- [ ] `GET /api/repositories` lists the repositories chosen during install, all with `managed: false`
-- [ ] `POST /api/repositories/{id}/manage` flips exactly one to `managed: true`
-- [ ] Change the App's repository selection on GitHub, then `POST /api/repositories/sync/{installationId}` — the list updates
-- [ ] Remove a *managed* repository's access; its status becomes `ACCESS_LOST`
-- [ ] Replay the setup callback URL from browser history — rejected as a spent nonce
-- [ ] Hand-edit `installation_id` in the callback URL to any other number — rejected, and an
-      `INSTALLATION_BIND_REJECTED` row appears in `audit_events`
-- [ ] Verify no GitHub token, and no App private key, appears in application logs
+- [x] Log in with GitHub; a user, workspace and owner membership are created
+- [x] `GET /api/session` returns a **non-null** `activeWorkspaceId`
+- [x] Confirm the OAuth consent screen requests **only** `read:user` and `user:email` — no repo access
+- [x] `GET /api/installations/start` redirects to the right App install page
+- [x] Complete the install; the callback binds and redirects
+- [x] `GET /api/repositories` lists the repositories chosen during install, all with `managed: false`
+- [x] `POST /api/repositories/{id}/manage` flips exactly one to `managed: true`
+- [x] Change the App's repository selection on GitHub, then `POST /api/repositories/sync/{installationId}` — the list updates
+- [x] Remove a *managed* repository's access; its status becomes `ACCESS_LOST`
+- [x] Replay the setup callback URL from browser history — rejected as a spent nonce
+- [x] Hand-edit `installation_id` in the callback URL to any other number — rejected, and an
+      `INSTALLATION_BIND_REJECTED` row appears in `audit_events`. **Ran 2026-08-17 and it failed
+      with a 500** — see §1.11
+- [x] Verify no GitHub token, and no App private key, appears in application logs
 - [x] Restart with a deliberately wrong `FORGESTACK_GITHUB_APP_ID` and replay the callback — expect a
       **500** naming the credentials, not a `403`. This is the §1.1 fix, and the one item here that
       cannot be checked against `FakeGithub`.

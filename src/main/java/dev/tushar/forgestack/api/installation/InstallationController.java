@@ -98,7 +98,7 @@ class InstallationController {
      */
     private static HttpStatus statusFor(InstallationBindingResult.Reason reason) {
         return switch (reason) {
-            case SETUP_STATE_EXPIRED, SETUP_STATE_FOREIGN -> HttpStatus.BAD_REQUEST;
+            case SETUP_STATE_EXPIRED, SETUP_STATE_FOREIGN, SETUP_NOT_STARTED_HERE -> HttpStatus.BAD_REQUEST;
             case UNKNOWN_INSTALLATION, NOT_YOUR_ACCOUNT -> HttpStatus.FORBIDDEN;
             case ORGANIZATION_NOT_SUPPORTED, ALREADY_BOUND_ELSEWHERE -> HttpStatus.CONFLICT;
         };
@@ -131,6 +131,11 @@ class InstallationController {
                 "ForgeStack cannot yet connect organization installations, only personal accounts. "
                         + "Install the App on your own account instead.";
             case ALREADY_BOUND_ELSEWHERE -> "That installation is already connected to another workspace.";
+            case SETUP_NOT_STARTED_HERE ->
+                "GitHub sent you here after changing an installation ForgeStack does not know about "
+                        + "yet. Connecting a new installation has to start from "
+                        + "/api/installations/start — changing the repositories on an already "
+                        + "connected one works from GitHub directly.";
         };
     }
 }

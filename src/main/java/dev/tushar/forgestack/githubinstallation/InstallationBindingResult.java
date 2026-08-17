@@ -60,6 +60,18 @@ public sealed interface InstallationBindingResult {
         ORGANIZATION_NOT_SUPPORTED,
 
         /** Already bound to a different workspace; the database refused a second binding. */
-        ALREADY_BOUND_ELSEWHERE
+        ALREADY_BOUND_ELSEWHERE,
+
+        /**
+         * No nonce at all, for an installation this workspace does not already hold.
+         *
+         * <p>Distinct from {@link #SETUP_STATE_EXPIRED}, which is a nonce that failed. GitHub's own
+         * "Redirect on update" sends the user to the setup URL with an {@code installation_id} and
+         * no {@code state} whenever they change repository access, so a missing nonce is a routine
+         * event rather than evidence of anything — but it cannot be allowed to *create* authority.
+         * Refreshing a binding the workspace already has is fine; establishing a new one still
+         * requires starting from {@code /api/installations/start}.
+         */
+        SETUP_NOT_STARTED_HERE
     }
 }
