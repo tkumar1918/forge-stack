@@ -3924,3 +3924,115 @@ green suite missed.
 2.4 — the task REST API with fake phase handlers simulating success, failure and escalation. That is
 what finally drives this FSM from outside a test, and what makes the `COMPLETE` path reachable by
 something other than a fixture.
+
+# Phase 2 — step 2.4: the task API and a runtime with nothing real in it
+
+**Status: implemented.** `V11__simulated_outcomes.sql`, the `runtime` module, `TaskService`,
+`TaskAttempts`, `TaskController`, 15 tests. Suite 145 → 160 green. Verified live over HTTP. Closes
+`known-gaps.md` §3.9 and §3.14.
+
+## Exit criterion
+
+> *A task runs end to end through the FSM with no model and no sandbox.*
+
+Against the running app, over real HTTP, in about half a second:
+
+```
+POST /api/tasks           → 202, QUEUED
+ADMIT → ENQUEUE → CLAIM → COMPLETE      (COMPLETED, 1 attempt, 5 step rows)
+```
+
+And the two paths that are harder than the happy one:
+
+```
+ESCALATE:  ADMIT ENQUEUE CLAIM ESCALATE_HUMAN → AWAITING_HUMAN
+           POST /answer {"resume":true}
+           RESUME CLAIM COMPLETE                → COMPLETED, 2 attempts
+FAIL:      ADMIT ENQUEUE CLAIM ATTEMPT_FAILED ATTEMPT_FAILED ABANDON → ABANDONED, 3 attempts
+```
+
+Everything in those lines is real except what an attempt concluded: the outbox, the Redis stream,
+the lease and its fence, the transition table, the guards, the attempt and step rows. `TaskWorker` is
+the attempt loop in the shape it will keep; only `FakePhaseHandler` goes away.
+
+Watched failing first by removing the `CLAIM` transition from the worker (six of six lifecycle tests
+fail) and by putting `RESUME` back to `RUNNING` (see below).
+
+## A correction to the plan's FSM
+
+**`AWAITING_HUMAN --RESUME--> RUNNING` deadlocks, and so does
+`AWAITING_EXTERNAL --EXTERNAL_FAILED--> RUNNING`.** Both now land in `QUEUED`.
+
+`RUNNING` means a worker holds a live lease. A person clicking "continue" holds no lease and puts
+nothing on a stream, and neither does a webhook reporting a failed check. A task resumed into
+`RUNNING` is therefore invisible to *both* halves of the reconciler — the `QUEUED` sweep does not
+match it, and the expired-lease sweep does not either, because there is no lease to expire. The task
+would never move again, and nothing would report it as stuck.
+
+Going through `QUEUED` reuses the enqueue that entering that state already performs, so it costs
+nothing. It also turns "`RUNNING` implies a live lease" from a coincidence into a property worth
+asserting.
+
+*The alternative considered:* a third reconciler branch for orphaned `RUNNING` tasks. Rejected as the
+primary fix — it costs a grace period of dead time every time a person clicks continue, and it leaves
+the contradictory state legal, so the invariant could never be checked. Still worth adding later as a
+backstop against bugs, with a warning log rather than silent healing.
+
+## `YIELD`, and graceful drain arriving late
+
+2.1 deferred graceful drain because nothing polled the queue. That stopped being true here, so it was
+built: `TaskWorker` stops claiming on `ContextClosedEvent`, finishes the attempt in hand, and applies
+a new `YIELD` event to hand the task straight back to the queue.
+
+`YIELD` is deliberately not `LEASE_EXPIRED`. One says the holder stopped answering; the other says it
+left on purpose and the work is intact. Collapsing them would make every routine deploy look like a
+worker crash on whatever dashboard is eventually built from this log.
+
+**The drain check sits on `runAvailableWork`, not on the scheduled method** — a placement the test
+caught. With it on the timer, a draining process still took on work through any other entry point,
+which is the exact failure drain exists to prevent arriving through a different door.
+
+## Decisions worth keeping
+
+- **Creation is three transitions, not an insert.** `CREATED → READY → QUEUED`, each a row. Creating
+  a task already admitted would hide the two decisions admission actually is — budget and policy —
+  behind an insert, and they are worth a record even while nothing yet makes them.
+- **Retries happen inside one claim.** `ATTEMPT_FAILED` is a self-loop, so the worker opens the next
+  attempt rather than going back through the queue. A retry is a new approach, not a new lifecycle.
+- **202 on create, never 201.** The resource exists; the thing the caller asked for has not happened.
+- **409 on an illegal transition, not 400.** The request was well formed and would have worked a
+  moment earlier or later. Answering "bad request" sends the caller hunting for a mistake in its own
+  payload. The guard-refusal response names every guard's verdict, because "why not" is the question.
+- **`runtime` depends on `task` and `platform`, and on neither `api` nor `iam`.** It writes no table
+  it does not own — attempts and steps go through `TaskAttempts`. The day it becomes its own service
+  the change should be a build file and a transport.
+- **`FakePhaseHandler` is a concrete class, not an interface.** The seam belongs there the day a
+  second handler exists. One introduced now would be an abstraction with no pressure behind it.
+
+## What the tests found
+
+- **The worker's one-second poll was live in every other test.** `AbstractIntegrationTest` pinned the
+  reconciler's interval but not the runtime's, so the worker would quietly claim and run tasks other
+  test classes had left queued — changing rows those tests were asserting on, from another thread,
+  sometimes. Now pinned to `PT24H` alongside the reconciler.
+- **The asynchronous relay is visible from the outside.** A test that created a task and immediately
+  ran the worker found nothing: the enqueue intent commits with the state change and reaches Redis a
+  moment later. Tests now wait for it, which is the honest shape rather than a workaround.
+
+## Deferred, with reasons
+
+- **`SUSPEND`/`UNSUSPEND`, `BLOCK`/`DEP_RESOLVED`, `TIMEOUT`, `SUBMIT`, `EXTERNAL_FAILED`** are in the
+  table and have no caller. They wait on budgets (§18), the work graph (§12), a scheduler sweep, and
+  pull requests respectively. Declared now because the table is closed and reviewed as a whole.
+- **Priority, admission control and per-repo concurrency.** `tasks.priority` exists; nothing reads it.
+  The scheduler that would is §9's, and building it before there is contention to schedule would be
+  guessing at the shape of the problem.
+- **A real `SIGTERM` test.** The drain flag is driven directly. Nothing in the suite starts and kills
+  the packaged application — the same gap as "no test boots the packaged application".
+
+## Next
+
+Phase 2 is complete. Before Phase 3, two things are worth doing in this order: an
+`AuthenticationEntryPoint` returning `401` for `/api/**` (`known-gaps.md` §4.5 — it blocks any
+frontend), and the Phase 0 decision on whether to adopt an L2 harness, which is what Phase 3 is
+gated on.

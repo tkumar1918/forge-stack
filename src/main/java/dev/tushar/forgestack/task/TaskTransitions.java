@@ -97,6 +97,10 @@ final class TaskTransitions {
                 new Transition(READY, ENQUEUE, QUEUED),
                 new Transition(QUEUED, CLAIM, RUNNING),
                 new Transition(RUNNING, LEASE_EXPIRED, QUEUED),
+                // A worker leaving on purpose hands the work back rather than holding it through a
+                // shutdown. Without this, draining would either abandon the lease — leaving a task
+                // RUNNING with nobody on it — or wait out a TTL of dead time on every deploy.
+                new Transition(RUNNING, YIELD, QUEUED),
 
                 // Retrying is a self-loop, because a new attempt is not a new lifecycle. The worker
                 // still holds the task; only the approach is being thrown away.
@@ -104,7 +108,15 @@ final class TaskTransitions {
 
                 // Waiting on a person.
                 new Transition(RUNNING, ESCALATE_HUMAN, AWAITING_HUMAN),
-                new Transition(AWAITING_HUMAN, RESUME, RUNNING),
+                // Back to QUEUED, not to RUNNING, and this is a correction to the plan's diagram.
+                //
+                // RUNNING means a worker holds a live lease. A person clicking "continue" holds no
+                // lease and puts nothing on the queue, so landing in RUNNING would leave the task
+                // invisible to both halves of the reconciler — the QUEUED sweep would not match it
+                // and neither would the expired-lease sweep, because there is no lease to expire.
+                // The task would simply never move again. Going through QUEUED reuses the enqueue
+                // that entering that state already performs.
+                new Transition(AWAITING_HUMAN, RESUME, QUEUED),
                 // Rejection and silence are different answers and must not land in the same state:
                 // one is a decision to stop, the other is nobody having decided anything.
                 new Transition(AWAITING_HUMAN, REJECT, CANCELLED),
@@ -112,7 +124,8 @@ final class TaskTransitions {
 
                 // Waiting on the world.
                 new Transition(RUNNING, SUBMIT, AWAITING_EXTERNAL),
-                new Transition(AWAITING_EXTERNAL, EXTERNAL_FAILED, RUNNING),
+                // Same reason: a webhook reporting a failed check has no worker attached to it.
+                new Transition(AWAITING_EXTERNAL, EXTERNAL_FAILED, QUEUED),
 
                 // Finishing. Both paths carry the same guards, because "a human accepted it" and
                 // "a pull request merged" are two ways of satisfying one precondition, not two

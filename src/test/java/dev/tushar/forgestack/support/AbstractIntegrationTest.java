@@ -34,7 +34,12 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
             // every workspace in the database, so a sweep landing in the middle of a test would
             // change the very rows that test is asserting on — and only sometimes. Tests that want
             // a sweep call it directly, which is also the only way to assert what one did.
-            "forgestack.jobs.reconcile-interval=PT24H"
+            "forgestack.jobs.reconcile-interval=PT24H",
+            // And the same for the worker, which matters more. Its default is one second, so without
+            // this it would quietly claim and run every task any other test left queued — changing
+            // the rows those tests are asserting on, from another thread, sometimes. Tests that want
+            // work done call runAvailableWork() directly.
+            "forgestack.runtime.poll-interval=PT24H"
         })
 public abstract class AbstractIntegrationTest {
 

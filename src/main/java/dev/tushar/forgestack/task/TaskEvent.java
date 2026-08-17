@@ -27,6 +27,14 @@ public enum TaskEvent {
     ESCALATE_HUMAN,
     /** The person answered, and the answer was to carry on. */
     RESUME,
+    /**
+     * A worker is giving the task back without finishing it — a deploy, a drain, a shutdown.
+     *
+     * <p>Distinct from {@link #LEASE_EXPIRED}, which says the holder stopped answering. This one
+     * says it is leaving on purpose and the work is intact, and keeping them apart is what stops a
+     * dashboard reading a routine deploy as a worker crash.
+     */
+    YIELD,
     /** The person answered, and the answer was no. */
     REJECT,
     /** Nobody answered in time. */

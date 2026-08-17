@@ -518,15 +518,20 @@ application cannot escape. **Revisit when one sweep stops fitting comfortably in
 The replacement is a workspace-agnostic index of outstanding leases — a small table platform may read
 without a tenant — not a wider grant to the application role.
 
-### 3.9 No graceful drain on `SIGTERM`
+### 3.9 No graceful drain on `SIGTERM` — **fixed**
 
-Listed under plan step 2.1 and deliberately not built: nothing polls the queue outside tests yet, so
-a drain flag would have no caller and no way to be exercised. Until it exists, a deploy kills workers
-outright and the reconciler picks the work back up a lease TTL later — correct, but it costs a TTL of
-latency per deploy on every in-flight task.
+Built with the worker loop in 2.4, since the reason for deferring it — nothing polled the queue —
+stopped being true. `TaskWorker` stops claiming on `ContextClosedEvent`, finishes the attempt in
+hand, and applies `YIELD` to hand the task straight back to the queue rather than letting the lease
+lapse. That is the difference between a deploy costing nothing and costing a lease TTL per in-flight
+task.
 
-Belongs with the attempt loop in Phase 3, where `SIGTERM → stop claiming → finish the step →
-checkpoint → release the lease` is a sequence something actually performs.
+The check sits on `runAvailableWork` rather than on the scheduled method, and that placement was a
+bug the test caught: with it on the timer, a draining process still took on work through any other
+entry point.
+
+**Not yet exercised by a real `SIGTERM`.** The test drives the flag directly, and no test starts and
+kills the packaged application — the same gap as §5's "no test boots the packaged application".
 
 ### 3.10 `LeaseReconciler` writes `RUNNING → QUEUED` directly — **fixed**
 
@@ -553,12 +558,23 @@ They pass rather than block because blocking every completion would make the pha
 missing data impossible to build. **Nothing autonomous may be allowed to complete a task until this
 set is empty** — that is the gate on Phase 4, not a nice-to-have.
 
-### 3.14 `COMPLETE` has never run outside a test
+### 3.14 `COMPLETE` has never run outside a test — **fixed**
 
-The FSM has no HTTP surface until step 2.4, so the only live exercise of `TaskStateService` is the
-reconciler's `LEASE_EXPIRED` path — verified against the running app. Admission, claiming, escalation
-and completion are covered by tests against Testcontainers and nothing else. Given that every phase
-so far has found bugs live that a green suite missed, that distinction is worth keeping in view.
+Closed by 2.4. The whole lifecycle now runs live over HTTP: create, admit, queue, claim, attempt,
+complete — and the escalation round trip, and retry-to-abandon. See the plan's step 2.4 section for
+what was actually driven against the running app.
+
+### 3.15 `tasks.simulated_outcome` is scaffolding in the production schema
+
+The fake phase handler needs to be told how an attempt turns out, and that instruction is a column
+on `tasks`. A column rather than a marker parsed out of the task's goal, deliberately — deriving
+behaviour from prose would make prose load-bearing in a system whose entire thesis is that guards
+read committed rows rather than text.
+
+It is still scaffolding sitting in the real schema. **Removal trigger: delete the column,
+`SimulatedOutcome`, and `FakePhaseHandler` together when real phase handlers land in Phase 4.** A
+`NULL` means "behave as though the work succeeded", because a default that made every task hang would
+teach people the system is broken.
 
 ### 3.11 Nothing consumes the queue
 
@@ -601,6 +617,18 @@ exist** — `SessionService.defaultWorkspaceFor` already sorts owned workspaces 
 
 Lives on Spring Security's `/logout` handler rather than `DELETE /api/session`. Deliberate: moving
 it belongs with the browser client, not with a rename.
+
+### 4.5 Unauthenticated `/api/**` redirects to GitHub instead of refusing
+
+A request with no session gets `302` to `/oauth2/authorization/github`. Right for a browser someone
+typed a URL into; wrong for a `fetch`, which follows the redirect to github.com and fails on CORS
+with nothing resembling "you are not signed in".
+
+**This bites the moment a frontend exists**, which is the next thing likely to be built. The fix is an
+`AuthenticationEntryPoint` that answers `401` for `/api/**` and redirects for everything else — a
+change to the entry point rather than to any controller, which is why it was not made inside 2.4.
+`TaskApiTest.unauthenticatedIsRedirectedToLogin` pins the current behaviour so the day it changes,
+a test says so.
 
 ### 4.4 Private GitHub emails get a placeholder
 

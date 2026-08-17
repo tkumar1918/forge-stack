@@ -11,5 +11,5 @@
  */
 @org.springframework.modulith.ApplicationModule(
         displayName = "API",
-        allowedDependencies = {"iam", "githublogin", "githubinstallation"})
+        allowedDependencies = {"iam", "githublogin", "githubinstallation", "task"})
 package dev.tushar.forgestack.api;
