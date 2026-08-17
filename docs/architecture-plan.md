@@ -4036,3 +4036,81 @@ Phase 2 is complete. Before Phase 3, two things are worth doing in this order: a
 `AuthenticationEntryPoint` returning `401` for `/api/**` (`known-gaps.md` §4.5 — it blocks any
 frontend), and the Phase 0 decision on whether to adopt an L2 harness, which is what Phase 3 is
 gated on.
+
+# Phase 0 — status: not run, and what that means now
+
+**There is no harness decision, because the spike that was supposed to produce one never happened.**
+Phase 0 was scheduled to run in parallel with Phase 1. Phase 1 shipped, Phase 2 shipped, and the
+spike did not start. Appendix B is therefore still what it says it is — a hypothesis assembled from
+documentation — and B.8 is explicit that this is not good enough: *"Decide from that data. Everything
+above is a hypothesis formed from documentation, and documentation is written by people selling
+something — including the MIT-licensed ones."*
+
+Recorded here rather than quietly carried forward, because "we chose OpenHands" is one careless
+sentence away from being true in everyone's head without anybody having measured anything.
+
+## What was re-checked on 2026-08-17
+
+Appendix B's three load-bearing external claims, verified at source rather than from memory.
+
+| Claim | Still true? | Detail |
+|---|---|---|
+| Managed Agents cannot offer ZDR | **Yes, and worse** | Anthropic's own docs: not eligible for Zero Data Retention *or* a HIPAA BAA, because sessions persist history and sandbox state server-side. Still beta (`managed-agents-2026-04-01`). Self-hosted sandboxes move tool execution, not session storage — they do not fix it. |
+| OpenHands ships a drivable agent server, MIT | **Yes** | `openhands-agent-server` 1.33.0, released 2026-07-08. REST + WebSocket, Python 3.12+, actively maintained. |
+| Claude Agent SDK is a viable fallback | **Yes** | Self-hosted, subprocess per session, `SessionStore` adapters for S3/Redis/Postgres, documented multi-tenant isolation. Still Anthropic-only, so adopting it still costs §13's provider-agnosticism. |
+
+## Two things the docs say that Appendix B did not record
+
+**OpenHands' agent server stores conversations, events and workspace files on the local filesystem,
+and its own documentation calls it "ideal for development, testing, and lightweight deployments."**
+That is not a description of multi-tenant SaaS. Whether the agent server is the right unit to deploy
+per workspace, or whether we need something around it, is now a question the spike has to answer
+rather than a detail to discover in month six.
+
+**Claude's `SessionStore` mirror writes are best-effort.** When a batch cannot be delivered the SDK
+*drops it*, emits `mirror_error`, and carries on. It also mirrors transcripts only — not `CLAUDE.md`
+or working-directory artifacts.
+
+Those two are the same finding from opposite directions, and it is the sharpest thing to come out of
+this re-check: **both candidate harnesses have a weaker durability model than the one Phase 2 just
+built.** We spent this phase making "losing Redis costs latency, not correctness" true, with a
+transactional outbox, fenced leases, and a reconciler that rebuilds from Postgres. Bolting an inner
+loop underneath it whose own state can be silently dropped puts the weakest link inside the part we
+did not write. That belongs in the spike's crash-resume criterion as the primary question, not a
+sub-clause.
+
+## What Phase 2 already settled
+
+B.8 lists four things to measure and calls one of them "most important": **whether transition
+authority can stay on the Java side.** That is no longer an open question, and the answer did not come
+from a harness evaluation — it came from building the FSM.
+
+- `TaskStateService` is the only writer of `tasks.state`, and the transition table is closed.
+- V10's fence refuses any write to a leased task that does not carry the claim, including from a
+  superuser.
+- `TaskGuard` decides completion from committed rows. Prose cannot satisfy a guard.
+
+A harness reporting "I finished" is an *input*. There is no code path by which it becomes a state.
+The residual risk is ergonomic — a harness whose model fights ours is unpleasant to drive — not
+architectural, and unpleasant is not a reason to build an inner loop ourselves.
+
+**So the spike shrinks to three questions**, all of which still require spending money on real runs:
+
+1. Resolution rate and cost per resolved task, on a repository shaped like a customer's.
+2. Crash-resume correctness, measured against the durability concern above: kill the harness
+   mid-attempt and establish what is actually lost.
+3. Whether §16's credential boundary holds — no GitHub token reachable inside the harness sandbox.
+
+## Recommendation
+
+**Do not pick a harness from documentation, including this document.** Two things follow:
+
+- **Phase 3.1 is not gated and should proceed:** the `ExecutionHarness` port, its in-memory fake, and
+  the conformance suite are ours whichever harness wins, and `FakePhaseHandler` already has the shape
+  the fake needs. Building it first also makes the spike cheaper, because the spike can then be
+  written against the port instead of against two vendor APIs.
+- **Phase 3.2 onward stays gated** until the three questions above have numbers.
+
+The spike needs a real repository with seeded failing tests, model spend on the order of the plan's
+$100–1000 per run, and both an Anthropic key and a provider key for the model-agnostic side. That is
+a resourcing decision, not an engineering one.
