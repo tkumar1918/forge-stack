@@ -29,7 +29,12 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         properties = {
             // The context must start without real credentials.
             "spring.ai.openai.api-key=test-key",
-            "forgestack.role=all"
+            "forgestack.role=all",
+            // Long enough never to fire. The reconciler reclaims leases and re-queues tasks across
+            // every workspace in the database, so a sweep landing in the middle of a test would
+            // change the very rows that test is asserting on — and only sometimes. Tests that want
+            // a sweep call it directly, which is also the only way to assert what one did.
+            "forgestack.jobs.reconcile-interval=PT24H"
         })
 public abstract class AbstractIntegrationTest {
 

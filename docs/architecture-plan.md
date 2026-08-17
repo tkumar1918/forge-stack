@@ -3613,3 +3613,146 @@ above it:
 2.1 `platform.jobs` — outbox relay, Redis Streams queue, fenced leases, reconciler. Needs
 `spring-modulith-starter-jpa` added: only `-core` is on the classpath today, so the
 `event_publication` registry the plan relies on as the transactional outbox is not present.
+
+# Phase 2 — step 2.1: the queue, the outbox, and taking work back
+
+**Status: implemented.** `V8__event_publication.sql`, `V9__reconciler_backoff.sql`, `platform.jobs`
+(7 files), `task` (3 files), 23 tests. Suite 97 → 120 green. Verified live against the running app,
+not only Testcontainers.
+
+## Exit criteria, and what holds them up
+
+> *A trivial job survives `kill -9` and resumes; `FLUSHALL` on Redis loses no work.*
+
+Both are the same claim from two directions — Postgres is the only source of truth and Redis is a
+transport that may vanish at any moment — and both are asserted in `CrashRecoveryTest`.
+
+| Criterion | Test | Watched failing first by |
+|---|---|---|
+| A killed worker's task is reclaimed and requeued | `aKilledWorkerLosesItsTask` | making `reclaimLapsedLeases` return nothing |
+| A stalled worker cannot write after being replaced | `aReusedWorkerNameDoesNotInheritTheClaim` | dropping `AND lease_epoch = ?` from `renew`/`release` |
+| `FLUSHALL` loses no work | `flushingRedisLosesNoWork` | making `findStrandedQueuedTasks` return nothing |
+| A rolled-back transaction queues nothing | `aRolledBackIntentIsNeverRelayed` | swapping `@ApplicationModuleListener` for `@EventListener` |
+| An undelivered job is still owed | `undeliveredWorkOutlivesTheOutage` | the same swap |
+| A flushed consumer group is rebuilt | `aFlushedGroupIsRebuilt` | removing the `NOGROUP` recovery |
+
+**One of those neutralisations passed, and that was the useful one.** Removing the epoch predicate
+from `renew` did not fail the fencing test, because reclaiming also clears `lease_owner` and the
+owner check alone covered for it. The epoch only earns its place when the owner string is *reused* —
+a restarted pod comes back under the same name — so the test was rewritten around that case and the
+neutralisation then failed properly. The original test would have let someone delete fencing and
+keep a green suite.
+
+## Three deviations from the plan, each with a reason
+
+**1. Leases and the reconciler live in `task`, not `platform.jobs`.** The plan puts them in platform
+beside the queue. Fencing is why they moved: a stalled worker is stopped by making its write
+conditional on the epoch *in the row it is writing*. A predicate against a separate lease table is
+not the same guarantee — Postgres re-checks a concurrently updated row against the `WHERE` clause,
+but it does not re-run a subquery against a lease table that moved on meanwhile. So the epoch belongs
+on `tasks`, and whatever owns `tasks` owns the lease. Reconciliation followed for a second reason
+below. `platform.jobs` keeps what is genuinely domain-free: the queue, the outbox relay, the leader
+lock.
+
+The alternative — a `LeaseReclaimer` port in platform implemented by `task` — was written out and
+rejected. It would have been an interface with exactly one production implementation whose only
+justification was the module diagram, which is the abstraction-without-pressure this project bans in
+Appendix A.
+
+**2. No Redis copy of the lease.** §5 lists `forge:lease:task:{id}` alongside the durable columns.
+Dropped: lease operations are one acquire plus a heartbeat every 15s per *running task*, so the
+Redis copy buys no measurable latency and adds a second place for the truth to live. Postgres also
+answers the clock-skew concern §21 raises more directly than Redis TTLs do — expiry is decided by
+the same clock that wrote the expiry, so no two hosts have to agree on the time. This makes "losing
+Redis costs latency, not correctness" straightforwardly true rather than something to be careful
+about.
+
+**3. Reconciliation iterates workspaces.** Row-level security has no all-tenants mode for this
+application by design: `forgestack_app` is not `BYPASSRLS`, so a cross-tenant scan returns zero rows
+however it is written. The sweep therefore takes `IamQueries.activeWorkspaceIds()` and enters each
+scope in turn. That is a real per-sweep cost and the honest price of an isolation guarantee the
+application cannot escape even when its own code is wrong. **Revisit when one sweep stops fitting
+comfortably inside its interval** — the shape that replaces it is a workspace-agnostic index of
+outstanding leases, not a wider grant.
+
+## What the reconciler rescues, and why it is two things
+
+`state = 'RUNNING'` with a lapsed lease is a worker that died. `state = 'QUEUED'` for longer than a
+grace period is what a *lost message* looks like from the database's side — the row still says
+queued and the message it refers to no longer exists anywhere. §5 says "state=QUEUED **or** lease
+expired" for exactly this reason. The grace period exists because there is no way to tell "the
+message was lost" from "no worker has got to it yet" except by waiting, which is also why
+re-queueing has to be harmless and every consumer has to be idempotent.
+
+Reclaiming writes a `task_state_transitions` row in the same transaction as the state change, so the
+schema's claim that every state change has exactly one transition row is true from the first day
+rather than from whenever 2.3 lands. A transition log with holes in it answers nothing, and the holes
+would be precisely the incidents anyone goes looking for.
+
+### The defect the live run found
+
+The first version had no memory of having re-queued anything, so a task nobody had capacity for
+looked lost on *every* sweep. Watching the real app for four minutes with one stranded task on it
+produced **eight copies of the same message** — one per sweep, and it would have continued
+indefinitely. The suite was green throughout: duplicates are safe by design, every test asserted the
+task *was* queued, and nothing asserted how often.
+
+Duplicates being harmless is exactly what made this easy to miss and wrong to leave. Queue depth is
+the number an operator reads to answer "are we behind", and §5's own advice — alert on outbox age,
+not just queue depth — assumes depth still means something.
+
+`V9__reconciler_backoff.sql` adds `tasks.requeued_at` and the reconciler skips anything re-queued
+within a grace period, bounding it to one message per grace period instead of one per sweep. Kept
+separate from `state_entered_at` deliberately: re-queueing is not a state change, and folding it in
+would reset "how long has this been QUEUED" on precisely the tasks worth noticing. `reQueueingBacksOff`
+covers it, watched failing first by removing the predicate.
+
+**This is the fourth phase running in which the live system found something a green suite did not.**
+
+## Details worth keeping
+
+- **`event_publication` is `text`, not `varchar(255)`.** The table's shape belongs to
+  `spring-modulith-events-jpa`, whose entity Hibernate validates against at startup. The DDL was
+  generated from that entity via `jakarta.persistence.schema-generation` rather than transcribed
+  from documentation. Widening the three string columns was then checked empirically: Hibernate's
+  `validate` compares types, not lengths, and accepts `text`. A serialized event is JSON whose size
+  is a property of the event, and a listener id is a class name plus a method signature.
+- **`completion-mode: delete`.** The outbox is a work list, not a history — §19 already separates it
+  from the audit log. Keeping completed rows would grow the table forever to preserve a duplicate of
+  something `task_state_transitions` records better.
+- **`@EnableAsync` is declared, not inherited.** `@ApplicationModuleListener` is meta-annotated
+  `@Async`; without async enabled the annotation still compiles, the event still persists, and the
+  relay runs inline — so the outbox would appear to work while holding every publishing request
+  behind a Redis round trip.
+- **Acknowledging deletes the stream entry.** A consumer group recreated after a flush starts at
+  offset 0, so leaving acknowledged entries in place would replay everything ever sent. Deleting on
+  ack makes that replay cover exactly the work still owed.
+- **The leader lock is an optimisation, and is documented as one.** Everything behind it is already
+  safe to run twice (`FOR UPDATE SKIP LOCKED`, epoch bumping). A leader lock that safety depends on
+  is a bug waiting for a network partition.
+
+## Deferred, with reasons
+
+- **Graceful drain on `SIGTERM`.** Listed in 2.1. There is no worker loop yet — nothing polls the
+  queue outside tests — so a drain flag would have no caller and no way to be exercised. It belongs
+  with the attempt loop in Phase 3, where `SIGTERM → stop claiming → finish the step → checkpoint →
+  release the lease` is a sequence something actually performs.
+- **Priority streams (`forge:q:agent:{p0,p1,p2}`).** One stream per kind today. Routing by priority
+  needs a scheduler making the routing decision; `tasks.priority` is already there for it.
+- **Reclaiming another consumer's pending entries (`XAUTOCLAIM`).** Deliberately not the recovery
+  path: recovery comes from Postgres, and a second one that depended on the pending-entries list
+  would make Redis load-bearing again.
+
+## Verified live
+
+Against the running app and the real Postgres and Redis, not Testcontainers: V8 applied cleanly;
+`event_publication` grants land as `arwd` for `forgestack_app`; the sweep fires on its timer and
+takes `forge:leader:scheduler`; a task inserted as `RUNNING` with a lapsed lease was moved to
+`QUEUED` with `lease_epoch` 7 → 8, its owner cleared, a `LEASE_EXPIRED` transition row written, the
+job placed on `forge:q:task` with the right resource id, and the outbox row completed and removed.
+
+## Next
+
+2.3 `TaskStateService` — the declared transition table and its guards (§10.3). V7 created the states;
+nothing yet enforces which transitions between them are legal, and `LeaseReconciler` currently writes
+`RUNNING → QUEUED` directly. That write moves behind the state service when it exists.

@@ -43,6 +43,19 @@ public class IamQueries {
                         user.getId(), user.getPrimaryEmail(), user.getDisplayName(), user.getAvatarUrl()));
     }
 
+    /**
+     * Every active workspace, for background work that has to sweep all tenants.
+     *
+     * <p>Exists because row-level security has no "all tenants" mode by design: the application role
+     * is not {@code BYPASSRLS}, so a cross-tenant scan returns nothing however it is written. Sweeps
+     * therefore iterate — take this list, and enter each workspace's scope in turn. That is a real
+     * cost per sweep, and the honest trade for an isolation guarantee the application cannot escape
+     * even when it is wrong.
+     */
+    public List<UUID> activeWorkspaceIds() {
+        return workspaces.findActiveIds();
+    }
+
     public List<WorkspaceSummary> workspacesFor(UUID userId) {
         return workspaces.findAllForUser(userId).stream()
                 .map(workspace ->

@@ -46,6 +46,18 @@ spring:
       host: localhost
       port: 6379
 
+  modulith:
+    events:
+      # The outbox is a work list, not a history. A completed publication has been delivered and
+      # the durable record of what it did lives in task_state_transitions and audit_events, so
+      # keeping the row would grow the table forever to preserve a duplicate of something else.
+      # Deleting also keeps the "how far behind is the relay" query scanning only real backlog.
+      completion-mode: delete
+      # The whole reason the outbox exists. A crash between commit and relay leaves an incomplete
+      # row; without this, that row is never looked at again and the work is silently lost — which
+      # is the exact failure the outbox was introduced to remove.
+      republish-outstanding-events-on-restart: true
+
   security:
     oauth2:
       client:

@@ -467,6 +467,57 @@ binding transaction, so the fix is to move it to a job once `platform.jobs` exis
 Documented trade in `InstallationTokenService.evict`. Costs one narrowly-scoped token living out its
 remaining minutes, versus stalling Redis with `KEYS`. Accepted.
 
+### 3.7 Nothing forces a worker's writes to carry its lease epoch
+
+**The gap with the widest blast radius in Phase 2.** Fencing works only if every write a worker makes
+to its task carries `AND lease_epoch = :epoch` in the same statement. `TaskLeases` does this for the
+three operations it owns, and `CrashRecoveryTest` proves a superseded worker cannot renew or release.
+Nothing checks the *next* write somebody adds.
+
+A lease that is consulted rather than made part of the write does not stop the stalled worker it
+exists to stop, and the failure is silent: two workers, both convinced they hold the task, both
+writing. The rule is stated in `TaskLeases`' class javadoc, which is discipline, not enforcement.
+
+Candidate fixes when `TaskStateService` lands in 2.3: route every task write through it and take the
+`Lease` as a parameter, so a caller without a lease cannot express the write at all. That is stronger
+than any ArchUnit rule and should be preferred over one.
+
+### 3.8 The reconciler sweep is O(active workspaces)
+
+Row-level security has no all-tenants mode for `forgestack_app` — deliberately, since it is not
+`BYPASSRLS` — so a cross-tenant scan returns nothing however it is written. `LeaseReconciler.sweep`
+therefore enters each active workspace in turn, every 30 seconds.
+
+Fine at any plausible near-term workspace count and the honest price of an isolation guarantee the
+application cannot escape. **Revisit when one sweep stops fitting comfortably inside its interval.**
+The replacement is a workspace-agnostic index of outstanding leases — a small table platform may read
+without a tenant — not a wider grant to the application role.
+
+### 3.9 No graceful drain on `SIGTERM`
+
+Listed under plan step 2.1 and deliberately not built: nothing polls the queue outside tests yet, so
+a drain flag would have no caller and no way to be exercised. Until it exists, a deploy kills workers
+outright and the reconciler picks the work back up a lease TTL later — correct, but it costs a TTL of
+latency per deploy on every in-flight task.
+
+Belongs with the attempt loop in Phase 3, where `SIGTERM → stop claiming → finish the step →
+checkpoint → release the lease` is a sequence something actually performs.
+
+### 3.10 `LeaseReconciler` writes `RUNNING → QUEUED` directly
+
+It writes the state change and its `task_state_transitions` row itself, because the state machine
+that should own that decision arrives in 2.3. It is the only writer of a task state today, and moves
+behind `TaskStateService` when there is one. Flagged so it is not mistaken for a sanctioned pattern —
+it is the exception that exists because the rule has not been written yet.
+
+### 3.11 Nothing consumes the queue
+
+Expected at this point — the attempt loop is Phase 3 — but worth stating plainly, because the queue
+and the reconciler currently form a closed loop with no exit. A task that reaches `QUEUED` is queued,
+re-queued a grace period later, and re-queued again after each subsequent grace period, forever.
+`V9__reconciler_backoff.sql` bounds that to one message per grace period rather than one per sweep;
+it does not stop it, and cannot, until something claims the work.
+
 ---
 
 ## 4. Product limitations

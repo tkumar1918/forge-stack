@@ -38,7 +38,7 @@ class ModularityTest {
     void moduleNamesAreDeliberate() {
         assertThat(MODULES.stream().map(module -> module.getIdentifier().toString()))
                 .containsExactlyInAnyOrder(
-                        "api", "audit", "githubinstallation", "githublogin", "iam", "platform");
+                        "api", "audit", "githubinstallation", "githublogin", "iam", "platform", "task");
     }
 
     @Test
