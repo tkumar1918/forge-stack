@@ -4512,3 +4512,92 @@ to answer one thing: **resolution rate and cost per resolved task**, against an 
 option 1 above in place.
 
 Do that before writing another line of adapter.
+
+---
+
+# Decision — build the execution runtime, keep the port
+
+**Date: 2026-08-19. This reverses Appendix B.6's "buy the inner loop" and supersedes it.** B.6 is left
+in place rather than edited, because the reasoning that led to it was sound given what was known, and
+a plan that quietly rewrites its own history teaches nobody anything.
+
+## What changed
+
+B.3's case rested on one claim: the inner loop is commodity, hardened over eighteen months, and *"we
+would spend M5–M8 rebuilding it and land somewhere worse."* Three findings retire that.
+
+**1. The loop is about a hundred lines.** [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent/)
+scores **>74% on SWE-bench Verified** — above the 72.8% B.3 credited OpenHands with — from ~100 lines
+of Python, with bash as its only tool and without using the models' tool-calling API at all. It is in
+production at Meta, NVIDIA and IBM. Whatever the resolution rate comes from, it is not the scaffold.
+
+**2. Our own constraints delete most of what we would be buying.** §15 forbids a shell, so not their
+`BashTool` — which 3.2 found is their only unit of granting for command execution. §16 forbids
+credentials in the sandbox, so not their secret registry and not agent-side git. §17 requires risk
+from path globs and change shape, so not their model-self-reported analyser. §18 requires tenancy
+they do not have. §10.3 requires our guards to decide completion. What is left to buy is a model
+call, a tool dispatch loop, and a condenser.
+
+**3. The Java gap closed.** B.2 said "there is no Java option at L2, and there will not be one" — true
+of coding-agent harnesses and irrelevant to what we actually need. Spring AI 2.0.0 **requires** Spring
+Boot 4.0/4.1 and Framework 7, which is what this application already runs, and it is already on the
+runtime classpath. Its user-controlled tool loop — call the model, execute tool calls yourself, feed
+results back — is §9's design exactly. §26's "Spring AI may prove immature on Boot 4.1" is closed by
+the dependency resolving.
+
+## What this does not change
+
+Everything B.6 put in the KEEP column, which was always the product. And the port: `ExecutionHarness`
+stays, with the native runtime as one implementation and `OpenHandsHarness` as the other. **Keeping a
+second adapter is what makes the abstraction honest** — an interface with one implementation is a
+guess about the future, and the conformance suite has already proved its worth by catching things the
+first implementation got wrong.
+
+## The risk this decision exposes rather than creates
+
+mini-swe-agent reaches 74% **with a shell and nothing else**. §15 says `run_command` is "an
+allowlisted set of binaries, not a shell", on the grounds that unrestricted shell makes every other
+sandbox control decorative.
+
+Both cannot be true at once. Either the allowlist costs materially less capability than the evidence
+suggests, or Forge resolves fewer tasks than an unconstrained agent and sells the difference as
+safety. **That trade has never been measured, and it is ours, not a vendor's.** Building the runtime
+does not create this risk — it stops it hiding behind somebody else's product decision.
+
+So the spike changes shape. It was never really OpenHands versus Claude. It is:
+
+> On a fixed set of seeded tasks, on our own runtime, what does resolution rate do when the agent has
+> an allowlisted tool set instead of a shell?
+
+Run it as soon as there is a runtime to run it on. If the gap is small, §15 is vindicated and the
+sandbox controls mean something. If the gap is large, §15 needs amending in the open — a wrapper
+binary on the sandbox PATH, or a shell inside a much stronger isolation boundary — rather than being
+quietly bypassed later by whoever is trying to make a demo work.
+
+## What we take from the research anyway
+
+Reading three harnesses closely was not wasted; it changes the design.
+
+- **Compaction as an event applied at read time.** Keep the whole log; a condensation is a row; the
+  view is computed. §11 and §14 had no answer for context growth beyond truncation.
+- **Deterministic stuck detection** over the last N events — repeated action-observation pairs,
+  repeated action-error runs, agent monologue, context-window loops. §9's escalation triggers were
+  prose; this is the working shape, and it is runtime-owned rather than model-reported.
+- **Max-severity fusion with fail-closed-to-HIGH** when a risk classifier throws. §17 states the
+  asymmetry and says nothing about a guard erroring.
+- **Tool spec separated from executor, resolved by name at runtime.** What makes a tool definition
+  crossable to a sandbox as JSON and bindable to environment-specific state on the far side.
+- **Every step ends in a committed checkpoint, and each is interruptible.** Already our design; worth
+  stating on the handler contract rather than leaving to habit.
+
+And one anti-lesson, from OpenHands V1's own rewrite: it relaxed mandatory sandboxing to **opt-in**,
+partly because MCP assumes local access to credentials and files. That is correct for a developer on
+their own machine and is a trade §16 and §18 cannot make. We take the event sourcing and leave the
+isolation model.
+
+## Build order
+
+`SandboxProvider` first (§16). It is needed under every option, has no model dependency, is the
+security perimeter, and — unlike anything involving a model — can be conformance-tested against real
+containers today. Then the tool catalogue and dispatch pipeline (§15), then `ModelRouter` on Spring
+AI (§13), then the loop and context assembly.

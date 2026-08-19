@@ -53,6 +53,7 @@ class ModularityTest {
                         "iam",
                         "platform",
                         "runtime",
+                        "sandbox",
                         "task");
     }
 
