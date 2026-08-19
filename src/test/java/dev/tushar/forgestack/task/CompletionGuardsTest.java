@@ -166,9 +166,47 @@ class CompletionGuardsTest extends AbstractIntegrationTest {
     }
 
     /**
+     * The guard that makes the product mean anything.
+     *
+     * <p>Every other precondition asks whether the work went well. This one asks whether the work
+     * was made to look like it went well, which is the only question an autonomous maintainer can be
+     * trusted on. Tests green and the failing test deleted is the exact state it exists to refuse.
+     */
+    @Test
+    @DisplayName("a task whose diff guards refused cannot complete, however well it otherwise went")
+    void refusedDiffGuardsBlockCompletion() {
+        this.taskId = rows.newTask(workspaceId, "RUNNING");
+        attempt(1, "SUCCEEDED", "REFUSED");
+
+        assertThatThrownBy(this::complete)
+                .isInstanceOf(GuardsRefusedException.class)
+                .hasMessageContaining("DIFF_GUARDS_PASSED");
+        assertThat(rows.stateOf(workspaceId, taskId)).isEqualTo("RUNNING");
+    }
+
+    /**
+     * Never having been checked is not the same as having passed.
+     *
+     * <p>The guard requires an explicit pass rather than the absence of a refusal, so that skipping
+     * verification is not a route to completion. A guard written the other way around would be
+     * satisfied by an attempt that did nothing at all.
+     */
+    @Test
+    @DisplayName("an attempt that never reached the diff guards cannot complete either")
+    void unrunDiffGuardsBlockCompletion() {
+        this.taskId = rows.newTask(workspaceId, "RUNNING");
+        attempt(1, "SUCCEEDED", null);
+
+        assertThatThrownBy(this::complete)
+                .isInstanceOf(GuardsRefusedException.class)
+                .hasMessageContaining("DIFF_GUARDS_PASSED");
+    }
+
+    /**
      * The pending set, pinned.
      *
-     * <p>Five of §10.3's completion preconditions read data that does not exist yet. Listing them
+     * <p>Four of §10.3's completion preconditions read data that does not exist yet — diff guards
+     * were a fifth until §17's arrived. Listing them
      * here means shrinking the set is a deliberate edit and growing it is a conversation — the same
      * device as {@code ModularityTest.moduleNamesAreDeliberate}, for the same reason: nothing
      * mechanical notices a guard quietly joining the list of things nobody checks.
@@ -183,7 +221,6 @@ class CompletionGuardsTest extends AbstractIntegrationTest {
         assertThat(pending)
                 .containsExactlyInAnyOrder(
                         TaskGuard.VERIFICATION_PASSED,
-                        TaskGuard.DIFF_GUARDS_PASSED,
                         TaskGuard.NO_OPEN_HUMAN_INTERVENTION,
                         TaskGuard.AUTHORITY_SUFFICIENT,
                         TaskGuard.ACCEPTED_BY_HUMAN_OR_MERGED);
@@ -199,15 +236,28 @@ class CompletionGuardsTest extends AbstractIntegrationTest {
     }
 
     private void attempt(int attemptNo, String outcome) {
+        attempt(attemptNo, outcome, "PASSED");
+    }
+
+    /**
+     * @param diffGuardVerdict what §17's guards made of the attempt's diff. Defaulted to
+     *     {@code PASSED} for the fixtures because any attempt that finished verification has one —
+     *     null here means "never checked", which is its own test below.
+     */
+    private void attempt(int attemptNo, String outcome, String diffGuardVerdict) {
         tenantScope.runInTenant(workspaceId, () -> jdbc.update(
                 """
-                INSERT INTO task_attempts (task_id, workspace_id, attempt_no, outcome, ended_at)
-                VALUES (?, ?, ?, ?, CASE WHEN ?::text IS NULL THEN NULL ELSE now() END)
+                INSERT INTO task_attempts
+                    (task_id, workspace_id, attempt_no, outcome, ended_at, diff_guard_verdict, diff_guard_findings)
+                VALUES (?, ?, ?, ?, CASE WHEN ?::text IS NULL THEN NULL ELSE now() END, ?,
+                        CASE WHEN ?::text = 'REFUSED' THEN 'a test was deleted' ELSE NULL END)
                 """,
                 taskId,
                 workspaceId,
                 attemptNo,
                 outcome,
-                outcome));
+                outcome,
+                diffGuardVerdict,
+                diffGuardVerdict));
     }
 }

@@ -22,5 +22,5 @@
  */
 @org.springframework.modulith.ApplicationModule(
         displayName = "Runtime",
-        allowedDependencies = {"harness", "task", "platform", "platform::jobs", "platform::tenancy"})
+        allowedDependencies = {"diffguard", "harness", "task", "platform", "platform::jobs", "platform::tenancy"})
 package dev.tushar.forgestack.runtime;

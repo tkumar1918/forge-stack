@@ -97,6 +97,24 @@ public class TaskAttempts {
     }
 
     /**
+     * Records what the diff guards made of this attempt's work (§17).
+     *
+     * <p>Written before the attempt ends, so that a completion decided a moment later reads a verdict
+     * that is already committed rather than one still in flight. The guards read committed rows only,
+     * and this is one of the rows they read.
+     *
+     * @param findings a summary for whoever looks next, required when the verdict refused, and
+     *     never containing the value of anything it caught
+     */
+    public void recordDiffGuardVerdict(Lease lease, UUID attemptId, String verdict, String findings) {
+        leaseScope.runUnderLease(lease, () -> jdbc.update(
+                "UPDATE task_attempts SET diff_guard_verdict = ?, diff_guard_findings = ? WHERE id = ?",
+                verdict,
+                findings,
+                attemptId));
+    }
+
+    /**
      * Ends the attempt, freeing the task for the next one.
      *
      * <p>Outcome and end time go in together because the schema requires it: a half-ended row would

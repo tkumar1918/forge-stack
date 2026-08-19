@@ -269,6 +269,35 @@ abstract class ExecutionHarnessContract {
         harness().close(session);
     }
 
+    /**
+     * The diff has to be a diff.
+     *
+     * <p>Weaker than it looks until you have watched it fail. The happy-path test only asked that
+     * the changed file's name appear somewhere in the string, and a harness whose newlines were
+     * literal {@code %n} satisfied that completely — every added and removed line concatenated onto
+     * the hunk header, nothing parseable, and §17's guards finding no violations because they were
+     * reading a file with no changes in it. A check that passes because there is nothing to read is
+     * the most convincing kind of check that does nothing.
+     */
+    @Test
+    @DisplayName("hands back a diff something can actually parse")
+    void theDiffIsWellFormed() {
+        HarnessSession session = harness().open(spec());
+        harness().run(session, new Instruction("EDIT:src/Main.java", 10), event -> {});
+
+        List<String> lines = List.of(harness().captureDiff(session).split("\n"));
+
+        assertThat(lines).anyMatch(line -> line.startsWith("diff --git "));
+        assertThat(lines)
+                .as("added lines have to be on their own line to be read as added")
+                .anyMatch(line -> line.startsWith("+") && !line.startsWith("+++"));
+        assertThat(lines).anyMatch(line -> line.startsWith("-") && !line.startsWith("---"));
+        assertThat(lines)
+                .as("a hunk header carries no payload of its own")
+                .noneMatch(line -> line.startsWith("@@") && line.length() > 40);
+        harness().close(session);
+    }
+
     @Test
     @DisplayName("a sandbox that changed nothing produces an empty diff, not a fabricated one")
     void nothingChangedMeansNoDiff() {

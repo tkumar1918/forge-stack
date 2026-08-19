@@ -118,13 +118,15 @@ class TaskLifecycleTest extends AbstractIntegrationTest {
                         TaskState.READY, TaskState.QUEUED, TaskState.RUNNING, TaskState.COMPLETED);
 
         assertThat(steps(created.id()))
-                .as("provisioned, one tool call, verified, submitted — the work reported, not a script")
-                // Four and not five, and the difference is the point. Steps used to come from a
-                // hardcoded list of phases, so the log said the same thing however the attempt had
-                // actually gone. They now come from the harness's own event stream — one row per
-                // completed tool call — plus the phases ForgeStack runs itself. An agent that used
-                // three tools writes three rows here.
-                .isEqualTo(4);
+                .as("provisioned, one tool call, diff-guarded, verified, submitted")
+                // Steps used to come from a hardcoded list of phases, so the log said the same thing
+                // however the attempt had actually gone. They now come from the harness's own event
+                // stream — one row per completed tool call — plus the phases ForgeStack runs itself.
+                // An agent that used three tools writes three rows here.
+                //
+                // Two of the five are VERIFYING, and they are two different questions: did the agent
+                // cheat, and did the work pass. Collapsing them would lose which one refused.
+                .isEqualTo(5);
     }
 
     /**
@@ -223,6 +225,42 @@ class TaskLifecycleTest extends AbstractIntegrationTest {
 
         assertThat(second.id()).isEqualTo(first.id());
         assertThat(tasks.list(workspaceId)).hasSize(1);
+    }
+
+    /**
+     * The one the product is for.
+     *
+     * <p>Everything else in this class checks that work which went well is recorded as having gone
+     * well. This checks the opposite: an attempt whose tests are genuinely green, whose verification
+     * genuinely passes, and which must still not be allowed to call itself done — because it got
+     * there by switching a test off.
+     *
+     * <p>{@code AWAITING_HUMAN} and not {@code FAILED}, per §17. A retry would produce the same
+     * reasonable-looking edit again; what is needed is a person, and the reason they need to look is
+     * recorded on the attempt rather than left to be re-derived from the diff.
+     */
+    @Test
+    @DisplayName("a task that makes the tests pass by disabling one is stopped and escalated")
+    void cheatingIsRefusedAndEscalated() {
+        TaskView created = create("Fix the flaky test", SimulatedOutcome.CHEAT);
+
+        workUntilItLeavesTheQueue(created.id());
+
+        TaskView.Detail detail = detail(created.id());
+        assertThat(detail.task().state())
+                .as("a person has to look; retrying would just do it again")
+                .isEqualTo(TaskState.AWAITING_HUMAN);
+        assertThat(detail.attempts()).singleElement().satisfies(attempt -> {
+            assertThat(attempt.outcome()).isEqualTo("ESCALATED");
+            // The summary names the guard, so the person opening this sees what was done rather than
+            // that something was.
+            assertThat(attempt.failureSummary()).contains("TEST_DISABLED");
+        });
+
+        assertThat(diffGuardVerdict(created.id()))
+                .as("the refusal is on the attempt row, not only in a log line")
+                .isEqualTo("REFUSED");
+        assertThat(diffGuardFindings(created.id())).contains("TEST_DISABLED");
     }
 
     /**
@@ -339,6 +377,20 @@ class TaskLifecycleTest extends AbstractIntegrationTest {
             delivered = queue.poll(LeaseReconciler.JOB_KIND, "lifecycle-drain", 100, Duration.ZERO);
             delivered.forEach(queue::acknowledge);
         } while (!delivered.isEmpty());
+    }
+
+    private String diffGuardVerdict(UUID taskId) {
+        return tenantScope.runInTenant(
+                workspaceId,
+                () -> jdbc.queryForObject(
+                        "SELECT diff_guard_verdict FROM task_attempts WHERE task_id = ?", String.class, taskId));
+    }
+
+    private String diffGuardFindings(UUID taskId) {
+        return tenantScope.runInTenant(
+                workspaceId,
+                () -> jdbc.queryForObject(
+                        "SELECT diff_guard_findings FROM task_attempts WHERE task_id = ?", String.class, taskId));
     }
 
     private int steps(UUID taskId) {

@@ -112,6 +112,9 @@ public class TaskStateService {
                                (SELECT a.outcome FROM task_attempts a
                                  WHERE a.task_id = t.id AND a.ended_at IS NOT NULL
                                  ORDER BY a.attempt_no DESC LIMIT 1) AS latest_outcome,
+                               (SELECT a.diff_guard_verdict FROM task_attempts a
+                                 WHERE a.task_id = t.id AND a.ended_at IS NOT NULL
+                                 ORDER BY a.attempt_no DESC LIMIT 1) AS latest_diff_guard_verdict,
                                EXISTS (SELECT 1 FROM task_attempts a
                                         WHERE a.task_id = t.id AND a.ended_at IS NULL) AS attempt_in_flight
                           FROM tasks t
@@ -128,6 +131,7 @@ public class TaskStateService {
                                 (Long) rs.getObject("budget_tokens"),
                                 rs.getLong("consumed_tokens"),
                                 rs.getString("latest_outcome"),
+                                rs.getString("latest_diff_guard_verdict"),
                                 rs.getBoolean("attempt_in_flight")),
                         taskId)
                 .stream()

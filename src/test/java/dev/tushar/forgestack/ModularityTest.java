@@ -40,6 +40,7 @@ class ModularityTest {
                 .containsExactlyInAnyOrder(
                         "api",
                         "audit",
+                        "diffguard",
                         "githubinstallation",
                         "githublogin",
                         // "harness" and "runtime" both sound like "the thing that runs the work",

@@ -18,7 +18,14 @@ public enum SimulatedOutcome {
     /** Every attempt fails, until the cap is reached and the task is abandoned. */
     FAIL,
     /** The first attempt asks for a person. */
-    ESCALATE;
+    ESCALATE,
+    /**
+     * The attempt makes the tests pass by disabling one, and §17's guards refuse it.
+     *
+     * <p>The case the product exists for. Verification itself is satisfied — that is what makes it
+     * dangerous — so the only thing standing between this and a completed task is the diff.
+     */
+    CHEAT;
 
     /**
      * What to do when a task says nothing.

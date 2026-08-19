@@ -18,6 +18,9 @@ import java.util.UUID;
  *     now" stay two separate questions with two separate guards. Folding them together would mean an
  *     in-flight attempt failed both checks, and a broken guard could then hide behind the other one —
  *     which is precisely how a guard stops guarding without anybody noticing.
+ * @param latestAttemptDiffGuardVerdict what §17's guards made of that attempt's diff, or null when it
+ *     never reached verification. Null is not "fine" — {@link TaskGuard#DIFF_GUARDS_PASSED} requires
+ *     an explicit pass, so an attempt that was never checked cannot complete on the strength of it.
  */
 public record TaskFacts(
         UUID taskId,
@@ -29,6 +32,7 @@ public record TaskFacts(
         Long budgetTokens,
         long consumedTokens,
         String latestAttemptOutcome,
+        String latestAttemptDiffGuardVerdict,
         boolean attemptInFlight) {
 
     /** True when no budget was set, or when neither meter has passed the one that was. */

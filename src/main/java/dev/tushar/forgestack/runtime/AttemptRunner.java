@@ -1,5 +1,7 @@
 package dev.tushar.forgestack.runtime;
 
+import dev.tushar.forgestack.diffguard.DiffGuards;
+import dev.tushar.forgestack.diffguard.DiffVerdict;
 import dev.tushar.forgestack.harness.AttemptSpec;
 import dev.tushar.forgestack.harness.EgressPolicy;
 import dev.tushar.forgestack.harness.ExecutionHarness;
@@ -40,14 +42,17 @@ class AttemptRunner {
 
     private final ExecutionHarness harness;
     private final TaskAttempts attempts;
+    private final DiffGuards diffGuards;
     private final String sandboxImage;
 
     AttemptRunner(
             ExecutionHarness harness,
             TaskAttempts attempts,
+            DiffGuards diffGuards,
             @Value("${forgestack.runtime.sandbox-image:forgestack/java-21:latest}") String sandboxImage) {
         this.harness = harness;
         this.attempts = attempts;
+        this.diffGuards = diffGuards;
         this.sandboxImage = sandboxImage;
     }
 
@@ -63,7 +68,7 @@ class AttemptRunner {
             HarnessStop stop = harness.run(session, instructionFor(simulation), steps::observe);
 
             return switch (stop.reason()) {
-                case INSTRUCTION_FINISHED -> verify(lease, attemptId, steps, simulation, attemptNo);
+                case INSTRUCTION_FINISHED -> verify(lease, attemptId, session, steps, simulation, attemptNo);
                 case AWAITING_HUMAN -> {
                     attempts.enterPhase(lease, attemptId, "ESCALATING");
                     steps.record("ESCALATING", "SYSTEM", "SUCCEEDED");
@@ -104,18 +109,48 @@ class AttemptRunner {
     /**
      * Whether the work is any good — asked here, and never of the harness.
      *
+     * <p>Two separate questions, in this order: did the agent cheat, and did the work pass. The
+     * first is answered from the diff by §17's guards, which is why a refusal here escalates rather
+     * than retries — an agent that deleted a test will delete it again.
+     *
      * <p>Simulated in Phase 2, and the simulation is deliberately on <em>this</em> side of the
      * boundary. It would have been less code to let the fake harness report a failure directly, and
      * that is exactly the shortcut that makes a verdict the agent's to give. {@link
      * dev.tushar.forgestack.harness.StopReason} has no value for it, so the shortcut does not exist.
      */
     private AttemptOutcome verify(
-            Lease lease, UUID attemptId, StepLog steps, SimulatedOutcome simulation, int attemptNo) {
+            Lease lease,
+            UUID attemptId,
+            HarnessSession session,
+            StepLog steps,
+            SimulatedOutcome simulation,
+            int attemptNo) {
 
         attempts.enterPhase(lease, attemptId, "VERIFYING");
+
+        // Before anything else, and before any question of whether the tests pass: what did the
+        // agent actually change? §17's order matters — a suite that went green by losing a test is
+        // not a suite that went green, so the diff is judged before the result is believed.
+        DiffVerdict diff = diffGuards.check(harness.captureDiff(session));
+        attempts.recordDiffGuardVerdict(
+                lease, attemptId, diff.passed() ? "PASSED" : "REFUSED", diff.passed() ? null : diff.summary());
+        steps.record("VERIFYING", "SYSTEM", diff.passed() ? "SUCCEEDED" : "FAILED");
+
+        if (!diff.passed()) {
+            // Escalated, not failed. A retry would produce the same reasonable-looking edit again,
+            // and the thing that has gone wrong needs a person to look at it rather than a budget
+            // spent re-discovering it (§17).
+            log.warn("diff guards refused attempt {}: {}", attemptId, diff.summary());
+            attempts.enterPhase(lease, attemptId, "ESCALATING");
+            steps.record("ESCALATING", "SYSTEM", "SUCCEEDED");
+            return new AttemptOutcome("ESCALATED", "POLICY_VIOLATION", diff.summary());
+        }
+
         boolean passed =
                 switch (simulation) {
-                    case SUCCEED, ESCALATE -> true;
+                    // CHEAT passes here on purpose. Its tests really are green; the diff is the only
+                    // thing that knows why, which is precisely the situation §17 was written for.
+                    case SUCCEED, ESCALATE, CHEAT -> true;
                     case FAIL -> false;
                     case FAIL_ONCE -> attemptNo > 1;
                 };
@@ -145,9 +180,11 @@ class AttemptRunner {
 
     /** What the agent is asked to do. Reads as a directive because Phase 2's harness is simulated. */
     private Instruction instructionFor(SimulatedOutcome simulation) {
-        return simulation == SimulatedOutcome.ESCALATE
-                ? new Instruction("ASK:the simulated attempt asked for a person", 50)
-                : new Instruction("EDIT:src/main/java/Simulated.java", 50);
+        return switch (simulation) {
+            case ESCALATE -> new Instruction("ASK:the simulated attempt asked for a person", 50);
+            case CHEAT -> new Instruction("CHEAT:src/test/java/SimulatedTest.java", 50);
+            default -> new Instruction("EDIT:src/main/java/Simulated.java", 50);
+        };
     }
 
     /**

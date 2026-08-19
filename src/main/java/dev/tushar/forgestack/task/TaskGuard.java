@@ -16,9 +16,9 @@ import java.util.function.Predicate;
  *
  * <h2>Guards that cannot be enforced yet</h2>
  *
- * <p>Five of §10.3's completion preconditions read data that does not exist: there is no
- * {@code evidence} table, no {@code human_interventions}, no diff guards, no policy engine, and no
- * record of a merge or an acceptance. They are listed here anyway, marked {@link Enforcement#PENDING},
+ * <p>Four of §10.3's completion preconditions read data that does not exist: there is no
+ * {@code evidence} table, no {@code human_interventions}, no policy engine, and no record of a merge
+ * or an acceptance. Diff guards used to be a fifth and are now enforced. They are listed here anyway, marked {@link Enforcement#PENDING},
  * for one reason: a guard list that quietly contained three checks and looked like eight would be
  * believed. Instead every transition writes into {@code task_state_transitions.guard_results} exactly
  * which guards ran and which did not, so a task completed today carries a permanent record that it
@@ -58,8 +58,14 @@ public enum TaskGuard {
     /** Needs {@code evidence}: the verification contract ran and passed on the final head SHA. */
     VERIFICATION_PASSED(Enforcement.PENDING, "needs the evidence table and a verification contract runner"),
 
-    /** Needs the verification module: no test deleted, disabled, or weakened to make the diff pass. */
-    DIFF_GUARDS_PASSED(Enforcement.PENDING, "needs diff guards, which arrive with verification"),
+    /**
+     * No test was deleted, disabled, or weakened to make the diff pass (§17).
+     *
+     * <p>Requires an explicit pass, not merely the absence of a refusal. An attempt that never
+     * reached verification has no verdict, and "was never checked" must not be a way to complete —
+     * that is precisely the shape of the thing this guard exists to catch.
+     */
+    DIFF_GUARDS_PASSED(facts -> "PASSED".equals(facts.latestAttemptDiffGuardVerdict())),
 
     /** Needs {@code human_interventions}: nothing is still waiting on a person. */
     NO_OPEN_HUMAN_INTERVENTION(Enforcement.PENDING, "needs the human_interventions table"),

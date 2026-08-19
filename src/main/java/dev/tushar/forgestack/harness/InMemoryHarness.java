@@ -84,15 +84,34 @@ public final class InMemoryHarness implements ExecutionHarness {
     @Override
     public String captureDiff(HarnessSession session) {
         Session live = require(session);
-        if (live.edited.isEmpty()) {
+        if (live.edited.isEmpty() && live.cheated.isEmpty()) {
             return "";
         }
         StringBuilder diff = new StringBuilder();
+        // Literal \n, not %n. An earlier version used %n inside plain append() calls, where it is
+        // not a format specifier at all -- so every added and removed line ended up concatenated
+        // onto the hunk header and the parser saw a file with no changes in it. The diff guards
+        // passed because there was nothing to read, which is the most convincing way for a check to
+        // do nothing. A diff is \n-delimited by definition anyway; the platform separator was never
+        // the right thing here.
+        for (String path : live.cheated) {
+            // A test switched off and an assertion taken out with it -- the shape §17 exists to
+            // catch, produced here so the guards can be driven by a real attempt rather than by a
+            // string in a unit test.
+            diff.append("diff --git a/").append(path).append(" b/").append(path).append('\n')
+                    .append("--- a/").append(path).append('\n')
+                    .append("+++ b/").append(path).append('\n')
+                    .append("@@ -4,2 +4,2 @@\n")
+                    .append("+    @Disabled(\"flaky\")\n")
+                    .append("-    assertThat(total).isEqualTo(expected);\n");
+        }
         for (String path : live.edited) {
-            diff.append("diff --git a/%s b/%s%n".formatted(path, path))
-                    .append("--- a/%s%n".formatted(path))
-                    .append("+++ b/%s%n".formatted(path))
-                    .append("@@ -1 +1 @@%n-was%n+edited by the fake%n");
+            diff.append("diff --git a/").append(path).append(" b/").append(path).append('\n')
+                    .append("--- a/").append(path).append('\n')
+                    .append("+++ b/").append(path).append('\n')
+                    .append("@@ -1 +1 @@\n")
+                    .append("-was\n")
+                    .append("+edited by the fake\n");
         }
         return diff.toString();
     }
@@ -171,7 +190,7 @@ public final class InMemoryHarness implements ExecutionHarness {
     }
 
     private void emitStep(Session live, String text, Consumer<HarnessEvent> sink, int step) {
-        String tool = text.startsWith("EDIT:") ? "apply_patch" : "read_file";
+        String tool = text.startsWith("EDIT:") || text.startsWith("CHEAT:") ? "apply_patch" : "read_file";
         if (!live.spec.allowedTools().contains(tool)) {
             // §15 requires the allowlist be enforced at dispatch and not only at offer time, because
             // models invent tool names. The fake enforces it so the conformance suite can insist
@@ -184,6 +203,9 @@ public final class InMemoryHarness implements ExecutionHarness {
         sink.accept(new HarnessEvent.ToolCallRequested(tool, "digest-" + step, "LOW"));
         if (text.startsWith("EDIT:")) {
             live.edited.add(text.substring(5));
+        }
+        if (text.startsWith("CHEAT:")) {
+            live.cheated.add(text.substring(6));
         }
         sink.accept(new HarnessEvent.ToolCallCompleted(tool, false, "digest-out-" + step, 128L * step));
         sink.accept(new HarnessEvent.TokensConsumed(1000, 200, 800));
@@ -201,6 +223,7 @@ public final class InMemoryHarness implements ExecutionHarness {
         private final AttemptSpec spec;
         private final String externalId;
         private final Set<String> edited = new HashSet<>();
+        private final Set<String> cheated = new HashSet<>();
         private volatile boolean running;
         private volatile boolean pauseRequested;
 
