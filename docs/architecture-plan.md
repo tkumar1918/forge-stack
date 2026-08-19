@@ -4406,3 +4406,109 @@ still must:
 3. **The upgrade treadmill's actual cost.** Pin v1.42.1, then re-run the conformance suite against
    whatever ships eight weeks later. Nine minor versions in five weeks is the risk; measure it rather
    than fearing it.
+
+---
+
+# Phase 3.2 — what happened when the adapter met the actual server
+
+**Date: 2026-08-19.** 3.1 built the port from a reading of OpenHands' source. 3.2 tried to build the
+adapter and run it. The adapter exists; **the exit criterion — "conformance suite green against the
+real adapter" — is not met**, and the reasons are worth more than the adapter is.
+
+## 1. There is no current agent-server image you can pull on x86_64
+
+`ghcr.io/all-hands-ai/agent-server:latest` has no `linux/amd64` entry in its manifest list — arm64
+only. Walking the tag list, the amd64 build that does exist (`489858f-java`,
+`sha256:ff03d88a2379…`, 626 MB) reports **`openhands_sdk 1.0.0`** from its own dist-info. Twelve
+recent commit SHAs from `main` are not published as tags at all.
+
+So on an x86_64 host, running current OpenHands means **building the image yourself from source**.
+That is a standing operational cost — a Python toolchain, a multi-stage build, and an image to host —
+that Appendix B costed at zero. B.7 item 3 said the Python surface was "bounded by running it only as
+a containerised service"; that bound assumed somebody else builds the container.
+
+## 2. What the pullable build actually exposes
+
+Its own `/openapi.json`, which is authoritative in a way source reading is not — fifteen paths:
+
+```
+GET  /alive · /health · /server_info · /tools/list
+GET,POST     /api/conversations/
+GET,DELETE   /api/conversations/{id}
+GET,POST     /api/conversations/{id}/events/
+GET          /api/conversations/{id}/events/search · /count · /{event_id}
+POST         /api/conversations/{id}/events/respond_to_confirmation
+POST         /api/conversations/{id}/pause · /resume
+```
+
+**No `/api/git/*` at all.** Our `captureDiff` — the single way work leaves a sandbox under §16's
+host-brokered rule — has no endpoint on the only image we can run. There is also no `/run`, no
+`/security-analyzer`, and no `/confirmation-policy`, so the per-conversation ensemble analyser that
+the corrected Appendix B relied on to satisfy §17's asymmetry cannot be installed on this build
+either.
+
+## 3. Even at v1.42.1 there is no "give me the patch" endpoint
+
+`GET /git/diff` takes a **file** path and returns `{original, modified}` — whole contents, before and
+after. `GET /git/changes` lists changed files. Assembling a patch is the client's job.
+
+So the adapter carries a diff implementation (`UnifiedDiffs`). Not difficult, but note *why* it can't
+be the obvious three-line version: marking every line removed and every line added is a valid unified
+diff, and it makes §17's `TEST_DISABLED` fire on an `@Disabled` that was already in the file, so every
+attempt touching that file escalates for something it did not do. A guard that cries wolf gets turned
+off. The diff has to be real.
+
+## 4. `run` is fire-and-forget
+
+`POST /{id}/run` returns `Success` immediately — "start running the conversation in the background."
+Our port's `run` is blocking and returns a `HarnessStop`, so the adapter posts the instruction, then
+polls `GET /api/conversations/{id}` for `execution_status` while draining `events/search` by cursor.
+Workable, and it means every attempt carries a polling loop and a poll interval to tune.
+
+## 5. The one that is not a version problem: tool granularity
+
+Their unit of granting is a **tool class**, not a tool. The request takes
+`[{"name": "BashTool", ...}, {"name": "FileEditorTool", ...}]`.
+
+§15 says the allowlist is computed per attempt *and per phase* — `ANALYZING` gets read-only tools,
+`WRITE_GITHUB` exists only in `SUBMITTING` — and it says `run_command` is "an allowlisted set of
+binaries, not a shell", because "unrestricted shell also makes the sandbox's other controls largely
+decorative."
+
+**`BashTool` is a shell.** Asking for anything that runs a command grants arbitrary command
+execution, and there is no way to ask for less. Phase gating cannot be expressed at all: you get the
+toolset for the whole conversation.
+
+This is not fixable in an adapter, and no newer image helps. Three ways out, in order of preference:
+
+1. **Never grant `BashTool`.** Give the agent file tools only, and run the verification contract
+   ourselves through `SandboxProvider` — which §9 already wanted, since `VERIFYING` has no model in
+   the decision path. The agent edits; ForgeStack runs the tests. This keeps §15 intact and is the
+   option that fits the existing design best.
+2. **Put the allowlist on the sandbox's PATH** — a wrapper binary that refuses anything not in the
+   verification contract. Defence we control, inside a tool we do not.
+3. **Amend §15** to say that a bought harness with a shell tool cannot honour the binary allowlist,
+   and record what is lost. Honest, and the weakest.
+
+Option 1 is recommended and is close to free, because it removes work rather than adding it.
+
+## 6. Confirmed at the source of truth: the model key goes in the sandbox
+
+The create-conversation schema carries `agent.llm.api_key` — and, next to it, `base_url`. That is §16's
+newly-recorded gap confirmed by the API itself, and its mitigation sitting in the same object. Point
+`base_url` at the ForgeStack egress proxy and pass a per-attempt token worth nothing anywhere else.
+
+## What this changes
+
+Nothing about B.6's recommendation yet — but it moves the cost. The inner loop is still not worth
+building; it is just more expensive to *buy* than the appendix assumed: build and host the image
+ourselves, carry a patch assembler, carry a polling loop, and resolve the tool-granularity conflict
+before any of it is safe.
+
+**The spike Appendix B asked for is now much cheaper and much better specified.** It no longer needs
+to answer "can we keep transition authority" (yes, structurally — two databases, one ours) or "does
+the credential boundary hold" (yes, if we register no secrets and never grant `BashTool`). It needs
+to answer one thing: **resolution rate and cost per resolved task**, against an image we build, with
+option 1 above in place.
+
+Do that before writing another line of adapter.
