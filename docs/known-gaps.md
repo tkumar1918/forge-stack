@@ -541,16 +541,22 @@ between releasing a lapsed claim and moving the task back to `QUEUED`, a worker 
 task, and the transition would then be applied to something somebody is already running — which V10's
 fence refuses, taking the sweep down with it.
 
-### 3.13 Five of the eight completion guards decide nothing
+### 3.13 Four of the eight completion guards decide nothing
 
-`COMPLETE` declares §10.3's full precondition list, and five of those guards read data that does not
-exist: no `evidence` table, no `human_interventions`, no diff guards, no policy engine, no record of
-a merge or an acceptance. They are marked `PENDING` and pass.
+`COMPLETE` declares §10.3's full precondition list, and four of those guards read data that does not
+exist: no `evidence` table, no `human_interventions`, no policy engine, no record of a merge or an
+acceptance. They are marked `PENDING` and pass.
+
+**Was five.** `DIFF_GUARDS_PASSED` now enforces: §17's guards run in `VERIFYING` against the diff the
+harness hands back, the verdict is written to `task_attempts.diff_guard_verdict`, and completion
+requires an explicit `PASSED` — not merely the absence of a refusal, so an attempt that never reached
+verification cannot complete on the strength of never having been checked. A refusal escalates rather
+than failing, because a retry produces the same reasonable-looking edit again.
 
 **This is a real hole and it is meant to read like one.** What makes it survivable is that it is
 never silent: every transition writes each guard's verdict into
 `task_state_transitions.guard_results`, so a task completed today carries a permanent record that
-five of its preconditions were `NOT_ENFORCED`, and nobody reading its history later has to
+the remaining preconditions were `NOT_ENFORCED`, and nobody reading its history later has to
 reconstruct what was actually checked. `CompletionGuardsTest.theUnenforcedGuardsAreKnown` pins the
 set, so shrinking it is a deliberate edit and growing it is a conversation.
 
