@@ -48,7 +48,7 @@ public class TaskWorker {
     private final TaskService tasks;
     private final TaskStateService taskStates;
     private final TaskAttempts attempts;
-    private final FakePhaseHandler handler;
+    private final AttemptRunner runner;
     private final String workerId;
     private final Duration leaseTtl;
     private final int batch;
@@ -67,7 +67,7 @@ public class TaskWorker {
             TaskService tasks,
             TaskStateService taskStates,
             TaskAttempts attempts,
-            FakePhaseHandler handler,
+            AttemptRunner runner,
             LeaderLock processIdentity,
             @Value("${forgestack.runtime.lease-ttl:PT60S}") Duration leaseTtl,
             @Value("${forgestack.runtime.batch:8}") int batch) {
@@ -76,7 +76,7 @@ public class TaskWorker {
         this.tasks = tasks;
         this.taskStates = taskStates;
         this.attempts = attempts;
-        this.handler = handler;
+        this.runner = runner;
         // The process identity the leader lock already mints: random per process, so a restart never
         // inherits its predecessor's claims. Reusing it keeps one answer to "who is this worker".
         this.workerId = "worker-" + processIdentity.processId();
@@ -186,13 +186,21 @@ public class TaskWorker {
             }
 
             TaskAttempts.OpenedAttempt attempt = attempts.open(lease);
-            FakePhaseHandler.AttemptResult result =
-                    handler.run(lease, attempt.id(), simulation, attempt.attemptNo());
+            AttemptRunner.AttemptOutcome result = runner.run(lease, attempt.id(), simulation, attempt.attemptNo());
             attempts.end(lease, attempt.id(), result.outcome(), result.failureClass(), result.summary());
 
             switch (result.outcome()) {
                 case "SUCCEEDED" -> {
                     taskStates.apply(lease, TaskEvent.COMPLETE, Actor.system(), "the attempt succeeded");
+                    return;
+                }
+                case "ABORTED" -> {
+                    // The infrastructure failed, not the approach. Handing the task back rather than
+                    // retrying here is what stops a worker that cannot provision a sandbox from
+                    // spending the whole retry budget discovering that — another worker, or this one
+                    // later, picks it up with the attempt cap untouched.
+                    log.info("attempt on {} aborted ({}); handing it back", lease.taskId(), result.failureClass());
+                    taskStates.apply(lease, TaskEvent.YIELD, Actor.system(), result.summary());
                     return;
                 }
                 case "ESCALATED" -> {

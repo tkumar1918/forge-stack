@@ -3,7 +3,13 @@
  *
  * <p>In Phase 2 it runs nothing real. The attempt loop, the lease heartbeat, the step log, the retry
  * budget and the escalation path are all here and all exercised; the only thing missing is a model
- * and a sandbox, and a fake handler stands in for both.
+ * and a sandbox, and a simulated harness stands in for both.
+ *
+ * <p>Where this module ends is worth being precise about, because {@code runtime} and {@code harness}
+ * both sound like "the thing that runs the work". This one owns <em>control flow</em> — which phase,
+ * how many attempts, when to escalate, and whether anything was achieved. {@code harness} is the port
+ * to the sandbox where a model actually touches the repository. Control flow is the product and stays
+ * ours; what is on the other side of that port may not be ours at all (Appendix B).
  *
  * <p>That order is the point of the whole plan (§27). When the agent later does something strange,
  * the queue, the lease, the state machine and the guards will already be known to work — so the
@@ -16,5 +22,5 @@
  */
 @org.springframework.modulith.ApplicationModule(
         displayName = "Runtime",
-        allowedDependencies = {"task", "platform", "platform::jobs", "platform::tenancy"})
+        allowedDependencies = {"harness", "task", "platform", "platform::jobs", "platform::tenancy"})
 package dev.tushar.forgestack.runtime;

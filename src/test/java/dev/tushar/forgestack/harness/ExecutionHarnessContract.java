@@ -51,7 +51,7 @@ abstract class ExecutionHarnessContract {
     @DisplayName("provisions, works, hands back a diff, and cleans up")
     void theHappyPath() {
         HarnessSession session = harness().open(spec());
-        var events = new InMemoryHarness.RecordedEvents();
+        var events = new RecordedEvents();
 
         HarnessStop stop = harness().run(session, new Instruction("EDIT:src/Main.java", 10), events);
 
@@ -73,7 +73,7 @@ abstract class ExecutionHarnessContract {
     @DisplayName("delivers every event before it reports the stop")
     void eventsArriveBeforeTheStop() {
         HarnessSession session = harness().open(spec());
-        var events = new InMemoryHarness.RecordedEvents();
+        var events = new RecordedEvents();
 
         HarnessStop stop = harness().run(session, new Instruction("EDIT:a.txt", 10), events);
         List<HarnessEvent> afterStop = events.all();
@@ -89,7 +89,7 @@ abstract class ExecutionHarnessContract {
     @DisplayName("reports what the model claimed about its own risk, and calls it a claim")
     void riskIsReportedAsTheModelsOwnOpinion() {
         HarnessSession session = harness().open(spec());
-        var events = new InMemoryHarness.RecordedEvents();
+        var events = new RecordedEvents();
 
         harness().run(session, new Instruction("EDIT:a.txt", 5), events);
 
@@ -224,7 +224,7 @@ abstract class ExecutionHarnessContract {
                 EgressPolicy.DENY_ALL,
                 Set.of("read_file"));
         HarnessSession session = harness().open(readOnly);
-        var events = new InMemoryHarness.RecordedEvents();
+        var events = new RecordedEvents();
 
         harness().run(session, new Instruction("EDIT:forbidden.txt", 5), events);
 
@@ -260,7 +260,7 @@ abstract class ExecutionHarnessContract {
     @DisplayName("an agent that asks for a person stops and says so")
     void askingForAHumanStopsTheRun() {
         HarnessSession session = harness().open(spec());
-        var events = new InMemoryHarness.RecordedEvents();
+        var events = new RecordedEvents();
 
         HarnessStop stop = harness().run(session, new Instruction("ASK:should I bump the major version?", 10), events);
 

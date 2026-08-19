@@ -61,7 +61,7 @@ class InMemoryHarnessTest extends ExecutionHarnessContract {
                 new ResourceLimits(2000, 4096, 8192, java.time.Duration.ofMinutes(30), 100, 500_000),
                 EgressPolicy.DENY_ALL,
                 java.util.Set.of("read_file", "apply_patch")));
-        var events = new InMemoryHarness.RecordedEvents();
+        var events = new RecordedEvents();
 
         harness.run(session, new Instruction("EDIT:a.txt", 5), events);
 

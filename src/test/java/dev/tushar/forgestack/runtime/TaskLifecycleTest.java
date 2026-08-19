@@ -3,6 +3,7 @@ package dev.tushar.forgestack.runtime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import dev.tushar.forgestack.harness.InMemoryHarness;
 import dev.tushar.forgestack.platform.jobs.DeliveredJob;
 import dev.tushar.forgestack.platform.jobs.JobQueue;
 import dev.tushar.forgestack.platform.jobs.LeaderLock;
@@ -61,7 +62,10 @@ class TaskLifecycleTest extends AbstractIntegrationTest {
     private TaskAttempts attempts;
 
     @Autowired
-    private FakePhaseHandler handler;
+    private AttemptRunner runner;
+
+    @Autowired
+    private InMemoryHarness harness;
 
     @Autowired
     private LeaderLock processIdentity;
@@ -114,8 +118,13 @@ class TaskLifecycleTest extends AbstractIntegrationTest {
                         TaskState.READY, TaskState.QUEUED, TaskState.RUNNING, TaskState.COMPLETED);
 
         assertThat(steps(created.id()))
-                .as("one step per phase, at the grain the real loop will use")
-                .isEqualTo(5);
+                .as("provisioned, one tool call, verified, submitted — the work reported, not a script")
+                // Four and not five, and the difference is the point. Steps used to come from a
+                // hardcoded list of phases, so the log said the same thing however the attempt had
+                // actually gone. They now come from the harness's own event stream — one row per
+                // completed tool call — plus the phases ForgeStack runs itself. An agent that used
+                // three tools writes three rows here.
+                .isEqualTo(4);
     }
 
     /**
@@ -217,6 +226,41 @@ class TaskLifecycleTest extends AbstractIntegrationTest {
     }
 
     /**
+     * A sandbox that could not be provisioned is not a failed attempt.
+     *
+     * <p>The distinction §20 insists on: infrastructure dying is not the approach being wrong. A
+     * worker that treated "there is nowhere to run this" as a failure would spend a task's whole
+     * retry budget discovering that the cluster was busy, and the transition log would blame the
+     * agent for it. So the task goes back on the queue for somebody else, and the reason is recorded.
+     *
+     * <p>Reached here by telling the harness it has no room, which is the kind of thing only a
+     * simulated one will do on request — and the reason the {@code induce} hooks exist.
+     */
+    @Test
+    @DisplayName("a task whose sandbox cannot be provisioned goes back on the queue")
+    void noCapacityHandsTheTaskBack() {
+        TaskView created = create("Needs a sandbox", SimulatedOutcome.SUCCEED);
+        awaitRelay();
+        harness.reportNoCapacity(true);
+        try {
+            worker.runAvailableWork();
+
+            assertThat(detail(created.id()).task().state())
+                    .as("handed back, not failed")
+                    .isEqualTo(TaskState.QUEUED);
+            assertThat(detail(created.id()).attempts())
+                    .singleElement()
+                    .satisfies(attempt -> assertThat(attempt.outcome()).isEqualTo("ABORTED"));
+        } finally {
+            harness.reportNoCapacity(false);
+        }
+
+        // And it still runs to completion once there is room, on the same task rather than a new one.
+        workUntilItLeavesTheQueue(created.id());
+        assertThat(detail(created.id()).task().state()).isEqualTo(TaskState.COMPLETED);
+    }
+
+    /**
      * Draining hands the work back instead of holding it through a shutdown.
      *
      * <p>{@code YIELD} rather than letting the lease lapse: the task returns to the queue at once
@@ -232,7 +276,7 @@ class TaskLifecycleTest extends AbstractIntegrationTest {
         // begun shutting down never starts claiming again. Draining the shared bean would leave
         // every later test in this context running against a worker that refuses work.
         TaskWorker leaving = new TaskWorker(
-                queue, leases, tasks, taskStates, attempts, handler, processIdentity, Duration.ofSeconds(60), 8);
+                queue, leases, tasks, taskStates, attempts, runner, processIdentity, Duration.ofSeconds(60), 8);
         leaving.beginDraining();
         awaitRelay();
 

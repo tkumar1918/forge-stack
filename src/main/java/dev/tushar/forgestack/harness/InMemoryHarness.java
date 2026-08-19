@@ -1,17 +1,15 @@
 package dev.tushar.forgestack.harness;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import org.springframework.stereotype.Component;
 
 /**
- * An execution harness that runs nothing, so the runtime around it can be tested for free.
+ * An execution harness that runs nothing.
  *
  * <p>Every candidate harness costs a container, a model call, and real money per run. A runtime
  * tested only against those is a runtime tested rarely, and the parts most worth testing — a lease
@@ -19,12 +17,23 @@ import java.util.function.Consumer;
  * hardest to arrange on purpose against a real one. This is the second implementation the
  * {@code @Port} on {@link ExecutionHarness} exists for.
  *
+ * <p>This is what Phase 2 runs on, and it is the same class the conformance suite is pointed at —
+ * deliberately, because a suite only ever run against a fake drifts towards asserting whatever the
+ * fake happens to do. Proving the contract against the implementation the runtime actually uses is
+ * worth more than proving it against a second simulator nobody runs.
+ *
+ * <p>The {@code induce} methods are the feature, not a leak. A runtime's recovery paths — a sandbox
+ * vanishing mid-attempt, capacity refused under load — are the parts hardest to arrange against a
+ * real harness and the parts most worth exercising, so this one can be told to fail on command.
+ * When a real adapter lands, this class and {@code tasks.simulated_outcome} go with it.
+ *
  * <p>Behaviour is driven by directives at the front of an instruction, the same idiom
  * {@code SimulatedOutcome} already uses for the phase handler: {@code ASK:question},
  * {@code STUCK}, {@code EDIT:path}. Anything else is worked on and finished. Keeping the vocabulary
  * in the instruction rather than in setter calls means a test reads as a scenario rather than as
  * configuration.
  */
+@Component
 public final class InMemoryHarness implements ExecutionHarness {
 
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
@@ -198,28 +207,6 @@ public final class InMemoryHarness implements ExecutionHarness {
         private Session(AttemptSpec spec, String externalId) {
             this.spec = spec;
             this.externalId = externalId;
-        }
-    }
-
-    /** Collects a run's events in order, which is what most assertions here are about. */
-    public static final class RecordedEvents implements Consumer<HarnessEvent> {
-        private final List<HarnessEvent> events = new ArrayList<>();
-
-        @Override
-        public synchronized void accept(HarnessEvent event) {
-            events.add(event);
-        }
-
-        public synchronized List<HarnessEvent> all() {
-            return List.copyOf(events);
-        }
-
-        public synchronized Map<Class<?>, Integer> countsByType() {
-            Map<Class<?>, Integer> counts = new HashMap<>();
-            for (HarnessEvent event : events) {
-                counts.merge(event.getClass(), 1, Integer::sum);
-            }
-            return counts;
         }
     }
 }
