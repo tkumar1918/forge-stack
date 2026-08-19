@@ -38,7 +38,21 @@ class ModularityTest {
     void moduleNamesAreDeliberate() {
         assertThat(MODULES.stream().map(module -> module.getIdentifier().toString()))
                 .containsExactlyInAnyOrder(
-                        "api", "audit", "githubinstallation", "githublogin", "iam", "platform", "runtime", "task");
+                        "api",
+                        "audit",
+                        "githubinstallation",
+                        "githublogin",
+                        // "harness" and "runtime" both sound like "the thing that runs the work",
+                        // which is exactly the confusion this test exists to force someone to look at.
+                        // They divide on which side of the process boundary they sit: runtime is the
+                        // Java control loop that decides what happens, harness is the port to the
+                        // sandbox where a model actually touches the repository. Runtime is ours and
+                        // always will be; harness is a seam over somebody else's code (Appendix B).
+                        "harness",
+                        "iam",
+                        "platform",
+                        "runtime",
+                        "task");
     }
 
     @Test
