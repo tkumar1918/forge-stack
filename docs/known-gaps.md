@@ -351,7 +351,7 @@ size for it.
 | **Installation tokens cached in Redis as plaintext** | Redis is credential-bearing infrastructure today. Tokens are short-lived and narrowly scoped, which bounds it. | `platform.crypto` envelope encryption |
 | **Database passwords in `application.yaml`** (`forgestack_app`/`forgestack_app`) | Local-only values, but the shape invites a real one being pasted there | Before any deployed environment |
 | **CSRF disabled for `/api/**`** | Session cookie is `SameSite=Lax` and the API is same-origin, so exposure is limited | Browser client lands |
-| **No sandbox isolation yet** | Not applicable until the sandbox exists, but the plan's residual-risk note (container ≠ VM boundary) stands | Before public self-serve signup — gVisor is the cheap next step |
+| **The container is the only isolation layer** | The sandbox now exists, and the plan's Decision section makes the container the *sole* boundary by design rather than by omission — the binary allowlist was measured and does not contain an adversary. Permitting third-party MCP servers inside it raises this further. | **Moved earlier, then back:** the trigger is **self-serve signup**, which is where "unvetted" actually starts — design-partner repositories are known and the risk is a business relationship, not an anonymous upload. Recorded as a decision, not an oversight: it buys the workspace capability work its first quarter, and the container is the only isolation layer until then. gVisor remains the cheap next step |
 | **`ForgeStackSessionCookie.read` takes the first matching cookie** | `findFirst()` over the cookie array, so two `forge_session` cookies would be resolved arbitrarily and could flip the caller between sessions request to request. It was the leading theory for §1.9 until the browser turned out to hold exactly one, so there is no evidence it is reachable — recorded rather than fixed speculatively | Anything that can set a second cookie: a `Domain` attribute, a path change, or a second host |
 
 ---
@@ -589,6 +589,246 @@ and the reconciler currently form a closed loop with no exit. A task that reache
 re-queued a grace period later, and re-queued again after each subsequent grace period, forever.
 `V9__reconciler_backoff.sql` bounds that to one message per grace period rather than one per sweep;
 it does not stop it, and cannot, until something claims the work.
+
+### 3.16 The plan permits a shell; `ExecRequest` still cannot express one
+
+The Decision section supersedes §15's shell prohibition: the allowlist is demoted to an operational
+contract, and the sandbox becomes the boundary. `ExecRequest` has not moved — it is `(binary, args,
+workDir, timeout)` with no shell form, and its javadoc still argues the old rule at length, including
+the honest note about `mvn test | tail -50`.
+
+Nothing is broken by this. The code is *stricter* than the plan, which is the safe direction for a
+divergence to point. It is recorded because the javadoc now argues a position the plan has abandoned,
+and a reader who trusts it will re-derive the wrong boundary.
+
+**Removal trigger:** the §15 dispatch work. Add the shell form, rewrite the javadoc to say the
+allowlist is not a containment feature, and land the command AST alongside it — the parse is what
+replaces the restriction, so shipping the shell without it would trade a weak control for none.
+
+### 3.17 The egress proxy does not exist, so §16's central promise is untested
+
+`EgressPolicy.PROXY_ONLY` names a per-workspace Docker network and nothing listens on it. Only
+`DENY_ALL` is real, and it is real only in the sense that `wget` fails — proven by absence, which is
+the weakest form of proof available.
+
+This was tolerable while the proxy was a convenience for reaching package registries. The Decision
+section makes it load-bearing for three separate things: remote MCP servers, the model API key, and
+any credential used without being disclosed to the sandbox. Until it exists, none of those can ship,
+and §16's claim that no credential enters the sandbox holds only because nothing has yet needed one.
+
+**Removal trigger:** it is the next build item, ahead of the tool catalogue, for exactly this reason.
+
+### 3.18 The diff guards describe a cost model they no longer have
+
+`DiffGuards`' class javadoc says findings are "tuned to fire" because "a finding escalates rather
+than failing the task, so the cost of being wrong stays on the cheap side." That was true while
+`DIFF_GUARDS_PASSED` was `PENDING`. It was promoted to `ENFORCED` in the same session that split the
+verdict into its own step, and `DiffVerdict.passed()` is `findings.isEmpty()` — so a finding now
+blocks completion outright. The tuning argument and the enforcement no longer agree, and the tuning
+argument is the one written down.
+
+This becomes acute under the amendment that lets the agent author tests: `weakenedAssertions` counts
+net assertions across the whole diff with no notion of provenance, so an agent consolidating five
+assertions into three parameterised ones — in a file it wrote itself, twenty steps earlier — is a
+refusal.
+
+**Removal trigger:** the §17 provenance work. `DiffFinding` gains `Severity.REFUSE | FLAG`,
+`passed()` becomes "no `REFUSE` finding", the three test-shape guards scope to the inherited tier by
+comparing against `WorkingCopy.baseSha`, and the javadoc is rewritten to describe what the code
+actually does. Until then the guards are stricter than intended, which is the safe direction, but
+they will refuse legitimate work as soon as an agent writes a second version of its own test.
+
+### 3.19 `SandboxProvider` cannot start a process that outlives a call
+
+`exec` takes a `Duration timeout`, returns an `ExecResult`, and streams to a `Consumer<OutputChunk>`
+until the process ends. Nothing in the port expresses a process that keeps running.
+
+The consequence is larger than it looks: no dev server, no `watch` mode, no debugger, no language
+server, and no way to test anything that has to be *running* to be tested. Frontend work is
+essentially out of reach. This was never a security decision — `ExecRequest` simply never grew the
+concept, and its absence has been reading as a deliberate restriction because it sits in a plan that
+argues for restrictions elsewhere.
+
+**Removal trigger:** the tool catalogue work. `start`/`signal`/`ports` on the port, processes tracked
+per handle and reaped in `destroy`, output buffered to a ring the agent reads through a tool. The
+hardening block does not change and **`-p` never joins it** — ports stay reachable inside the sandbox
+and unreachable from the host, which is what keeps this the same privilege for longer rather than a
+new one.
+
+### 3.20 The image name reached Docker's option parser — **fixed**
+
+`provision` placed `spec.ociImage()` on the command line as a positional argument. `docker run` parses
+options until the first non-option argument, so a name beginning with `--` is parsed as an *option*.
+Verified against a real daemon rather than reasoned about:
+
+```
+$ docker run --rm --user 10001:10001 "--volume=/var/run/docker.sock:/sock" alpine:3.20 ls -l /sock
+srw-rw----    1 root     984    0 Aug 19 02:06 /sock
+```
+
+That is the daemon socket, mounted, from a string occupying the image field — the one escape §16
+excludes categorically.
+
+**It was not reachable.** The provider appends `sleep <ttl>` after the image, so the injected run
+failed on `sleep` not being an image. That is an accident of argument order, not a control, and
+`ociImage` is validated only for null/blank — the javadoc says "never named by a model", which is a
+comment. §16's service dependencies will let a verification contract name images, which is the change
+that would have made it live.
+
+Fixed by terminating option parsing with `--` before the image, and by classifying
+`invalid reference format` as `Refused`.
+
+**The first test written for this was wrong, and the fix's own discipline caught it.** It called
+`provision` with a hostile name and asserted `Refused` — and passed with the `--` deleted, because
+`sleep` then lands in the image position and is refused for its own unrelated reason. Same verdict,
+different cause, nothing guaranteed. The same shape as the `/etc` versus `/var/tmp` error in the
+read-only rootfs test. The command assembly is now a static `runCommand(spec)`, and the test asserts
+the argument *shape* — that nothing the spec carries reaches the option parser — which fails alone
+when the terminator is removed.
+
+### 3.21 §17 promises seven diff guards and five exist
+
+The anti-cheat list in §17 names seven checks. `DiffGuard` has five. The two missing ones were never
+logged here, and the §17 amendment's own "what the guards become" table re-enumerated every guard —
+adding `SUBJECT_MOCKED` and `SELF_CERTIFYING` — while silently inheriting the same two omissions. Two
+independent enumerations, the same hole in both.
+
+**Changes outside `plan.declared_file_scope`.** Blocked, and for a reason nothing records: there is no
+`plans` table. `declared_file_scope` appears in a schema sketch at §11 and as a §9 supervisor
+escalation trigger, and in **no migration** — `V1`–`V13` do not create it. §9's trigger is also a
+softer thing than §17 promises: mid-loop, spends supervisor tokens to reconsider, and does not block.
+If it does not fire, nothing currently stops an out-of-scope change reaching `COMPLETE`.
+
+**Dependency added that is not in the plan.** Appears exactly once in the repository — the §17 line
+promising it. No column, no trigger, no code, no test.
+
+This was found by an outside reader tracing references across the plan, not by this project's own
+checks, and it is the more uncomfortable half: the gap sits *in the anti-cheat layer*, which is the
+one place §26 says the product lives or dies. `DIFF_GUARDS_PASSED` is `ENFORCED` and reads
+`DiffVerdict.passed()`, so the enforcement is real — it just enforces five sevenths of what §17 says
+it enforces, and the completion guard cannot tell the difference.
+
+**Removal trigger:** `DEPENDENCY_ADDED` is buildable today from diff text alone — manifest paths plus
+added-line parsing for `package.json`, `pom.xml`, `build.gradle`, `requirements.txt`, `go.mod`,
+`Cargo.toml` — and should land with the §17 provenance work. `FILE_SCOPE_VIOLATED` waits on the
+`plans` table and is blocked, not deferred; until then §9's escalation trigger is the only thing
+covering it and the plan should say so rather than implying a guard exists.
+
+### 3.22 `SandboxProvider.exec` spawns a process per tool call
+
+`exec` shells out to `docker exec` once per call. Measured against a real daemon: 50 sequential
+`docker exec` invocations cost **102ms each**; the same 50 multiplexed over one long-lived
+`docker exec -i` cost **2ms each**.
+
+The 50× is worse than it reads, because the calls an agent makes most — `read_file`, `grep`,
+`list_directory` — are the cheapest operations, so process creation is nearly all of their cost. An
+attempt making 200 calls spends 20 seconds on spawn overhead alone, and that is the *cheap* path: the
+same design also forecloses streaming a command's output as it is produced, since the call returns
+only when the process exits.
+
+This was not caught by the conformance suite because the suite tests **behaviour**, and the behaviour
+is correct — it is fast enough for the handful of calls a test makes and wrong at the scale of a real
+attempt. Conformance suites do not catch cost.
+
+**Removal trigger:** the §16 in-container stub — one long-lived `docker exec -i` per session, tool
+calls framed over stdin, responses and output chunks framed back on stdout. The port's shape survives
+(`exec` still takes an `ExecRequest` and a `Consumer<OutputChunk>`); what changes is the adapter
+beneath it, plus a fallback to per-call `exec` when the image has no stub.
+
+### 3.22 One tenant can monopolise every worker, and nothing stops it
+
+`RedisStreamJobQueue.streamKey` is `STREAM_PREFIX + kind` — one stream per job *kind*, shared by every
+tenant, consumed FIFO. `workspaceId` rides in the message and scopes the rows once a job is claimed; it
+does not affect queue position. A workspace that enqueues a thousand tasks puts every other tenant
+behind them.
+
+There is also no limit on concurrent attempts per workspace. Per-container `--cpus` / `--memory` /
+`--pids-limit` bound one sandbox; nothing bounds a tenant's total, so one workspace can exhaust the
+worker VM's memory or container count and degrade everyone.
+
+Not reachable today — there is one design-partner tenant and nothing consumes the queue at volume — but
+it becomes visible with the second paying customer, which is earlier than most items in this file.
+
+**Removal trigger:** a per-workspace in-flight quota checked before `leases.acquire`, with over-quota
+messages re-queued on the backoff `V9__reconciler_backoff.sql` already provides. One control expressed
+in attempts, covering both fairness and host exhaustion. Partitioned streams with a round-robin
+consumer would also work and are a much larger change for the same outcome.
+
+### 3.23 A shared build cache would be a cross-tenant read
+
+Recorded before it is built, because the plan lists warm build caches as a workspace capability and the
+obvious implementation — one cache volume mounted into every sandbox — is a confidentiality bug rather
+than a performance optimisation. A private npm package, an internal Maven artifact, or a resolved
+source file belonging to one customer would sit in a volume the next tenant's container mounts.
+
+**Caches are per-workspace, always.** The warm-image story is per-workspace layers, not a shared
+volume. There is no version of "share the cache and filter it" worth attempting.
+
+### 3.24 Two attempts for the same tenant can address each other
+
+`hardeningFlags` puts a sandbox on `forge-sbx-{workspaceId}` under `PROXY_ONLY`, so the network is per
+workspace and two concurrent attempts for one tenant are mutually reachable. Under `DENY_ALL` there is
+no interface at all, so this only applies once the proxy lands and attempts start using it.
+
+Nothing needs that reachability, and one compromised repository reaching another of the same tenant's
+in-flight builds is a real step in an attack chain — the tenant boundary holds, but the blast radius
+inside it is larger than it needs to be.
+
+**Removal trigger:** move the network to per-**attempt** when the §16 proxy sidecar is built, since
+both change the same code. Measure Docker's subnet ceiling on a worker VM first: each network consumes
+a subnet from the default address pool, and if the ceiling is low the fallback is per-attempt firewall
+rules on a shared network, which is weaker and must be recorded as such rather than quietly accepted.
+
+### 3.25 The runtime runs one attempt per JVM, and the lease cannot survive a real one
+
+Three defects in one code path. Individually survivable, together they set the ceiling on everything.
+
+**Concurrency is one.** `TaskWorker.poll()` is `@Scheduled(fixedDelay)`, and it walks its batch with
+`for (DeliveredJob job : delivered)` — sequentially, on the scheduler thread. An attempt that takes ten
+minutes occupies that thread for ten minutes. Running a hundred attempts means running a hundred JVMs.
+
+**The reconciler shares that thread.** `TaskWorker` and `LeaseReconciler` are the only two `@Scheduled`
+components, and no `TaskScheduler` pool size is configured, so Spring's default of **one thread** is
+what both get. A long attempt therefore blocks lease reconciliation process-wide: the component whose
+whole job is noticing stalled work cannot run while work is in progress.
+
+**The lease is not renewed during an attempt.** `leases.renew` is called at the top of each iteration
+of `runAttempts`' retry loop — before `runner.run(...)`, never during it. `lease-ttl` defaults to
+`PT60S`, and a real agent attempt is minutes.
+
+The three interact in a way that hides the problem in exactly the configuration we develop in. On a
+single JVM the blocked reconciler cannot reclaim the lease it should have reclaimed, so nothing appears
+wrong. Add a second worker — which is the entire point of scaling — and worker B's reconciler reclaims
+worker A's stale lease mid-attempt, B starts the same task, and V10's fencing correctly rejects A's
+writes. A has then spent ten minutes of sandbox time it cannot commit, and its container is orphaned
+until the reaper finds it.
+
+Not reachable today because `AttemptRunner` returns in milliseconds against a fake. It becomes
+reachable on the first real agent loop, which is Phase 3.5.
+
+**Removal trigger:** with the native runtime. An `ExecutorService` sized independently of the scheduler,
+`poll()` dispatching rather than executing, an explicit `TaskScheduler` pool so the reconciler is never
+behind a worker, and a renewal heartbeat that runs *during* `runner.run` rather than between attempts.
+The heartbeat is the load-bearing one: without it, lease TTL has to exceed the longest possible attempt,
+which makes genuine worker death undetectable for that long.
+
+### 3.26 Scaling limits that have not been measured
+
+Recorded so they are measured rather than discovered. None is a defect yet; each is a ceiling nobody
+has looked for.
+
+- **The Docker daemon is one process per host.** Every `provision`, `exec`, `inspect`, and `rm` serialises
+  through it. The per-call `exec` cost is already measured at ~102ms against ~2ms for a multiplexed
+  session, which is why §16 moves to a stub — but daemon throughput under concurrent `docker run` has
+  not been.
+- **Model provider rate limits are shared.** One API key across all tenants means one tenant's burst
+  produces 429s for everyone. §22 governs spend, not request rate, and these are different controls.
+- **Image size against cold start.** Pre-baking toolchains, MCP servers, a language server, the CA
+  anchor, and the exec stub produces multi-gigabyte images, and the first pull onto a new worker is on
+  the critical path of somebody's first attempt.
+- **Proxy TLS termination is CPU-bound**, and every model call and package install crosses it.
+- **Write volume.** A step per tool call, at a few hundred calls per attempt, against `task_steps` plus
+  `audit_events` — whose partitions are monthly.
 
 ---
 

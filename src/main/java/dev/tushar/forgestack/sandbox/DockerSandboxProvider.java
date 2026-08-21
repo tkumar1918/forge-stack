@@ -72,18 +72,7 @@ public final class DockerSandboxProvider implements SandboxProvider {
 
     @Override
     public SandboxHandle provision(SandboxSpec spec) {
-        List<String> command = new ArrayList<>(List.of("docker", "run", "--detach"));
-        command.addAll(hardeningFlags(spec));
-        command.addAll(List.of(
-                "--label", LABEL_SANDBOX + "=" + spec.sandboxId(),
-                "--label", LABEL_WORKSPACE + "=" + spec.workspaceId(),
-                "--name", containerName(spec.sandboxId())));
-        command.add(spec.ociImage());
-        // A container that exits immediately cannot be exec'd into. §16 calls this out because the
-        // naive Kubernetes port reaches for a Job, which is run-to-completion, and then cannot satisfy
-        // a port whose contract is a session with repeated exec. Sleeping is that contract, on Docker.
-        command.addAll(List.of("sleep", String.valueOf(spec.ttl().toSeconds())));
-
+        List<String> command = runCommand(spec);
         Ran ran = run(command, dockerTimeout);
         if (!ran.ok()) {
             String stderr = ran.stderr();
@@ -114,10 +103,44 @@ public final class DockerSandboxProvider implements SandboxProvider {
      */
     private static boolean imageIsUnobtainable(String stderr) {
         return stderr.contains("No such image")
+                // What a name that is not a reference comes back as — including one that tried to be
+                // a flag and was held to being a name by the "--" above.
+                || stderr.contains("invalid reference format")
                 || stderr.contains("manifest unknown")
                 || stderr.contains("repository does not exist")
                 || stderr.contains("pull access denied")
                 || stderr.contains("not found");
+    }
+
+    /**
+     * The whole {@code docker run} argument vector, assembled where it can be read and tested.
+     *
+     * <p>Static and separate for the same reason {@link #hardeningFlags} is: the security properties
+     * of this command live in its <em>shape</em>, and a shape buried inside a method that also talks
+     * to a daemon can only be checked by running one.
+     *
+     * <p>The {@code "--"} is the load-bearing token. {@code docker run} parses options until the
+     * first non-option argument, so an image name beginning with {@code --} is parsed as an option —
+     * verified against a real daemon, where {@code "--volume=/var/run/docker.sock:/sock"} in the
+     * image position mounts the daemon socket. The trailing {@code sleep} currently makes that
+     * particular injection fail, because {@code sleep} then lands in the image position and is not an
+     * image. That is an accident of argument order rather than a control, and §16's service
+     * dependencies will let a verification contract name images.
+     */
+    static List<String> runCommand(SandboxSpec spec) {
+        List<String> command = new ArrayList<>(List.of("docker", "run", "--detach"));
+        command.addAll(hardeningFlags(spec));
+        command.addAll(List.of(
+                "--label", LABEL_SANDBOX + "=" + spec.sandboxId(),
+                "--label", LABEL_WORKSPACE + "=" + spec.workspaceId(),
+                "--name", containerName(spec.sandboxId())));
+        command.add("--");
+        command.add(spec.ociImage());
+        // A container that exits immediately cannot be exec'd into. §16 calls this out because the
+        // naive Kubernetes port reaches for a Job, which is run-to-completion, and then cannot satisfy
+        // a port whose contract is a session with repeated exec. Sleeping is that contract, on Docker.
+        command.addAll(List.of("sleep", String.valueOf(spec.ttl().toSeconds())));
+        return command;
     }
 
     /**

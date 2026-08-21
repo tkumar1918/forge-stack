@@ -1,6 +1,7 @@
 package dev.tushar.forgestack.sandbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -102,6 +103,34 @@ class DockerSandboxProviderTest extends SandboxProviderContract {
         assertThat(result.succeeded())
                 .as("DENY_ALL means there is no interface to try")
                 .isFalse();
+    }
+
+    /**
+     * The image name is held to being a name, even when it is shaped like a flag.
+     *
+     * <p>{@code docker run} parses options until the first non-option argument, so a value in the
+     * image position beginning with {@code --} is parsed as an <em>option</em>. Verified against a
+     * real daemon: {@code docker run --user 10001:10001 "--volume=/var/run/docker.sock:/sock"
+     * alpine:3.20 ls -l /sock} prints {@code srw-rw---- root} &mdash; the daemon socket, mounted,
+     * from a string that occupied the image field.
+     *
+     * <p>This asserts the argument <em>shape</em> rather than the outcome of a run, and the
+     * distinction is the whole point. The first version of this test called {@code provision} with a
+     * hostile name and asserted {@code Refused} — and it passed with the {@code --} deleted, because
+     * {@code sleep} then lands in the image position and is refused for its own unrelated reason.
+     * Same verdict, different cause, no guarantee. What actually has to hold is that nothing the spec
+     * carries can reach Docker's option parser.
+     */
+    @Test
+    @DisplayName("the image name cannot be parsed as an option")
+    void theImageNameCannotBecomeAFlag() {
+        List<String> command = DockerSandboxProvider.runCommand(spec("--volume=/var/run/docker.sock:/sock"));
+
+        int terminator = command.indexOf("--");
+        assertThat(terminator).as("option parsing must be terminated").isNotNegative();
+        assertThat(command.subList(terminator + 1, command.size()))
+                .as("the hostile name sits after the terminator, where Docker reads it as a name")
+                .startsWith("--volume=/var/run/docker.sock:/sock");
     }
 
     @Test

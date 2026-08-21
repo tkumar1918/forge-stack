@@ -12,9 +12,9 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  *
  * <p>Real Postgres, not H2: the schema depends on row-level security, partitioning, and partial
  * unique indexes. A test against an in-memory database would verify a different system than the
- * one that ships — and RLS is precisely the property most worth verifying.
+ * one that ships &mdash; and RLS is precisely the property most worth verifying.
  *
- * <p>Containers are started once per JVM by the static initialiser below and deliberately never
+ * <p>Containers are started once per JVM by the static initializer below and deliberately never
  * stopped. The JUnit {@code @Testcontainers} extension stops {@code @Container} fields after each
  * test <em>class</em>, which for a shared static field means the second class inherits a dead
  * container. Ryuk removes these on JVM exit.

