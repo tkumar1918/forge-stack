@@ -4,7 +4,7 @@ Everything deliberately left undone, deferred, or accepted as a trade — with t
 should force each one to be revisited. Written down because a gap nobody recorded is
 indistinguishable from a bug nobody noticed.
 
-Last updated after the working copy first reached a real sandbox (§3.27-3.30). 270 tests.
+Last updated after the tool layer landed (§3.27-3.30, §15 dispatch). 283 tests.
 
 Setting up real credentials for the first time is a separate document: [local-setup.md](local-setup.md).
 
@@ -1013,6 +1013,7 @@ When a user's email is private, GitHub omits it and provisioning falls back to a
 | **`policyDoesNotDependOnLlm` is vacuous** | Same: neither module exists. |
 | **`interfacesMustJustifyThemselves` allows empty** | There are no production interfaces yet besides Spring Data ones. |
 | **No test boots the packaged application** | **The highest-value gap in this table, and still fully open.** Every test uses Testcontainers and overrides configuration, so nothing exercises `application.yaml` as shipped — `LoginSessionIntegrationTest` included, since MockMvc never starts the packaged app either. Three startup failures (§1.2b, §1.6, §1.7) survived a month because of it, and §1.8 makes four findings that came from *running* the app rather than testing it. All surfaced within minutes of first use. |
+| **`anUnknownImageIsRefused` needs the internet to pass** | To prove an image does not exist, Docker has to ask the registry — so on a slow or blocked connection the pull fails with `TLS handshake timeout` or `i/o timeout` instead of `repository does not exist`, and the adapter correctly reports `SubstrateUnavailable` (retryable) rather than `Refused`. The classification is right and the test is over-specified: it asserts an answer that is only available when `auth.docker.io` is reachable. Observed failing twice and passing on the third run, on the same machine, with no code change between. Fix is to assert against a reference Docker rejects **locally** (an invalid reference format needs no round trip), keeping the registry-dependent branch out of the gating path. |
 | **`ForgeStackSessionAuthenticationFilter` is registered twice** | It is a `@Component` implementing `Filter`, so Boot registers it as a container-level servlet filter *in addition* to its place in the security chain. Benign only because the chain has precedence `-100` and `OncePerRequestFilter` suppresses the second invocation — but it is the same shape as §1.8: a second copy of an authentication mechanism running outside the chain. Fix is a `FilterRegistrationBean` with `setEnabled(false)`, or dropping `@Component` and constructing it in `SecurityConfig`. |
 
 ---

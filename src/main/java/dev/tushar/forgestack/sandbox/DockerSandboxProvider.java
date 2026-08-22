@@ -200,12 +200,18 @@ public final class DockerSandboxProvider implements SandboxProvider {
                     "'%s' is not in this sandbox's allowlist".formatted(request.binary()));
         }
         List<String> command = new ArrayList<>(List.of(
-                "docker", "exec", "--workdir", workDirFor(request), "--user", "10001:10001", handle.externalId()));
+                "docker", "exec", "--workdir", workDirFor(request), "--user", "10001:10001"));
+        if (request.stdin() != null) {
+            // Without -i the daemon gives the process a closed stdin, so a command that reads its
+            // input sees EOF immediately and reports an empty patch rather than a missing one.
+            command.add("-i");
+        }
+        command.add(handle.externalId());
         command.add(request.binary());
         command.addAll(request.args());
 
         Instant started = Instant.now();
-        Ran ran = run(command, request.timeout());
+        Ran ran = runWithInput(command, request.stdin(), request.timeout());
         Duration took = Duration.between(started, Instant.now());
 
         if (ran.stderr().contains("No such container") || ran.stderr().contains("is not running")) {

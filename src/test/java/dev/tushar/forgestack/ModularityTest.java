@@ -54,7 +54,14 @@ class ModularityTest {
                         "platform",
                         "runtime",
                         "sandbox",
-                        "task");
+                        "task",
+                        // "tools" sits next to "sandbox" and the pair has to be read together: the
+                        // sandbox is where somebody else's code runs, tools is what a model is
+                        // permitted to ask for. Neither contains anything alone -- the sandbox does
+                        // not know what this attempt was offered, and a tool cannot enforce a kernel
+                        // boundary. Naming them apart is what keeps "offered" and "possible" from
+                        // being quietly treated as the same question.
+                        "tools");
     }
 
     @Test
