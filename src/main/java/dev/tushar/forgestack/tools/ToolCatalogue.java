@@ -128,10 +128,19 @@ public final class ToolCatalogue {
                     SideEffect.WRITE_SANDBOX,
                     false,
                     Duration.ofSeconds(60)),
+            // argv OR script, and neither is required on its own -- validated in the dispatch, because
+            // "exactly one of these two" is not something a required-arguments list can express.
+            //
+            // The shell is here because §15's ban was withdrawn: it rested on the claim that a shell
+            // makes the sandbox's other controls decorative, and that was measured and found false.
+            // An agent that cannot pipe, chain, or redirect cannot do ordinary work, and the
+            // allowlist it was protecting never contained an adversary anyway. What replaces the
+            // restriction is recording -- see CommandSignals.
             new ToolDefinition(
                     "run_command",
-                    "Run one command in the working copy. The binary must be permitted for this attempt.",
-                    List.of("argv"),
+                    "Run a command in the working copy. Give argv for a single command, or script for "
+                            + "a shell line with pipes, redirection and && chaining.",
+                    List.of(),
                     RiskLevel.MEDIUM,
                     SideEffect.EXEC,
                     false,

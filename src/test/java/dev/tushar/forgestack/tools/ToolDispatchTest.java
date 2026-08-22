@@ -439,6 +439,82 @@ class ToolDispatchTest {
                 .hasMessageContaining("no retained output");
     }
 
+
+    // --- the shell, which is what most of these tools were compensating for ----------------------
+
+    /**
+     * The capability §15's ban was costing.
+     *
+     * <p>None of this is expressible as argv: a pipe, a chain, a redirect. The old rule's surviving
+     * justification was that argv is easier to attribute — which is true, and is why argv is still
+     * the default — but its load-bearing claim was that a shell makes the sandbox's other controls
+     * decorative, and that was measured against real containers and found false.
+     */
+    @Test
+    @DisplayName("a shell script can pipe, chain and redirect, which argv cannot express")
+    void theShellFormDoesWhatArgvCannot() {
+        ToolResult piped = dispatch.dispatch(
+                sandbox, EVERYTHING, ToolCall.of("run_command", "script", "seq 1 100 | tail -3 | tr '\\n' ','"));
+        assertThat(piped.failed()).isFalse();
+        assertThat(piped.output()).contains("98,99,100");
+
+        ToolResult chained = dispatch.dispatch(
+                sandbox,
+                EVERYTHING,
+                ToolCall.of("run_command", "script", "echo first > out.txt && echo second >> out.txt && cat out.txt"));
+        assertThat(chained.output()).contains("first").contains("second");
+    }
+
+    /**
+     * Both or neither is a refusal, rather than one silently winning.
+     *
+     * <p>A precedence rule means a model that sent both watches one of them not happen, and nothing
+     * in the record says which.
+     */
+    @Test
+    @DisplayName("run_command refuses to guess between argv and script")
+    void argvAndScriptAreExclusive() {
+        assertThatThrownBy(() -> dispatch.dispatch(sandbox, EVERYTHING, ToolCall.of("run_command")))
+                .isInstanceOf(ToolRefusal.class)
+                .hasMessageContaining("either 'argv' or 'script'");
+
+        assertThatThrownBy(() -> dispatch.dispatch(
+                        sandbox,
+                        EVERYTHING,
+                        ToolCall.of("run_command", "argv", List.of("ls"), "script", "ls")))
+                .isInstanceOf(ToolRefusal.class);
+    }
+
+    /**
+     * The allowlist is an operational contract, and the shell is in it like anything else.
+     *
+     * <p>An attempt that should not have a shell is configured by leaving {@code sh} out of the
+     * spec, not by removing the capability from the tool. That is the difference between containing
+     * and subtracting.
+     */
+    @Test
+    @DisplayName("an attempt whose sandbox has no shell cannot use the script form")
+    void theShellIsJustAnotherPermittedBinary() {
+        SandboxHandle shellless = docker.provision(new SandboxSpec(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                TOOLCHAIN,
+                2000,
+                512,
+                256,
+                Duration.ofMinutes(5),
+                EgressPolicy.DENY_ALL,
+                Set.of("ls", "git")));
+        try {
+            assertThatThrownBy(() ->
+                            dispatch.dispatch(shellless, EVERYTHING, ToolCall.of("run_command", "script", "ls | wc -l")))
+                    .isInstanceOf(ToolRefusal.class)
+                    .hasMessageContaining("allowlist");
+        } finally {
+            docker.destroy(shellless);
+        }
+    }
+
     // -------------------------------------------------------------------------------------------
 
     private static Set<String> union(Set<String> a, Set<String> b) {

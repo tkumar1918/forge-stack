@@ -4,7 +4,7 @@ Everything deliberately left undone, deferred, or accepted as a trade — with t
 should force each one to be revisited. Written down because a gap nobody recorded is
 indistinguishable from a bug nobody noticed.
 
-Last updated after the tool layer landed (§3.27-3.30, §15 dispatch, narrowing tools). 289 tests.
+Last updated after the tool layer landed (§3.27-3.30, §15 dispatch, narrowing tools, the shell and its parse). 301 tests.
 
 Setting up real credentials for the first time is a separate document: [local-setup.md](local-setup.md).
 
@@ -590,20 +590,19 @@ re-queued a grace period later, and re-queued again after each subsequent grace 
 `V9__reconciler_backoff.sql` bounds that to one message per grace period rather than one per sweep;
 it does not stop it, and cannot, until something claims the work.
 
-### 3.16 The plan permits a shell; `ExecRequest` still cannot express one
+### 3.16 The plan permits a shell; `ExecRequest` still cannot express one — **fixed**
 
-The Decision section supersedes §15's shell prohibition: the allowlist is demoted to an operational
-contract, and the sandbox becomes the boundary. `ExecRequest` has not moved — it is `(binary, args,
-workDir, timeout)` with no shell form, and its javadoc still argues the old rule at length, including
-the honest note about `mvn test | tail -50`.
+`ExecRequest.script` resolves to `sh -c`, and `run_command` takes `argv` or `script` and refuses both
+or neither rather than preferring one silently. The javadoc no longer argues the withdrawn position:
+it states that the allowlist is an operational contract and not a containment control, so nobody
+later defends it as security or blocks a feature to preserve it.
 
-Nothing is broken by this. The code is *stricter* than the plan, which is the safe direction for a
-divergence to point. It is recorded because the javadoc now argues a position the plan has abandoned,
-and a reader who trusts it will re-derive the wrong boundary.
+The shell is in the allowlist like any other binary, which is the part worth keeping straight. An
+attempt that should not have one is configured by leaving `sh` out of its spec — not by removing the
+capability from the tool. That is the difference between containing and subtracting.
 
-**Removal trigger:** the §15 dispatch work. Add the shell form, rewrite the javadoc to say the
-allowlist is not a containment feature, and land the command AST alongside it — the parse is what
-replaces the restriction, so shipping the shell without it would trade a weak control for none.
+The parse landed alongside it, as the trigger required, but see §3.32: what shipped is not the AST
+the plan asked for.
 
 ### 3.17 The egress proxy does not exist, so §16's central promise is untested
 
@@ -887,6 +886,27 @@ genuinely owned by the agent, and **less** permissive than before — 0755 rathe
 runs, a flag is applied — and none asked whether a real piece of work could be done. `WorkingCopyTest`
 is that question, and it found this within a minute of first running. Same shape as §5's "no test
 boots the packaged application".
+
+### 3.32 The command parse is a tokeniser, not the AST §15 asked for
+
+`CommandSignals` is quoting-aware and reads operators, which is strictly more than the prefix
+matching the plan rules out — `'curl'` and `"cu""rl"` are both seen. It is strictly less than a
+parser, and the misses are asserted as tests rather than described in a comment, because a comment
+about a limitation goes stale silently:
+
+- a command held in a variable (`C=curl; $C ...`) is invisible
+- anything reached through `eval` is invisible
+- `find -exec` reaches an interpreter without a pipe
+
+**Why that is affordable, and would not be if these were controls:** nothing refuses a command. The
+container contains, and §16's hardening measures identically whether every signal fires or none do.
+A missed signal costs visibility in an audit trail and a risk rating that should have been higher —
+not a hole. The day any of this gates execution, the tokeniser stops being sufficient.
+
+Also unbuilt: nothing consumes the signals yet. They are logged, and §17's consumer — which raises
+the *task's* rating and can require approval — is Phase 7.
+
+**Removal trigger:** a real AST if signals ever gate anything; §17's risk classifier for the consumer.
 
 ### 3.31 Retained tool output is heap, and is lost above 2MB
 

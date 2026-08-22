@@ -38,6 +38,8 @@ import java.util.Set;
  */
 public final class ToolDispatch {
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(ToolDispatch.class);
+
     /**
      * What the model is shown of a long result.
      *
@@ -213,17 +215,50 @@ public final class ToolDispatch {
                         : result;
             }
             case "run_command" -> {
+                boolean hasArgv = call.arguments().containsKey("argv");
+                boolean hasScript = call.arguments().containsKey("script");
+                if (hasArgv == hasScript) {
+                    // Both or neither. Refused rather than resolved by precedence, because a silent
+                    // preference means a model that sent both watches one of them not happen.
+                    throw new ToolRefusal("run_command needs either 'argv' or 'script', and not both");
+                }
+                if (hasScript) {
+                    String script = call.text("script");
+                    yield runWithSignals(
+                            sandbox, ExecRequest.script(script, definition.timeout()), CommandSignals.in(script));
+                }
                 List<String> argv = call.textList("argv");
                 if (argv.isEmpty()) {
                     throw new ToolRefusal("'argv' needs at least the command to run");
                 }
-                yield run(sandbox, definition, argv.getFirst(), argv.subList(1, argv.size()));
+                yield runWithSignals(
+                        sandbox,
+                        new ExecRequest(argv.getFirst(), argv.subList(1, argv.size()), ".", definition.timeout()),
+                        CommandSignals.in(argv));
             }
             // Unreachable while the catalogue and this switch agree. It is here because they are two
             // lists that must be edited together, and the failure to avoid is a tool that resolves,
             // validates, and then silently does nothing.
             default -> throw new IllegalStateException("no dispatch for tool " + definition.name());
         };
+    }
+
+    /**
+     * Runs a command, having first noticed what it appears to be reaching for.
+     *
+     * <p>The signals are recorded and never enforced. §17 rates risk to decide what needs a person,
+     * not what may run — the container is what contains, and it measures identically whether these
+     * fire or not. Logged at WARN for a HIGH rating so an operator has something to find; §17's
+     * consumer, which raises the <em>task's</em> rating and can ask for approval, is Phase 7 work and
+     * the reason this returns a value rather than only logging.
+     */
+    private ToolResult runWithSignals(SandboxHandle sandbox, ExecRequest request, CommandSignals signals) {
+        if (signals.risk() == RiskLevel.HIGH) {
+            log.warn("high-risk command in sandbox {}: {}", sandbox.externalId(), signals.found());
+        } else if (!signals.found().isEmpty()) {
+            log.info("command signals in sandbox {}: {}", sandbox.externalId(), signals.found());
+        }
+        return run(sandbox, request);
     }
 
     private ToolResult run(SandboxHandle sandbox, ToolDefinition definition, String binary, List<String> args) {
@@ -336,6 +371,9 @@ public final class ToolDispatch {
      * the attempt's own decision and the sandbox is what holds it to it.
      */
     public static Set<String> binariesUsed() {
-        return Set.of("ls", "rg", "fd", "git");
+        // sh is in the list because run_command's script form resolves to `sh -c`, and the sandbox
+        // refuses it like any other binary that was not permitted. An attempt that should not have a
+        // shell is configured by leaving it out here, not by removing the capability from the tool.
+        return Set.of("ls", "rg", "fd", "git", ExecRequest.SHELL);
     }
 }
