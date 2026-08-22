@@ -79,6 +79,17 @@ final class InMemorySandbox implements SandboxProvider {
     }
 
     @Override
+    public void writeFiles(SandboxHandle handle, Map<String, byte[]> files) {
+        Live sandbox = require(handle);
+        // Validated in full before anything lands, so the fake refuses a bad batch the same way the
+        // Docker adapter does. A fake that were more forgiving here would let the contract pass
+        // against behaviour no real substrate has.
+        Map<String, byte[]> safe = new HashMap<>();
+        files.forEach((path, content) -> safe.put(DockerSandboxProvider.safeRelative(path), content));
+        sandbox.files.putAll(safe);
+    }
+
+    @Override
     public HealthState probe(SandboxHandle handle) {
         return live.containsKey(handle.externalId()) ? HealthState.ALIVE : HealthState.GONE;
     }

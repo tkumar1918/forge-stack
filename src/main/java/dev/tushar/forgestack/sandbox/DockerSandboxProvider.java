@@ -157,7 +157,17 @@ public final class DockerSandboxProvider implements SandboxProvider {
                 "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m",
                 // The one writable path, and a tmpfs rather than a bind mount: §16 forbids a host
                 // path escaping the adapter, and a bind mount is exactly how that starts.
-                "--tmpfs", WORKSPACE + ":rw,exec,nosuid,size=" + spec.diskMib() + "m",
+                //
+                // uid/gid/mode are load-bearing rather than cosmetic. A tmpfs is created root-owned
+                // whatever the image says about its mountpoint — chowning it in a layer does not
+                // carry, because the mount replaces the directory rather than inheriting it. Left
+                // alone, Docker mounts it 1777 and the agent can write, but *git cannot run*: it
+                // sees a repository whose directory belongs to another user and refuses with
+                // "detected dubious ownership". Since git is how work leaves the sandbox, that made
+                // the workspace unusable for the one thing it exists for. Naming the owner here also
+                // takes the mode from world-writable 1777 down to 0755.
+                "--tmpfs",
+                        WORKSPACE + ":rw,exec,nosuid,size=" + spec.diskMib() + "m,uid=10001,gid=10001,mode=0755",
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges",
                 "--pids-limit=512",
@@ -250,6 +260,105 @@ public final class DockerSandboxProvider implements SandboxProvider {
             throw lostOrUnavailable(handle, "reading " + safe, ran);
         }
         return ran.stdout().getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Override
+    public void writeFiles(SandboxHandle handle, java.util.Map<String, byte[]> files) {
+        if (files.isEmpty()) {
+            return;
+        }
+        // Every name checked before a single byte is written. Validating as we stream would leave a
+        // half-populated workspace behind whenever an entry was bad, and the caller could not tell
+        // that from a substrate failure.
+        java.util.Map<String, byte[]> safe = new java.util.LinkedHashMap<>();
+        files.forEach((path, content) -> safe.put(safeRelative(path), content));
+
+        byte[] archive = tar(safe);
+        // Through the container's own tar rather than `docker cp`: cp is refused by a read-only
+        // rootfs even when the destination is a writable tmpfs, which was measured against a real
+        // daemon before this was written. exec also runs as the sandbox's own uid, so extracted
+        // files are owned by the agent that has to edit them rather than by root.
+        Ran ran = runWithInput(
+                List.of(
+                        "docker", "exec", "--user", "10001:10001", "-i", "--workdir", WORKSPACE,
+                        handle.externalId(), "tar", "-xf", "-"),
+                archive,
+                dockerTimeout);
+        if (!ran.ok()) {
+            throw lostOrUnavailable(handle, "placing " + safe.size() + " files", ran);
+        }
+    }
+
+    /**
+     * The files as a POSIX ustar archive.
+     *
+     * <p>Written here rather than pulled in as a dependency because only the writing half is needed,
+     * and writing a tar is a header this method can be read against. Reading one — which is what
+     * accepting an archive at the port would have required — is where the parsing bugs live.
+     *
+     * <p>No directory entries are emitted. {@code tar} creates missing parents on extraction, which
+     * is relied on here and asserted by the conformance suite rather than assumed from the manual.
+     */
+    static byte[] tar(java.util.Map<String, byte[]> files) {
+        var out = new ByteArrayOutputStream();
+        files.forEach((path, content) -> {
+            out.writeBytes(ustarHeader(path, content.length));
+            out.writeBytes(content);
+            // Every record is padded to the block size; the reader finds the next header by offset.
+            int padding = (BLOCK - (content.length % BLOCK)) % BLOCK;
+            out.writeBytes(new byte[padding]);
+        });
+        // Two zero blocks are what "end of archive" is, and tar warns about a truncated file without
+        // them even though it has already extracted everything.
+        out.writeBytes(new byte[BLOCK * 2]);
+        return out.toByteArray();
+    }
+
+    private static final int BLOCK = 512;
+
+    private static byte[] ustarHeader(String path, int size) {
+        byte[] header = new byte[BLOCK];
+        // ustar splits a long path across prefix[155] and name[100], and cannot express one that
+        // fits in neither. Refused rather than truncated: a silently shortened path writes the
+        // agent's file somewhere it will not find it.
+        String name = path;
+        String prefix = "";
+        if (name.getBytes(StandardCharsets.UTF_8).length > 100) {
+            int split = path.lastIndexOf('/', 155);
+            if (split <= 0 || path.length() - split - 1 > 100) {
+                throw new SandboxException.Refused("path is too long for the archive format: " + path);
+            }
+            prefix = path.substring(0, split);
+            name = path.substring(split + 1);
+        }
+        write(header, 0, name, 100);
+        write(header, 100, "0000644", 8);
+        write(header, 108, "0010001", 8); // uid 10001, matching the container's user
+        write(header, 116, "0010001", 8); // gid
+        write(header, 124, String.format("%011o", size), 12);
+        write(header, 136, String.format("%011o", 0), 12); // mtime: fixed, so an archive is reproducible
+        write(header, 156, "0", 1); // typeflag: a regular file, and this writer emits nothing else
+        write(header, 257, "ustar", 6);
+        write(header, 263, "00", 2);
+        write(header, 345, prefix, 155);
+
+        // The checksum is computed with its own field read as spaces, then written into it.
+        java.util.Arrays.fill(header, 148, 156, (byte) ' ');
+        int sum = 0;
+        for (byte b : header) {
+            sum += b & 0xFF;
+        }
+        write(header, 148, String.format("%06o", sum), 7);
+        header[155] = ' ';
+        return header;
+    }
+
+    private static void write(byte[] header, int offset, String value, int length) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > length) {
+            throw new SandboxException.Refused("value does not fit the archive header: " + value);
+        }
+        System.arraycopy(bytes, 0, header, offset, bytes.length);
     }
 
     @Override

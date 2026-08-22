@@ -4,7 +4,7 @@ Everything deliberately left undone, deferred, or accepted as a trade — with t
 should force each one to be revisited. Written down because a gap nobody recorded is
 indistinguishable from a bug nobody noticed.
 
-Last updated at the end of Phase 1.6 (installation binding, repository sync, opt-in). 67 tests.
+Last updated after the working copy first reached a real sandbox (§3.27-3.30). 270 tests.
 
 Setting up real credentials for the first time is a separate document: [local-setup.md](local-setup.md).
 
@@ -616,7 +616,21 @@ section makes it load-bearing for three separate things: remote MCP servers, the
 any credential used without being disclosed to the sandbox. Until it exists, none of those can ship,
 and §16's claim that no credential enters the sandbox holds only because nothing has yet needed one.
 
-**Removal trigger:** it is the next build item, ahead of the tool catalogue, for exactly this reason.
+**Removal trigger:** ~~it is the next build item, ahead of the tool catalogue~~ — **deferred, deliberately,
+2026-08-22.** The proxy was ordered first on the strength of "every capability routes through it".
+Re-read against §16's own consumer table, that is true of fewer things than the ordering assumed:
+the model key, remote MCP, and git are all **host-side by construction**, because the agent loop is
+Java on the host. What genuinely needs the proxy is package installs, in-sandbox doc fetches, and
+stdio MCP servers reaching a network.
+
+So the cost of deferring is bounded and stated: only repositories that build offline can be worked
+on (§3.30). Nothing becomes less safe — the sandbox holds no credential today because nothing hands
+it one — and the claim stays unproven rather than becoming untrue. The trade buys the orchestration
+work its turn first, on the same reasoning §27 uses everywhere else: prove the mechanical substrate
+before adding a moving part.
+
+The trigger is now **the first repository whose tests do not run offline**, or the first authenticated
+private registry — whichever arrives first.
 
 ### 3.18 The diff guards describe a cost model they no longer have
 
@@ -829,6 +843,88 @@ has looked for.
 - **Proxy TLS termination is CPU-bound**, and every model call and package install crosses it.
 - **Write volume.** A step per tool call, at a few hundred calls per attempt, against `task_steps` plus
   `audit_events` — whose partitions are monthly.
+
+### 3.27 A repository could not get into the sandbox at all — **fixed**
+
+`§16` says the host clones the working copy and the harness finds it already on disk. Nothing
+implemented that, and nothing could have: the workspace is a **tmpfs inside the container**, and the
+same section forbids a host path reaching the adapter, so the host has nowhere to clone *to*.
+`docker cp` is refused outright by a read-only rootfs — checked against a real daemon rather than
+assumed. That left `writeFile`, one file per `docker exec`.
+
+Measured, because the gap decides whether this is a wart or a blocker: **100 files take 8.4 seconds
+one at a time and 85ms in a single call.** A five-thousand-file repository is seven minutes versus
+four seconds, on every attempt.
+
+`SandboxProvider.writeFiles` closes it, taking a path→content map and shipping one `tar` through a
+single `exec`. Expressed as files rather than as an archive on purpose: a wire format in the port
+would be a substrate detail leaking through a boundary whose whole discipline is that a caller
+cannot tell what it is running on, and it would move path validation into a tar parser. Every name
+goes through the same `safeRelative` check `writeFile` uses, and **one bad entry refuses the whole
+batch** — a partially-written working copy is indistinguishable from a substrate that failed
+half way.
+
+Covered by `SandboxProviderContract`, so the fake and Docker are held to it identically. The escape
+guard was watched failing ("one escaping path refuses the whole working copy") with the validation
+neutralised.
+
+### 3.28 `git` could not run in the workspace, which is the one thing it is for — **fixed**
+
+A tmpfs is created **root-owned regardless of what the image says about its mountpoint**, because the
+mount replaces the directory rather than inheriting it — so `chown` in a layer does nothing. Left
+alone Docker mounts it `1777`, which is writable, so `writeFile`, `exec`, and every existing test
+passed.
+
+Git did not. It saw a repository directory belonging to another user and refused every command after
+`init` with `fatal: detected dubious ownership in repository at '/workspace'`. Since `captureDiff` is
+git, and a diff is the only way work leaves a sandbox, the workspace was unusable for its entire
+purpose while looking healthy.
+
+Fixed in the hardening block: `uid=10001,gid=10001,mode=0755` on the tmpfs. The workspace is now
+genuinely owned by the agent, and **less** permissive than before — 0755 rather than world-writable.
+
+*How it was missed:* every test asserted a property of the mechanism — a file round-trips, a command
+runs, a flag is applied — and none asked whether a real piece of work could be done. `WorkingCopyTest`
+is that question, and it found this within a minute of first running. Same shape as §5's "no test
+boots the packaged application".
+
+### 3.29 The toolchain image existed only as a string
+
+`forgestack/java-21:latest` has been the configured default since Phase 2 and was never built, so the
+first real attempt would have failed on `no such image`. `docker/sandbox/Dockerfile` now builds it,
+via `scripts/build-sandbox-image.sh`.
+
+Three limitations, all deliberate and all worth naming:
+
+- **One image for every repository.** §16 already flags image drift — the agent's toolchain differing
+  from CI's — as a live risk, and a single image makes that certain rather than likely. Deriving the
+  image from the repository's own CI configuration is the stated intent and is not built.
+- **It carries git, a JDK, and Python, and nothing else.** No Node, no Go, no Maven or Gradle cache.
+- **Not built by the build.** A Gradle task would rebuild the image on every `test` run and fail the
+  suite on a machine without Docker. The tests that need it skip themselves and name the script.
+
+**Removal trigger:** the tool catalogue work, which is when a per-repository toolchain stops being
+cosmetic.
+
+### 3.30 Nothing in the sandbox can install a dependency
+
+The direct cost of deferring the egress proxy (§3.17), recorded here rather than left implicit,
+because it is the boundary of what can be worked on today.
+
+Containers run `--network none`. A repository whose tests need `npm install`, `pip install`, or a
+Gradle dependency resolution **cannot be built in a sandbox at all** — not slowly, not degraded, at
+all. What can be worked on is repositories whose tests run from what is already in the image, which
+is why the first fixture is Python with a standard-library test runner. That choice is a fact about
+the proxy, not about the language.
+
+This does not weaken anything. §16's claim that no credential enters the sandbox holds today because
+nothing has yet needed one, and the deferral leaves that claim unproven rather than untrue. The
+narrower case the proxy was really designed for — an authenticated private registry, where the
+sandbox must authenticate and must not learn the secret — is untouched by all of this and still
+waiting.
+
+**Removal trigger:** the first repository whose tests do not run offline, which in practice is the
+first real design-partner repository.
 
 ---
 

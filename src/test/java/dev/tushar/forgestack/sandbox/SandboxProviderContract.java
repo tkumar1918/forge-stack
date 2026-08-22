@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -155,6 +156,64 @@ abstract class SandboxProviderContract {
                     .as("read %s", escape)
                     .isInstanceOf(SandboxException.Refused.class);
         }
+    }
+
+    /**
+     * A working copy arrives, which until {@code writeFiles} existed it had no way to do.
+     *
+     * <p>The nested path is the load-bearing part. Nothing creates {@code src/main/java} before the
+     * file inside it is written, so this asserts that a substrate materialises missing parents —
+     * relied on by the Docker adapter, which emits no directory entries at all, and true of the fake
+     * only because a map has no directories to miss.
+     */
+    @Test
+    @DisplayName("a whole working copy arrives in one call, parents and all")
+    void aWorkingCopyIsPlacedInOneCall() {
+        SandboxHandle handle = provision();
+
+        provider()
+                .writeFiles(
+                        handle,
+                        Map.of(
+                                "README.md", "# fixture\n".getBytes(StandardCharsets.UTF_8),
+                                "src/main/java/Main.java", "class Main {}\n".getBytes(StandardCharsets.UTF_8),
+                                "src/test/java/MainTest.java", "class MainTest {}\n".getBytes(StandardCharsets.UTF_8)));
+
+        assertThat(new String(provider().readFile(handle, "src/main/java/Main.java"), StandardCharsets.UTF_8))
+                .contains("class Main {}");
+        assertThat(new String(provider().readFile(handle, "README.md"), StandardCharsets.UTF_8))
+                .contains("# fixture");
+    }
+
+    /**
+     * One bad entry refuses the batch, rather than the file it appears in.
+     *
+     * <p>The alternative — write what is valid, refuse the rest — leaves a working copy that is
+     * neither what was asked for nor empty, and a caller cannot tell it from a substrate that failed
+     * half way. The escape is the second spelling on purpose: {@code a/../../etc/passwd} normalises
+     * into one and is the version a {@code startsWith("..")} check waves through.
+     */
+    @Test
+    @DisplayName("one escaping path refuses the whole working copy")
+    void anEscapingEntryRefusesEverything() {
+        SandboxHandle handle = provision();
+        Map<String, byte[]> mixed = new java.util.LinkedHashMap<>();
+        mixed.put("innocent.txt", "fine".getBytes(StandardCharsets.UTF_8));
+        mixed.put("a/../../etc/passwd", "pwned".getBytes(StandardCharsets.UTF_8));
+
+        assertThatThrownBy(() -> provider().writeFiles(handle, mixed)).isInstanceOf(SandboxException.Refused.class);
+
+        assertThatThrownBy(() -> provider().readFile(handle, "innocent.txt"))
+                .as("the valid entry must not have landed either")
+                .isInstanceOf(SandboxException.class);
+    }
+
+    @Test
+    @DisplayName("placing nothing is not an error")
+    void anEmptyWorkingCopyIsANoOp() {
+        SandboxHandle handle = provision();
+
+        assertThatCode(() -> provider().writeFiles(handle, Map.of())).doesNotThrowAnyException();
     }
 
     @Test
