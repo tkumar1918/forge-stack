@@ -68,6 +68,13 @@ class ToolDispatchTest {
         Map<String, byte[]> files = new LinkedHashMap<>();
         files.put("calc.py", utf8("def add(a, b):\n    return a - b\n"));
         files.put("README.md", utf8("# fixture\nsentinel-string\n"));
+        files.put("long.txt", utf8(java.util.stream.IntStream.rangeClosed(1, 500)
+                .mapToObj("line %d"::formatted)
+                .collect(Collectors.joining("\n", "", "\n"))));
+        // Ignored by git, so it must not turn up in a default search -- which is the whole reason
+        // for using ripgrep over grep.
+        files.put(".gitignore", utf8("vendor/\n"));
+        files.put("vendor/copy.py", utf8("sentinel-string in a vendored copy\n"));
         docker.writeFiles(sandbox, files);
     }
 
@@ -204,10 +211,13 @@ class ToolDispatchTest {
                 EVERYTHING,
                 ToolCall.of("write_file", "path", "src/new/thing.py", "content", "VALUE = 1\n"));
 
+        // Numbered, because an extract a model cannot cite is one it has to re-read to ask about.
+        // The cost is that content does not come back byte-identical, which is why apply_patch rather
+        // than write_file is the preferred edit tool -- a patch is authored, not copied back.
         assertThat(dispatch
                         .dispatch(sandbox, EVERYTHING, ToolCall.of("read_file", "path", "src/new/thing.py"))
                         .output())
-                .isEqualTo("VALUE = 1\n");
+                .isEqualTo("1\tVALUE = 1\n");
     }
 
     /**
@@ -324,6 +334,109 @@ class ToolDispatchTest {
         assertThat(result.output().length()).isLessThanOrEqualTo(ToolDispatch.MAX_OUTPUT_CHARS + 200);
         assertThat(result.outputBytes()).isGreaterThan(200_000);
         assertThat(result.output()).startsWith("HEAD").contains("characters omitted").endsWith("TAIL\n");
+    }
+
+
+    // --- narrowing: the thing that makes a large repository explorable ---------------------------
+
+    /**
+     * The single most important thing this catalogue offers.
+     *
+     * <p>Without a line range, seeing part of a large file means reading all of it and having the
+     * middle removed — which hands a model a mangled view it cannot then ask a better question about.
+     * Narrowing (outline, then slice, then read) is how an unfamiliar repository gets explored at all.
+     */
+    @Test
+    @DisplayName("reads a range of lines, numbered, and says it is showing an extract")
+    void aFileCanBeReadInSlices() {
+        ToolResult slice = dispatch.dispatch(
+                sandbox, EVERYTHING, ToolCall.of("read_file", "path", "long.txt", "from_line", 100, "max_lines", 5));
+
+        assertThat(slice.output())
+                .contains("100\tline 100")
+                .contains("104\tline 104")
+                .doesNotContain("line 99")
+                .doesNotContain("line 105");
+        assertThat(slice.output())
+                .as("an extract a model does not know is an extract gets reasoned about as the whole file")
+                .contains("showing lines 100-104 of 500");
+    }
+
+    @Test
+    @DisplayName("asking past the end of a file says so rather than returning nothing")
+    void readingPastTheEndIsExplained() {
+        ToolResult past = dispatch.dispatch(
+                sandbox, EVERYTHING, ToolCall.of("read_file", "path", "long.txt", "from_line", 9000));
+
+        assertThat(past.output()).contains("500 lines").contains("nothing at line 9000");
+    }
+
+    /**
+     * Search respects what git ignores, which is most of ripgrep's value over grep.
+     *
+     * <p>A search that returns every hit in {@code vendor/} and {@code node_modules/} costs the model
+     * the context it needed for the answer, and it is the reason an agent stops using search and
+     * starts reading whole files instead.
+     */
+    @Test
+    @DisplayName("a search skips what git ignores, unless asked not to")
+    void searchIgnoresWhatGitIgnores() {
+        ToolResult byDefault = dispatch.dispatch(sandbox, EVERYTHING, ToolCall.of("grep", "pattern", "sentinel-string"));
+        assertThat(byDefault.output()).contains("README.md").doesNotContain("vendor/");
+
+        ToolResult everywhere = dispatch.dispatch(
+                sandbox, EVERYTHING, ToolCall.of("grep", "pattern", "sentinel-string", "include_ignored", true));
+        assertThat(everywhere.output()).contains("vendor/");
+    }
+
+    @Test
+    @DisplayName("a search can return surrounding lines, or only the file names")
+    void searchCanWidenOrNarrow() {
+        ToolResult withContext =
+                dispatch.dispatch(sandbox, EVERYTHING, ToolCall.of("grep", "pattern", "line 250", "context", 2));
+        assertThat(withContext.output()).contains("line 248").contains("line 252");
+
+        ToolResult namesOnly = dispatch.dispatch(
+                sandbox, EVERYTHING, ToolCall.of("grep", "pattern", "sentinel-string", "files_only", true));
+        assertThat(namesOnly.output()).contains("README.md").doesNotContain("sentinel-string\n");
+    }
+
+    /**
+     * Truncation without a way back is data loss, not summarising.
+     *
+     * <p>A capped build log whose middle is simply gone leaves a model drawing confident conclusions
+     * from whichever half survived. §15 lists {@code read_tool_output} in the MVP set for this reason.
+     */
+    @Test
+    @DisplayName("the part of a long result that was cut can still be read back")
+    void aTruncatedResultCanBeReadBack() {
+        ToolResult huge = dispatch.dispatch(
+                sandbox,
+                EVERYTHING,
+                ToolCall.of(
+                        "run_command",
+                        "argv",
+                        List.of("python3", "-c", "[print('line', i) for i in range(40000)]")));
+
+        assertThat(huge.truncated()).isTrue();
+        assertThat(huge.outputId()).as("a truncated result the model cannot get behind is data loss").isNotNull();
+        assertThat(huge.output()).contains("read_tool_output");
+
+        // The middle -- precisely what the cap removed and what a head-and-tail extract cannot show.
+        ToolResult middle = dispatch.dispatch(
+                sandbox,
+                EVERYTHING,
+                ToolCall.of("read_tool_output", "output_id", huge.outputId(), "from_line", 20000, "max_lines", 3));
+        assertThat(middle.output()).contains("line 19999");
+    }
+
+    @Test
+    @DisplayName("an output id that does not exist is refused, not answered with nothing")
+    void anUnknownOutputIdIsRefused() {
+        assertThatThrownBy(() ->
+                        dispatch.dispatch(sandbox, EVERYTHING, ToolCall.of("read_tool_output", "output_id", "nope")))
+                .isInstanceOf(ToolRefusal.class)
+                .hasMessageContaining("no retained output");
     }
 
     // -------------------------------------------------------------------------------------------

@@ -49,7 +49,27 @@ public final class ToolDispatch {
      */
     static final int MAX_OUTPUT_CHARS = 32_000;
 
+    /**
+     * How much of one over-long result is kept for {@code read_tool_output}.
+     *
+     * <p>Bounded because this is heap. §11 puts the real answer in blob storage under the workspace's
+     * own prefix, which does not exist yet — so a result larger than this is still genuinely lost
+     * past the cap, and the model is told so rather than left to discover it by reading a silently
+     * short tail.
+     */
+    static final int MAX_RETAINED_CHARS = 2_000_000;
+
     private final SandboxProvider sandboxes;
+
+    /**
+     * Full outputs, by id, for as long as this dispatch lives.
+     *
+     * <p>Which is one attempt. Scoped that way rather than globally on purpose: an id from another
+     * attempt must not resolve here, because the two may belong to different tenants and a tool that
+     * returns another workspace's build log is a cross-tenant read (§18) arriving through a door
+     * nobody thought to guard.
+     */
+    private final java.util.Map<String, String> retained = new java.util.concurrent.ConcurrentHashMap<>();
 
     public ToolDispatch(SandboxProvider sandboxes) {
         this.sandboxes = sandboxes;
@@ -96,25 +116,76 @@ public final class ToolDispatch {
         return switch (definition.name()) {
             case "read_file" -> {
                 byte[] content = sandboxes.readFile(sandbox, call.text("path"));
-                yield capped(false, new String(content, StandardCharsets.UTF_8));
+                yield slice(
+                        new String(content, StandardCharsets.UTF_8),
+                        call.numberOr("from_line", 1),
+                        call.numberOr("max_lines", Integer.MAX_VALUE));
+            }
+            case "read_tool_output" -> {
+                String id = call.text("output_id");
+                String full = retained.get(id);
+                if (full == null) {
+                    // Refused rather than empty. An id that has fallen out of the store and an id the
+                    // model invented look identical from here, and "" reads to a model as "the output
+                    // was empty" -- which is a different and much more misleading fact.
+                    throw new ToolRefusal("no retained output called '%s'".formatted(id));
+                }
+                yield slice(full, call.numberOr("from_line", 1), call.numberOr("max_lines", Integer.MAX_VALUE));
             }
             case "list_directory" -> run(sandbox, definition, "ls", List.of("-la", call.text("path")));
             // -r to recurse, -n for line numbers, -I to skip binaries. The pattern is a model's string
             // and is passed as one argument, so it cannot become a second flag or a second command.
-            // grep exits 0 for a match, 1 for no match, and 2 for a real error, so "not zero" is the
-            // wrong test. A model told its search *failed* retries the search; a model told the search
-            // found nothing looks somewhere else, and only one of those is progress. Caught by a test
-            // that was originally written weakly enough to pass while this was wrong.
-            case "grep" -> run(
+            // ripgrep rather than grep, and the difference is not only speed. It skips what git
+            // ignores, so a search does not come back with ten thousand hits from build/ and
+            // node_modules/ that the model then has to read past. Both exit 1 for "no matches" and 2
+            // for a real error, so "not zero" is the wrong failure test either way: a model told its
+            // search *failed* retries the search, where a model told it found nothing looks somewhere
+            // else. Only one of those is progress. Caught by a test originally written weakly enough
+            // to pass while this was wrong.
+            case "grep" -> {
+                var argv = new java.util.ArrayList<>(List.of("--line-number", "--no-heading", "--color", "never"));
+                // Dotfiles are searched -- .github/workflows and .gitignore are repository content an
+                // agent legitimately needs -- but .git never is. Verified against a real ripgrep:
+                // --no-ignore --hidden walks into .git and buries the answer in loose objects.
+                // --no-require-git because ripgrep applies .gitignore only *inside* a git repository
+                // by default, so the same search would quietly return vendored and generated files
+                // whenever .git happened to be absent -- before the baseline commit, or in a working
+                // copy placed rather than cloned. Verified against a real ripgrep. Search behaving
+                // differently depending on a directory nobody looked at is worse than either
+                // behaviour on its own.
+                argv.addAll(List.of("--hidden", "--glob", "!.git", "--no-require-git"));
+                if (call.flag("include_ignored")) {
+                    argv.add("--no-ignore");
+                }
+                if (call.flag("files_only")) {
+                    argv.add("--files-with-matches");
+                }
+                int context = call.numberOr("context", 0);
+                if (context > 0) {
+                    argv.addAll(List.of("--context", String.valueOf(Math.min(context, 20))));
+                }
+                argv.addAll(List.of("--", call.text("pattern"), call.textOr("path", ".")));
+                yield run(
+                        sandbox,
+                        new ExecRequest("rg", argv, ".", definition.timeout()),
+                        exitCode -> exitCode > 1);
+            }
+            // fd for the same reason as ripgrep: it respects .gitignore, so "where is the config
+            // file" does not return four hundred copies out of a dependency directory.
+            case "find_files" -> run(
                     sandbox,
                     new ExecRequest(
-                            "grep",
-                            List.of("-rnI", "--", call.text("pattern"), call.textOr("path", ".")),
+                            "fd",
+                            List.of(
+                                    "--type", "f",
+                                    "--hidden",
+                                    "--exclude", ".git",
+                                    // Same reason as grep's, and verified the same way.
+                                    "--no-require-git",
+                                    "--glob", call.text("pattern")),
                             ".",
                             definition.timeout()),
-                    exitCode -> exitCode > 1);
-            case "find_files" -> run(
-                    sandbox, definition, "find", List.of(".", "-name", call.text("pattern"), "-type", "f"));
+                    exitCode -> exitCode != 0);
             case "git_diff" -> run(sandbox, definition, "git", List.of("diff"));
             case "git_log" -> run(sandbox, definition, "git", List.of("log", "--oneline", "-n", "20"));
             case "write_file" -> {
@@ -194,21 +265,65 @@ public final class ToolDispatch {
         return capped(isFailure.test(result.exitCode()), output.toString(), bytes[0]);
     }
 
-    private static ToolResult capped(boolean failed, String output) {
+    /**
+     * Part of a text, by line, numbered.
+     *
+     * <p>Numbered because an unnumbered extract is one a model cannot ask a follow-up question about:
+     * it can see the code but not say where it is, and the next call has to re-read the file to find
+     * out. The numbers are what make narrowing repeatable rather than a one-way trip.
+     */
+    private ToolResult slice(String text, int fromLine, int maxLines) {
+        if (fromLine < 1) {
+            throw new ToolRefusal("'from_line' starts at 1");
+        }
+        if (maxLines < 1) {
+            throw new ToolRefusal("'max_lines' must be at least 1");
+        }
+        List<String> lines = text.lines().toList();
+        if (fromLine > lines.size()) {
+            return new ToolResult(
+                    false,
+                    "the file has %d lines, so there is nothing at line %d".formatted(lines.size(), fromLine),
+                    text.length(),
+                    false);
+        }
+        int end = (int) Math.min((long) fromLine - 1 + maxLines, lines.size());
+        var numbered = new StringBuilder();
+        for (int i = fromLine - 1; i < end; i++) {
+            numbered.append(i + 1).append('\t').append(lines.get(i)).append('\n');
+        }
+        boolean partial = fromLine > 1 || end < lines.size();
+        ToolResult result = capped(false, numbered.toString(), numbered.length());
+        return partial && !result.truncated()
+                // Said out loud. A model handed lines 40-80 with nothing marking them as an extract
+                // will reason as though it has seen the file.
+                ? new ToolResult(
+                        false,
+                        "showing lines %d-%d of %d%n%s".formatted(fromLine, end, lines.size(), result.output()),
+                        result.outputBytes(),
+                        false,
+                        result.outputId())
+                : result;
+    }
+
+    private ToolResult capped(boolean failed, String output) {
         return capped(failed, output, output.getBytes(StandardCharsets.UTF_8).length);
     }
 
-    private static ToolResult capped(boolean failed, String output, long totalBytes) {
+    private ToolResult capped(boolean failed, String output, long totalBytes) {
         if (output.length() <= MAX_OUTPUT_CHARS) {
             return new ToolResult(failed, output, totalBytes, false);
         }
         // Both ends. A build log's cause is at the top and its verdict is at the bottom, and keeping
         // only the head is how a model reads a compilation error and never learns the suite failed.
         int half = MAX_OUTPUT_CHARS / 2;
-        String kept = output.substring(0, half) + "%n%n[... %d characters omitted ...]%n%n".formatted(
-                        output.length() - MAX_OUTPUT_CHARS)
+        String id = java.util.UUID.randomUUID().toString();
+        retained.put(id, output.length() > MAX_RETAINED_CHARS ? output.substring(0, MAX_RETAINED_CHARS) : output);
+        String kept = output.substring(0, half)
+                + "%n%n[... %d characters omitted -- read_tool_output(output_id: %s) for the rest ...]%n%n"
+                        .formatted(output.length() - MAX_OUTPUT_CHARS, id)
                 + output.substring(output.length() - half);
-        return new ToolResult(failed, kept, totalBytes, true);
+        return new ToolResult(failed, kept, totalBytes, true, id);
     }
 
     /**
@@ -221,6 +336,6 @@ public final class ToolDispatch {
      * the attempt's own decision and the sandbox is what holds it to it.
      */
     public static Set<String> binariesUsed() {
-        return Set.of("ls", "grep", "find", "git");
+        return Set.of("ls", "rg", "fd", "git");
     }
 }

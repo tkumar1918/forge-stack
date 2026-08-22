@@ -17,7 +17,23 @@ FROM eclipse-temurin:25-jdk-alpine
 # python3— the first fixture language, chosen because its test runner is in the standard
 #          library and therefore needs no network. A Java fixture needs a warm Gradle or Maven
 #          cache baked into an image, which is the same problem the proxy exists to solve.
-RUN apk add --no-cache git tar python3
+#
+# The next four are search tools, and they are here for a specific reason: the way an agent
+# explores a repository it has never seen is by narrowing — outline, then slice, then read —
+# and plain grep/find make the narrowing steps expensive enough that a model skips them and
+# reads whole files instead, which is what exhausts a context window.
+#
+# ripgrep  — respects .gitignore, so a search does not return ten thousand hits from build/
+#            and node_modules/. Orders of magnitude faster, and has context lines and a
+#            files-only mode built in, both of which save a whole second tool call.
+# fd       — the same for filename search.
+# ast-grep — structural search: "find every call to this method", not "find this string".
+#            Unused by the catalogue today and installed because the refactoring tools that
+#            need it are next, and rebuilding the image is the expensive half.
+# jq       — so an agent reading a JSON test report does not have to reason about raw JSON.
+#
+# +36MB on a 491MB image, measured. Cheap against §26's cold-start concern.
+RUN apk add --no-cache git tar python3 ripgrep fd ast-grep jq
 
 # uid 10001, matching the --user the provider passes. The container is run non-root regardless,
 # so this exists to give that uid a name and a home rather than to grant it anything.

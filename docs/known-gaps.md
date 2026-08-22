@@ -4,7 +4,7 @@ Everything deliberately left undone, deferred, or accepted as a trade — with t
 should force each one to be revisited. Written down because a gap nobody recorded is
 indistinguishable from a bug nobody noticed.
 
-Last updated after the tool layer landed (§3.27-3.30, §15 dispatch). 283 tests.
+Last updated after the tool layer landed (§3.27-3.30, §15 dispatch, narrowing tools). 289 tests.
 
 Setting up real credentials for the first time is a separate document: [local-setup.md](local-setup.md).
 
@@ -887,6 +887,23 @@ genuinely owned by the agent, and **less** permissive than before — 0755 rathe
 runs, a flag is applied — and none asked whether a real piece of work could be done. `WorkingCopyTest`
 is that question, and it found this within a minute of first running. Same shape as §5's "no test
 boots the packaged application".
+
+### 3.31 Retained tool output is heap, and is lost above 2MB
+
+`read_tool_output` reads back what the 32k display cap removed, which is what makes capping a summary
+rather than a deletion. What backs it is a map in the `ToolDispatch` instance — scoped to one attempt,
+deliberately, because an id resolving across attempts would be a cross-tenant read (§18) arriving
+through a door nobody thought to guard.
+
+Two limits follow, both accepted for now:
+
+- **2MB per output, then genuinely gone.** §11 puts the real answer in blob storage under the
+  workspace's own prefix. That does not exist, so a build log larger than 2MB is truncated a second
+  time and the model is told so rather than left to find out from a short tail.
+- **Nothing survives a restart.** A resumed attempt cannot read back an output its predecessor
+  produced, which is a hole in §20's resumability that only shows up as a refused `read_tool_output`.
+
+**Removal trigger:** blob storage, which §11 and §16 both already assume.
 
 ### 3.29 The toolchain image existed only as a string
 

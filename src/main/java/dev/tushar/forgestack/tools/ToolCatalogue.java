@@ -35,9 +35,16 @@ import java.util.Set;
 public final class ToolCatalogue {
 
     private static final Map<String, ToolDefinition> BY_NAME = index(
+            // from_line/max_lines are optional and are the single most important thing this
+            // catalogue offers. Without them the only way to see part of a large file is to read all
+            // of it and have the middle cut out -- which hands a model a mangled view it cannot then
+            // ask a better question about. Narrowing (outline, slice, read) is how an unfamiliar
+            // repository gets explored at all, and a read tool that cannot slice makes every step of
+            // that cost a whole file.
             new ToolDefinition(
                     "read_file",
-                    "Read one file from the working copy.",
+                    "Read a file, or a range of its lines. Give from_line and max_lines to read part "
+                            + "of a large file instead of all of it. Output is numbered.",
                     List.of("path"),
                     RiskLevel.LOW,
                     SideEffect.READ,
@@ -51,9 +58,14 @@ public final class ToolCatalogue {
                     SideEffect.READ,
                     true,
                     Duration.ofSeconds(30)),
+            // context and files_only each remove a whole follow-up call. A match with no surrounding
+            // lines usually forces a read_file to find out what it means, and a survey of "which
+            // files mention this" does not want the lines at all.
             new ToolDefinition(
                     "grep",
-                    "Search the working copy for a pattern, reporting file and line.",
+                    "Search file contents. Optional: context (lines shown either side of a match), "
+                            + "files_only (list matching files instead of lines), path, "
+                            + "include_ignored (search files git ignores, off by default).",
                     List.of("pattern"),
                     RiskLevel.LOW,
                     SideEffect.READ,
@@ -75,6 +87,17 @@ public final class ToolCatalogue {
                     SideEffect.READ,
                     true,
                     Duration.ofSeconds(60)),
+            // The other half of capping output. §15 lists it in the MVP set for exactly this reason:
+            // a truncated result the model cannot get behind is data loss wearing a summary's clothes.
+            new ToolDefinition(
+                    "read_tool_output",
+                    "Read more of an earlier result that was too long to show in full. Give the "
+                            + "output_id from that result, and optionally from_line and max_lines.",
+                    List.of("output_id"),
+                    RiskLevel.LOW,
+                    SideEffect.READ,
+                    true,
+                    Duration.ofSeconds(30)),
             new ToolDefinition(
                     "git_log",
                     "Show recent commits.",

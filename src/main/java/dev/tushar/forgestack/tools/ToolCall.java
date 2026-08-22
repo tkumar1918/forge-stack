@@ -66,4 +66,40 @@ public record ToolCall(String name, Map<String, Object> arguments) {
     String textOr(String argument, String fallback) {
         return arguments.containsKey(argument) ? text(argument) : fallback;
     }
+
+    /**
+     * One optional whole number, or the fallback when absent.
+     *
+     * <p>Accepts the digits-as-text form as well as a real number, because that is what a model
+     * emits often enough to matter and refusing it teaches nothing — the value is unambiguous. A
+     * value that is <em>not</em> a number is still refused rather than guessed at.
+     */
+    int numberOr(String argument, int fallback) {
+        Object value = arguments.get(argument);
+        if (value == null) {
+            return fallback;
+        }
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof String text) {
+            try {
+                return Integer.parseInt(text.strip());
+            } catch (NumberFormatException e) {
+                throw new ToolRefusal("'%s' must be a whole number, and was '%s'".formatted(argument, text));
+            }
+        }
+        throw new ToolRefusal("'%s' must be a whole number".formatted(argument));
+    }
+
+    /** One optional true/false argument, false when absent. */
+    boolean flag(String argument) {
+        Object value = arguments.get(argument);
+        return switch (value) {
+            case null -> false;
+            case Boolean bool -> bool;
+            case String text -> Boolean.parseBoolean(text.strip());
+            default -> throw new ToolRefusal("'%s' must be true or false".formatted(argument));
+        };
+    }
 }
